@@ -43,6 +43,8 @@ def fresh() -> Ream:
         except OSError:
             pass
     window = Ream([])
+    window.layout = "single"
+    window._place_sheet()
     window.resize(1100, 820)
     window.show()
     pump(0.1)
@@ -608,6 +610,67 @@ def test_empty_note_leaves_nothing_and_notes_survive():
                              view_point(w2, target))
     assert w2.editing is notes[1]
     w2.close()
+
+
+def test_spread_and_all_pages():
+    w = fresh()
+    type_paragraphs(w, 40)
+    pages = w.sheet.pages()
+    assert pages >= 5
+    w.flip(0)
+    pump()
+    # spread: a book - the first page alone on the right, then 2|3, 4|5
+    w.set_layout("spread")
+    pump(0.1)
+    assert w.layout == "spread" and w.visible_pages() == [0] and not w.ghosts
+    assert w.sheet.pos() == QtCore.QPointF(0, 0)
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Right, QtCore.Qt.ControlModifier)
+    pump(0.1)
+    assert w.page == 1 and w.visible_pages() == [1, 2] and list(w.ghosts) == [2]
+    assert w.sheet.pos().x() == -w.sheet.W and w.ghosts[2].pos().x() == 0
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Right, QtCore.Qt.ControlModifier)
+    pump(0.1)
+    assert w.page == 3 and w.visible_pages() == [3, 4]
+    # clicking the facing page makes it live, with the caret where you clicked
+    right = w.ghosts[4].sceneBoundingRect()
+    spot = QtCore.QPointF(right.left() + w.fmt.margin + 30, right.top() + w.fmt.head + 20)
+    QtTest.QTest.mouseClick(w.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+                            view_point(w, spot))
+    pump(0.1)
+    assert w.page == 4 and 3 in w.ghosts and w.sheet.caret_page() == 4
+    QtTest.QTest.keyClicks(w.view, "on the right")
+    assert w.page == 4
+    # a picture dropped on the facing page pins to that page
+    left = w.ghosts[3].sceneBoundingRect()
+    w.add_files([make_png(os.path.join(TMP, "s.png"))], left.center())
+    (thing,) = [t for t in w.things.values() if t.alive]
+    assert thing.pinned and w.page == 3
+    assert 3 * w.sheet.H <= thing.pos().y() < 4 * w.sheet.H
+    # the facing page draws without trouble (vector), and in distress view
+    w.grab()
+    w.set_distress_view(True)
+    pump(1.2)
+    assert all(g.distressed is not None for i, g in w.ghosts.items() if i < w.sheet.pages())
+    w.set_distress_view(False)
+    # all pages: every page, in a grid; the same shortcut again goes back
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_3, QtCore.Qt.ControlModifier)
+    pump(0.1)
+    assert w.layout == "all" and len(w.ghosts) == w.sheet.pages() - 1
+    xs = {round(g.pos().x()) for g in w.ghosts.values()} | {round(w.sheet.pos().x())}
+    ys = {round(g.pos().y()) for g in w.ghosts.values()} | {round(w.sheet.pos().y())}
+    assert len(xs) > 1 and len(ys) > 1, (xs, ys)          # a grid, not a row
+    seen = w.view.visible_scene_rect()
+    assert seen.contains(w.layout_rect()), "the whole grid is framed"
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_3, QtCore.Qt.ControlModifier)
+    pump(0.1)
+    assert w.layout == "single" and not w.ghosts and w.sheet.pos() == QtCore.QPointF(0, 0)
+    # exports are the same in any layout
+    w.set_layout("all")
+    pdf = w.export_pdf(clean=True, path=os.path.join(TMP, "layout.pdf"))
+    import pypdfium2
+    assert len(pypdfium2.PdfDocument(pdf)) == w.sheet.pages()
+    w.set_layout("single")
+    w.close()
 
 
 def main() -> int:

@@ -37,13 +37,15 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from . import __version__, distress, export, project, style
 from .canvas import CanvasView
-from .page import Note, NoteText, Sheet, Thing
+from .page import GhostPage, Note, NoteText, Sheet, Thing
 from .palette import Command, CommandPalette
 from .panel import Panel
 
 HANDLE_PX = 7
 KNOB_PX = 22            # how far the rotation knob stands off the top edge
 REVEAL_PX = 40          # room kept around the page when the view follows it
+GRID_GAP_X, GRID_GAP_Y = 0.06, 0.11     # all-pages view: gaps as a share of the page
+LAYOUTS = ("single", "spread", "all")
 PREVIEW_DPI = 150
 PREVIEW_MAX_DPI = 600
 CANVAS_SWATCHES = ["#e8e7e3", "#ffffff", "#d9d6cc", "#b9b7b0", "#535353", "#2a2a2a", "#161616", "#c8d3cf"]
@@ -91,6 +93,7 @@ def busy():
 
 class Ream(QtWidgets.QMainWindow):
     preview_ready = QtCore.pyqtSignal(int, object)      # from the preview worker
+    ghost_ready = QtCore.pyqtSignal(int, object, object)  # page, key, image
 
     def __init__(self, paths: list[str] | None = None, theme: str | None = None):
         super().__init__()
@@ -129,6 +132,12 @@ class Ream(QtWidgets.QMainWindow):
         self.distress_panel: Panel | None = None
         self.page_panel: Panel | None = None
         self.editing: Note | None = None            # the free text being written
+        self.layout = self.prefs.get("layout", "single")    # single / spread / all
+        if self.layout not in LAYOUTS:
+            self.layout = "single"
+        self.ghosts: dict[int, GhostPage] = {}
+        self._grid_cols = 4
+        self.ghost_ready.connect(self._ghost_arrived)
         self.distress_view = False                  # write on the distressed page
         self._view_from_panel = False
         self._last_edit = 0.0
@@ -138,6 +147,7 @@ class Ream(QtWidgets.QMainWindow):
         self._idle_timer.timeout.connect(lambda: self._render_live(fast=False))
         self._view_timer = QtCore.QTimer(self, singleShot=True, interval=160)
         self._view_timer.timeout.connect(lambda: self._render_live(fast=False))
+        self._view_timer.timeout.connect(lambda: self.live() and self._render_ghosts())
         self._note_birth: tuple[int, int] | None = None
 
         self.save_timer = QtCore.QTimer(self, singleShot=True, interval=1200)
@@ -372,6 +382,9 @@ class Ream(QtWidgets.QMainWindow):
     def paint_overlay(self, painter: QtGui.QPainter):
         th = self.th()
         rect = self.page_rect_view()
+        transform = self.view.viewportTransform()
+        shown = [(self.page, rect)] + [(i, transform.mapRect(g.sceneBoundingRect()))
+                                       for i, g in sorted(self.ghosts.items())]
         painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
         if th["edge"]:
             pen = QtGui.QPen(style.qc(th["edge"]), 1.0)
@@ -380,19 +393,28 @@ class Ream(QtWidgets.QMainWindow):
                 pen.setDashPattern([1.0, 3.0])
             painter.setPen(pen)
             painter.setBrush(QtCore.Qt.NoBrush)
-            painter.drawRect(rect.adjusted(-1, -1, 0, 0))
-        if self.drag and self.drag.get("mode") == "move" and self.drag.get("over"):
+            for _index, box in shown:
+                painter.drawRect(box.adjusted(-1, -1, 0, 0))
+        over = self.drag.get("over") if self.drag and self.drag.get("mode") == "move" else None
+        if over:
             painter.setPen(QtGui.QPen(style.qc(style.INK if self.theme != "night" else "#ffffff"), 2.0))
-            painter.drawRect(rect.adjusted(-3, -3, 2, 2))
+            painter.drawRect(transform.mapRect(over).adjusted(-3, -3, 2, 2))
 
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
         painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
         painter.setFont(style.ui_font(11))
         painter.setPen(style.qc(th["meta"]))
-        label = f"{self.page + 1:02d} / {self.pages_shown():02d}"
-        if self.page >= self.sheet.pages():
-            label = f"{self.page + 1:02d} / blank"
-        painter.drawText(QtCore.QPointF(rect.left(), rect.bottom() + 20), label)
+        if self.layout == "single":
+            label = f"{self.page + 1:02d} / {self.pages_shown():02d}"
+            if self.page >= self.sheet.pages():
+                label = f"{self.page + 1:02d} / blank"
+            painter.drawText(QtCore.QPointF(rect.left(), rect.bottom() + 20), label)
+        else:
+            for index, box in shown:
+                label = f"{index + 1:02d}" if index < self.sheet.pages() else "blank"
+                if index == self.page:
+                    label += " ·"
+                painter.drawText(QtCore.QPointF(box.left(), box.bottom() + 18), label)
         if self.preview is not None:
             tag = f"distress · {self.distress.style}"
             width = QtGui.QFontMetrics(painter.font()).horizontalAdvance(tag)
@@ -630,6 +652,7 @@ class Ream(QtWidgets.QMainWindow):
             self.view.viewport().update()
             return True
         self.clear_selection()
+        self.live_on(at)                    # a click on another shown page makes it live
         page = self.sheet.scene_page_rect()
         if page.contains(at):
             y = at.y() - page.top() + self.page * self.sheet.H
@@ -662,7 +685,7 @@ class Ream(QtWidgets.QMainWindow):
             for thing, origin in zip(drag["things"], drag["from"]):
                 thing.setPos(origin + delta)
             lead = drag["lead"]
-            drag["over"] = self.sheet.scene_page_rect().contains(lead.sceneBoundingRect().center())
+            drag["over"] = self.page_rect_at(lead.sceneBoundingRect().center())
         elif drag["mode"] == "scale" and isinstance(drag["thing"], Note):
             note = drag["thing"]
             note.set_width(note.mapFromScene(at).x())
@@ -685,14 +708,13 @@ class Ream(QtWidgets.QMainWindow):
         if drag is None:
             return
         if drag["mode"] == "move":
-            page = self.sheet.scene_page_rect()
             carried = drag["things"]
             z = max((t.zValue() for t in self.things.values()
                      if t.alive and not t.pinned and t not in carried), default=0.0)
             for thing in carried:
                 z += 1.0
                 thing.setZValue(z)
-                if page.contains(thing.sceneBoundingRect().center()):
+                if self.live_on(thing.sceneBoundingRect().center()):
                     self.pin(thing)
             self.push("things", drag["before"])
             self.changed()
@@ -737,12 +759,188 @@ class Ream(QtWidgets.QMainWindow):
         pos = QtCore.QPointF(self.view.mapFromGlobal(QtGui.QCursor.pos()))
         self._hover_cursor(pos, self.view.mapToScene(pos.toPoint()))
 
+    # -- layouts: one page, a spread, all pages --------------------------------
+    def spread_of(self, index: int) -> tuple[int, int | None]:
+        """(left, right) of the spread holding `index`, as in a book: the
+        first page alone on the right, then 2|3, 4|5 ... (zero-based: 0, then
+        1|2, 3|4).  -1 on the left means no page there."""
+        if index == 0:
+            return -1, 0
+        left = index if index % 2 == 1 else index - 1
+        return left, left + 1
+
+    def visible_pages(self) -> list[int]:
+        if self.layout == "spread":
+            left, right = self.spread_of(self.page)
+            last = self.sheet.pages()               # the blank page after the words
+            return [i for i in (left, right) if 0 <= i <= last]
+        if self.layout == "all":
+            return list(range(max(self.sheet.pages(), self.page + 1)))
+        return [self.page]
+
+    def slot(self, index: int) -> QtCore.QPointF:
+        """Where page `index` sits on the canvas in the current layout."""
+        w, h = self.sheet.W, self.sheet.H
+        if self.layout == "spread":
+            return QtCore.QPointF(0.0 if index % 2 == 0 else -w, 0.0)   # spine at x = 0
+        if self.layout == "all":
+            cols = max(1, self._grid_cols)
+            gap_x, gap_y = w * GRID_GAP_X, h * GRID_GAP_Y   # room for the page numbers
+            return QtCore.QPointF((index % cols) * (w + gap_x), (index // cols) * (h + gap_y))
+        return QtCore.QPointF(0.0, 0.0)
+
+    def layout_rect(self) -> QtCore.QRectF:
+        rect = QtCore.QRectF()
+        for index in self.visible_pages():
+            rect = rect.united(QtCore.QRectF(self.slot(index),
+                                             QtCore.QSizeF(self.sheet.W, self.sheet.H)))
+        return rect
+
+    def _place_sheet(self):
+        """Put the live page in its slot and draw the others round it."""
+        self.anim.stop()
+        self.sheet.setPos(self.slot(self.page))
+        self.sheet.set_offset(self.page * self.sheet.H)
+        wanted = {i for i in self.visible_pages() if i != self.page}
+        for index in list(self.ghosts):
+            if index not in wanted:
+                self.scene.removeItem(self.ghosts.pop(index))
+        for index in wanted:
+            ghost = self.ghosts.get(index)
+            if ghost is None:
+                ghost = self.ghosts[index] = GhostPage(self, index)
+                self.scene.addItem(ghost)
+            ghost.prepareGeometryChange()
+            ghost.setPos(self.slot(index))
+            ghost.update()
+        self.view.viewport().update()
+
+    def _refresh_ghosts(self):
+        if self.layout == "single":
+            return
+        if set(self.ghosts) | {self.page} != set(self.visible_pages()):
+            self._place_sheet()
+        for ghost in self.ghosts.values():
+            ghost.update()
+        if self.live():
+            self._render_ghosts()
+
+    def set_layout(self, layout: str):
+        """⌘1 one page, ⌘2 a spread, ⌘3 all pages; asking for the layout
+        you are in goes back to one page."""
+        if layout == self.layout and layout != "single":
+            layout = "single"
+        self.layout = layout
+        self.prefs["layout"] = layout
+        self._write_prefs()
+        self._update_grid()
+        if self.editing is not None:
+            self.finish_editing()
+        self._drop_overlay()
+        self._place_sheet()
+        self.view.frame(self.layout_rect(), margin=48)
+        self.toast({"single": "one page", "spread": "spread", "all": "all pages"}[layout])
+        if self.live():
+            self.request_preview()
+            self._render_ghosts()
+        self.focus_text()
+
+    def _update_grid(self):
+        """Columns for the all-pages view, so the grid roughly fills the window."""
+        n = max(self.sheet.pages(), 1)
+        size = self.view.viewport().size()
+        aspect = (size.width() / max(1, size.height())) * (self.sheet.H / self.sheet.W)
+        self._grid_cols = max(1, min(n, round(math.sqrt(n * aspect)) or 1))
+
+    def ghost_at(self, at: QtCore.QPointF) -> GhostPage | None:
+        for ghost in self.ghosts.values():
+            if ghost.sceneBoundingRect().contains(at):
+                return ghost
+        return None
+
+    def page_rect_at(self, at: QtCore.QPointF) -> QtCore.QRectF | None:
+        """The rect of whichever shown page is under `at`."""
+        if self.sheet.scene_page_rect().contains(at):
+            return self.sheet.scene_page_rect()
+        ghost = self.ghost_at(at)
+        return ghost.sceneBoundingRect() if ghost else None
+
+    def make_live(self, index: int):
+        """Make a page shown beside the live one the live one."""
+        if index == self.page:
+            return
+        self.page = index
+        self._drop_overlay()
+        self._place_sheet()
+        if self.live():
+            self.request_preview()
+            self._render_ghosts()
+
+    def live_on(self, at: QtCore.QPointF) -> bool:
+        """If `at` is over a shown page, make that page live; True if so."""
+        ghost = self.ghost_at(at)
+        if ghost is not None:
+            self.make_live(ghost.index)
+        return self.sheet.scene_page_rect().contains(at)
+
+    def paint_ghost(self, painter: QtGui.QPainter, ghost: GhostPage):
+        rect = ghost.boundingRect()
+        painter.fillRect(rect, self.paper())
+        if ghost.index >= self.sheet.pages():
+            return                                  # the blank page after the words
+        if self.live() and ghost.distressed is not None and ghost.distressed[0] == self._ghost_key(ghost.index):
+            painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
+            painter.drawImage(rect, ghost.distressed[1])
+            return
+        export.draw_page(painter, self.sheet, ghost.index, self.ink())
+
+    def _ghost_key(self, index: int) -> tuple:
+        return (index, self.doc.revision(), tuple(sorted(self.snapshot().items())),
+                tuple(asdict(self.fmt).items()), tuple(self.distress.to_dict().items()),
+                tuple(t.text() for t in self.things.values() if isinstance(t, Note) and t.alive))
+
+    def _render_ghosts(self):
+        """In distress view the pages beside the live one are distressed too,
+        a little softer, on the worker thread - the ones in sight only."""
+        seen = self.view.visible_scene_rect()
+        ratio = self.view.devicePixelRatioF() if hasattr(self.view, "devicePixelRatioF") else 1.0
+        dpi = max(60.0, min(200.0, 72.0 * self.view.zoom() * ratio))
+        settings = replace(self.distress, enabled=True)
+        paper, density = export.rgb(self.paper()), self.density()
+        for index, ghost in self.ghosts.items():
+            if index >= self.sheet.pages() or not ghost.sceneBoundingRect().intersects(seen):
+                continue
+            key = self._ghost_key(index)
+            if ghost.distressed is not None and ghost.distressed[0] == key:
+                continue
+            layer = export.ink_layer(self.sheet, index, dpi, self.ink())
+
+            def work(index=index, key=key, layer=layer):
+                try:
+                    out = distress.compose(layer, paper, settings, dpi, density=density)
+                except Exception as exc:
+                    print("ream: page preview failed:", exc, file=sys.stderr)
+                    return
+                self.ghost_ready.emit(index, key, out)
+            self._pool.submit(work)
+
+    def _ghost_arrived(self, index: int, key, out):
+        ghost = self.ghosts.get(index)
+        if ghost is not None and key == self._ghost_key(index):
+            ghost.distressed = (key, export.from_rgb(out))
+            ghost.update()
+
     # -- turning pages -------------------------------------------------------
     def turn_page(self, delta: int):
         """Cmd+Left / Cmd+Right: the previous or next page, with the caret
         moved to its first line so writing carries on there.  Past the last
         page waits a blank one; click it to start writing on it."""
-        target = max(0, min(self.page + delta, self.sheet.pages()))
+        if self.layout == "spread":
+            left, _right = self.spread_of(self.page)
+            target = (left + 2 if left > 0 else 1) if delta > 0 else (left - 2 if left > 1 else 0)
+        else:
+            target = self.page + delta
+        target = max(0, min(target, self.sheet.pages()))
         if target == self.page:
             return
         if self.editing is not None:
@@ -775,6 +973,21 @@ class Ream(QtWidgets.QMainWindow):
         head ("top") or foot ("bottom") of the page is in sight."""
         target = max(0, min(int(target), self.sheet.pages()))
         self._drop_overlay()
+        if self.layout != "single":
+            self.page = target
+            self._place_sheet()
+            page = self.sheet.scene_page_rect()
+            seen = self.view.visible_scene_rect()
+            if not seen.contains(page):
+                margin = REVEAL_PX / self.view.zoom()
+                head = QtCore.QRectF(page.left(), page.top(), page.width(),
+                                     min(page.height(), seen.height()))
+                self.view.ensureVisible(head if reveal != "bottom" else page, int(margin), int(margin))
+                self.view_changed()
+            if self.live():
+                self.request_preview()
+                self._render_ghosts()
+            return
         pan = 0.0
         if reveal:
             zoom = self.view.zoom()
@@ -1084,8 +1297,8 @@ class Ream(QtWidgets.QMainWindow):
         at = at or self.palette_at or self.pointer_scene()
         self.palette_at = None
         before = self.snapshot()
+        on_page = self.live_on(at)
         page = self.sheet.scene_page_rect()
-        on_page = page.contains(at)
         text_width = self.sheet.W - 2 * self.fmt.margin
         x, y, row_h = at.x(), at.y(), 0.0
         z = self.top_z()
@@ -1259,8 +1472,8 @@ class Ream(QtWidgets.QMainWindow):
         line that grows."""
         self.clear_selection()
         before = self.snapshot()
+        on_page = self.live_on(at)
         page = self.sheet.scene_page_rect()
-        on_page = page.contains(at)
         wrap = -1.0
         if on_page:
             x = at.x() - page.left()
@@ -1339,11 +1552,14 @@ class Ream(QtWidgets.QMainWindow):
         self._each_selected(lambda t: t.setRotation(degrees % 360.0))
 
     # -- view ----------------------------------------------------------------
+    def fit_layout(self):
+        self.view.frame(self.layout_rect(), margin=48)
+
     def fit_page(self):
         self.view.frame(self.sheet.scene_page_rect(), margin=48)
 
     def fit_all(self):
-        rect = self.sheet.scene_page_rect()
+        rect = self.layout_rect()
         for thing in self.things.values():
             if thing.alive and not thing.pinned:
                 rect = rect.united(thing.sceneBoundingRect())
@@ -1495,8 +1711,11 @@ class Ream(QtWidgets.QMainWindow):
         self._write_prefs()
         if on:
             self.request_preview()
+            self._render_ghosts()
         else:
             self.hide_preview()
+        for ghost in self.ghosts.values():
+            ghost.update()
         if self.distress_panel is not None:
             self.distress_panel.refresh()
         if not quiet:
@@ -1511,6 +1730,8 @@ class Ream(QtWidgets.QMainWindow):
         if self.live():
             self._live_timer.stop()
             self.request_preview(fast)
+            if not fast:
+                self._render_ghosts()
         elif still:
             self.show_preview()
 
@@ -1616,7 +1837,7 @@ class Ream(QtWidgets.QMainWindow):
         panel.buttons([("reset", self.reset_distress),
                        ("new seed", self._new_seed),
                        ("export pdf", self.export_pdf)])
-        panel.on_release = lambda: self._refresh_live_preview(fast=False)
+        panel.on_release = lambda: (self._refresh_live_preview(fast=False), self._render_ghosts())
         return panel
 
     def _new_seed(self):
@@ -1668,12 +1889,15 @@ class Ream(QtWidgets.QMainWindow):
             self._view_from_panel = True    # closing the panel turns it off again
             self.distress_panel.refresh()
         self.request_preview()
+        self._render_ghosts()
 
     def _distress_panel_closed(self):
         if self._view_from_panel:
             self.distress_view = False
             self._view_from_panel = False
             self.hide_preview()
+            for ghost in self.ghosts.values():
+                ghost.update()
 
     def open_page_panel(self):
         if self.page_panel is None:
@@ -1837,6 +2061,8 @@ class Ream(QtWidgets.QMainWindow):
                 thing.setZValue(entry.get("z", 1.0))
             self.page = max(0, min(int(state.get("page", 0)), self.sheet.pages()))
             self.sheet.set_offset(self.page * self.sheet.H)
+            self._update_grid()
+            self._place_sheet()
             cursor = QtGui.QTextCursor(self.doc)
             cursor.setPosition(max(0, min(int(state.get("caret", 0)),
                                           self.doc.characterCount() - 1)))
@@ -1849,7 +2075,7 @@ class Ream(QtWidgets.QMainWindow):
             self.view.setTransform(QtGui.QTransform.fromScale(view["zoom"], view["zoom"]))
             self.view.centerOn(view["x"], view["y"])
         else:
-            QtCore.QTimer.singleShot(0, self.fit_page)
+            QtCore.QTimer.singleShot(0, self.fit_layout)
         self.view.viewport().update()
 
     def open_document(self, path: str, quiet: bool = False):
@@ -1884,7 +2110,7 @@ class Ream(QtWidgets.QMainWindow):
         self.path = None
         self._ready = True
         self._titled()
-        QtCore.QTimer.singleShot(0, self.fit_page)
+        QtCore.QTimer.singleShot(0, self.fit_layout)
         QtCore.QTimer.singleShot(0, self.focus_text)
 
     def browse_open(self):
@@ -1924,6 +2150,7 @@ class Ream(QtWidgets.QMainWindow):
         if self._loading:
             return
         self.save_timer.start()
+        self._refresh_ghosts()
         if self.live():
             self._schedule_live()
         elif self.preview is not None:
@@ -2007,8 +2234,13 @@ class Ream(QtWidgets.QMainWindow):
         out += [C(f"theme · {name}", partial(self._set_theme, name),
                   dot if name == self.theme else "", "canvas colour") for name in style.THEMES]
         out += [
-            C("fit page", self.fit_page, "⌘0", "zoom view"),
-            C("actual size", self.actual_size, "⌘1", "zoom 100"),
+            C("fit page", self.fit_layout, "⌘0", "zoom view spread all"),
+            C("actual size", self.actual_size, "", "zoom 100"),
+            C("one page", partial(self.set_layout, "single"), "⌘1", "single view layout"),
+            C("spread", partial(self.set_layout, "spread"), "⌘2",
+              "two pages book facing view layout double"),
+            C("all pages", partial(self.set_layout, "all"), "⌘3",
+              "expand grid overview every page view layout"),
             C("fit everything", self.fit_all, "⇧⌘0", "zoom canvas all"),
         ]
         if self.selection():
@@ -2106,8 +2338,11 @@ class Ream(QtWidgets.QMainWindow):
             ("Ctrl+O", self.browse_files),
             ("Ctrl+Shift+O", self.browse_open), ("Ctrl+S", self.save),
             ("Ctrl+Shift+S", self.save_as), ("Ctrl+N", self.new_document),
-            ("Ctrl+0", self.fit_page), ("Ctrl+Shift+0", self.fit_all),
-            ("Ctrl+1", self.actual_size), ("Ctrl+Return", self.new_page),
+            ("Ctrl+0", self.fit_layout), ("Ctrl+Shift+0", self.fit_all),
+            ("Ctrl+1", partial(self.set_layout, "single")),
+            ("Ctrl+2", partial(self.set_layout, "spread")),
+            ("Ctrl+3", partial(self.set_layout, "all")),
+            ("Ctrl+Return", self.new_page),
             ("Ctrl+=", lambda: self.view.zoom_by(1.25)), ("Ctrl++", lambda: self.view.zoom_by(1.25)),
             ("Ctrl+-", lambda: self.view.zoom_by(0.8)), ("Ctrl+Q", self.close),
         ]

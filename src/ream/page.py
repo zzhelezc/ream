@@ -208,6 +208,27 @@ class Note(Thing):
         self.editor.document().documentLayout().draw(painter, context)
 
 
+class GhostPage(QtWidgets.QGraphicsItem):
+    """Another page of the document, beside the live one in the spread and
+    all-pages views.  It is drawn straight from the document (vector, so it
+    is sharp at any zoom), or from a distressed rendering in distress view.
+    Click it and it becomes the live page."""
+
+    def __init__(self, controller, index: int):
+        super().__init__()
+        self.controller = controller
+        self.index = index
+        self.distressed: tuple | None = None     # (key, QImage) in distress view
+        self.setZValue(-10)
+
+    def boundingRect(self) -> QtCore.QRectF:
+        sheet = self.controller.sheet
+        return QtCore.QRectF(0.0, 0.0, sheet.W, sheet.H)
+
+    def paint(self, painter, option, widget=None):
+        self.controller.paint_ghost(painter, self)
+
+
 def bump_uids(uid: int):
     """Keep fresh ids above any loaded from a project."""
     global _uids

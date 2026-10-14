@@ -56,6 +56,7 @@ There is one sheet, centred on the canvas, and only ever one page on screen.
   page, so you can carry on writing there.
 - **Scrolling never turns a page.** Over the page it pans, the same as
   anywhere else.
+- **Three views:** `⌘1` one page, `⌘2` a spread, `⌘3` all pages (below).
 - **A blank page** waits after the last one. Click on it to start writing
   there; the page breaks go in for you.
 - **New page** (`⌘↵`) breaks the page at the caret.
@@ -83,6 +84,32 @@ page's own words or anything else.
 Blocks always take the document's face, size, line height and paragraph
 spacing, and change with them.
 
+### Spread and all pages
+
+| Key | View |
+| --- | --- |
+| `⌘1` | one page (the default) |
+| `⌘2` | a **spread**: two facing pages, like an open book |
+| `⌘3` | **all pages** in a grid, sized to fit the window |
+
+Pressing the key of the view you are in goes back to one page. Each view frames
+itself when you switch, and `⌘0` re-frames it.
+
+- **Spread.** Pages pair the way a book's do: the first page alone on the
+  right, then 2 | 3, 4 | 5 and so on. `⌘←` and `⌘→` turn a whole spread.
+- **All pages.** Every page is numbered underneath; the live one is marked
+  with a dot.
+- **You keep writing in every view.** The page holding the caret is the live
+  one. Click any other page and it becomes live, with the caret where you
+  clicked. Typing past the foot of a page carries on into the next one,
+  wherever it sits.
+- **Pinning and ⌘-click text** work on any page you can see. Drop an image
+  on the facing page and it pins to that page.
+- **The other pages** are drawn straight from the document, so they are sharp
+  at any zoom. In distress view they are distressed too, the ones in sight,
+  and they re-render after a change.
+- **Exports** are the same whichever view you are in.
+
 The text is plain: one face, one size, one line height and one paragraph
 spacing for the whole document, set from the page panel or the palette. The default face is the first installed of
 IBM Plex Mono, Iosevka, JetBrains Mono, Roboto Mono, Space Mono, Departure
@@ -94,8 +121,8 @@ Mono, SF Mono or Menlo, at 9 pt with 150% leading on A4.
   dragging the empty canvas. Pinch or `⌘`+scroll zooms at the pointer, and `Alt`+scroll
   pans anywhere. `Space`+drag and middle-drag pan too, while an image is
   selected.
-- **Zoom shortcuts:** `⌘0` fits the page, `⇧⌘0` fits everything and `⌘1` goes
-  to 100%.
+- **Zoom shortcuts:** `⌘0` fits the page (or the spread, or all pages),
+  `⇧⌘0` fits everything. **actual size** in the palette goes to 100%.
 - **Adding images and PDFs:** drop them, paste them (`⌘V`), browse with `⌘O`,
   or double-click the empty canvas. They land where you drop or click. Phone
   photos come in the right way up. Each page of a PDF becomes its own image,
@@ -161,6 +188,7 @@ the number.
 | Distress | distress view (`⇧⌘D`), distress on/off, style · …, fade texture · …, reset distress |
 | Page and type | page size · a4 / letter / a5 / square, paper · white / cream / newsprint / bond, paper colour…, canvas colour…, font · … |
 | Pages | new page, next page (`⌘→`), previous page (`⌘←`), go to page |
+| Views | one page (`⌘1`), spread (`⌘2`), all pages (`⌘3`), fit page (`⌘0`) |
 | Look | theme · paper / white / night |
 | Selection (images and text blocks) | rotate 90° right / left, rotate, straighten, delete, bring to front, send behind text, unpin from page, fit to text width, natural size |
 | File | new document (`⌘N`), open… (`⇧⌘O`), save (`⌘S`), save as… (`⇧⌘S`), show drafts, word count, quit |
