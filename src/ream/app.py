@@ -1,0 +1,2159 @@
+"""
+The window, and everything ream does.
+
+There is no chrome.  The canvas, one page, and a palette on Tab.
+
+- **Writing.**  The page's text editor has the keyboard unless an image is
+  selected.  Typing past the foot of a page moves on to the next one; the
+  strip of pages slides and the view follows the caret.
+- **Pages.**  Cmd+Left and Cmd+Right turn them; the caret goes along.
+  Scrolling never turns a page: it pans, over the page or not.  Pinch or
+  Cmd+scroll zooms, and dragging the empty canvas pans.
+- **Things.**  Images and PDF pages are dropped, pasted or browsed onto the
+  canvas.  Drag one so its middle is over the page and it is pinned to that
+  page: it scrolls with it and goes out with the PDF.  Drag it off to unpin.
+  The corner square resizes.
+- **Undo** covers words and things in one history.
+- **Saving** is automatic: to the document's file once it has one, to the
+  draft until then.  Starting a new document files the old draft away.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, fields, replace
+from functools import partial
+from pathlib import Path
+
+from PyQt5 import QtCore, QtGui, QtWidgets
+
+from . import __version__, distress, export, project, style
+from .canvas import CanvasView
+from .page import Note, NoteText, Sheet, Thing
+from .palette import Command, CommandPalette
+from .panel import Panel
+
+HANDLE_PX = 7
+KNOB_PX = 22            # how far the rotation knob stands off the top edge
+REVEAL_PX = 40          # room kept around the page when the view follows it
+PREVIEW_DPI = 150
+PREVIEW_MAX_DPI = 600
+CANVAS_SWATCHES = ["#e8e7e3", "#ffffff", "#d9d6cc", "#b9b7b0", "#535353", "#2a2a2a", "#161616", "#c8d3cf"]
+
+
+def home() -> Path:
+    base = os.environ.get("REAM_HOME") or os.path.expanduser("~/Library/Application Support/ream")
+    path = Path(base)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+@dataclass
+class Format:
+    page: str = "a4"
+    font: str = ""              # "" = the first installed of style.MONO
+    size: float = 9.0           # pt
+    line: float = 150.0         # % of the font's line height
+    margin: float = 64.0        # pt, left and right
+    head: float = 70.0          # pt, top and bottom
+    para: float = 0.0           # pt of space after each paragraph
+    paper: str = "white"        # a name from style.PAPERS or "#rrggbb"
+    ink: float = 100.0          # %: 100 is solid black, lower fades toward the paper,
+                                # higher strikes heavier and packs the ink denser
+    dpi: float = 300.0          # export
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "Format":
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in (data or {}).items() if k in known})
+
+
+FORMAT_PARAMS = {"size": (5, 72), "line": (80, 300), "para": (0, 72), "margin": (0, 200),
+                 "head": (0, 200), "dpi": (72, 1200), "ink": (5, 150)}
+
+
+@contextmanager
+def busy():
+    QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+    try:
+        yield
+    finally:
+        QtWidgets.QApplication.restoreOverrideCursor()
+
+
+class Ream(QtWidgets.QMainWindow):
+    preview_ready = QtCore.pyqtSignal(int, object)      # from the preview worker
+
+    def __init__(self, paths: list[str] | None = None, theme: str | None = None):
+        super().__init__()
+        self.home = home()
+        self.prefs = self._read_prefs()
+        self.theme = theme or self.prefs.get("theme", style.DEFAULT_THEME)
+        if self.theme not in style.THEMES:
+            self.theme = style.DEFAULT_THEME
+
+        self.scene = QtWidgets.QGraphicsScene(self)
+        self.view = CanvasView(self, self.scene)
+        self.setCentralWidget(self.view)
+        self.sheet = Sheet(self)
+        self.scene.addItem(self.sheet)
+        self.doc = self.sheet.doc
+
+        self.fmt = Format()
+        self.distress = distress.Settings()
+        self.things: dict[int, Thing] = {}          # every thing, alive or not (undo)
+        self.page = 0
+        self.path: str | None = None                # None: the draft
+        self.history: list[tuple[str, object]] = []
+        self.future: list[tuple[str, object]] = []
+        self.drag: dict | None = None
+        self.preview: QtWidgets.QGraphicsPixmapItem | None = None
+        self.palette_at: QtCore.QPointF | None = None
+        self._loading = False
+        self._ready = False                         # nothing is saved before a load
+        self._undoing = False
+        self._joining = False                       # a slider drag is one undo step
+        self._pending_key: str | None = None
+        self._preview_gen = 0
+        self._ink_cache: tuple | None = None
+        self._pool = ThreadPoolExecutor(max_workers=1)
+        self.preview_ready.connect(self._preview_arrived)
+        self.distress_panel: Panel | None = None
+        self.page_panel: Panel | None = None
+        self.editing: Note | None = None            # the free text being written
+        self.distress_view = False                  # write on the distressed page
+        self._view_from_panel = False
+        self._last_edit = 0.0
+        self._live_timer = QtCore.QTimer(self, singleShot=True, interval=30)
+        self._live_timer.timeout.connect(lambda: self._render_live(fast=True))
+        self._idle_timer = QtCore.QTimer(self, singleShot=True, interval=450)
+        self._idle_timer.timeout.connect(lambda: self._render_live(fast=False))
+        self._view_timer = QtCore.QTimer(self, singleShot=True, interval=160)
+        self._view_timer.timeout.connect(lambda: self._render_live(fast=False))
+        self._note_birth: tuple[int, int] | None = None
+
+        self.save_timer = QtCore.QTimer(self, singleShot=True, interval=1200)
+        self.save_timer.timeout.connect(self.autosave)
+        self.anim = QtCore.QVariantAnimation(self)
+        self.anim.setDuration(260)
+        self.anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        self.anim.setStartValue(0.0)
+        self.anim.setEndValue(1.0)
+        self.anim.valueChanged.connect(self._animate)
+        self._flip = {"from": 0.0, "to": 0.0, "pan": 0.0, "panned": 0.0}
+
+        self.doc.contentsChanged.connect(self.changed)
+        self.doc.undoCommandAdded.connect(lambda: self.push("text", None))
+
+        self.palette = CommandPalette(self, self.commands, self.dynamic, self.caption,
+                                      self.prefs.get("recents"))
+        self.palette.on_ran = self._remember_recents
+        self._shortcuts()
+
+        self.setWindowTitle("ream")
+        self.setMinimumSize(480, 360)
+        geometry = self.prefs.get("geometry")
+        if geometry:
+            self.restoreGeometry(QtCore.QByteArray.fromHex(geometry.encode()))
+        else:
+            self.resize(1280, 860)
+        self.apply_theme()
+
+        # the textures take a few seconds to pull out of the PSDs the first time
+        threading.Thread(target=distress.library, daemon=True).start()
+
+        documents = [p for p in (paths or []) if p.lower().endswith(project.SUFFIX)]
+        others = [p for p in (paths or []) if not p.lower().endswith(project.SUFFIX)]
+        last = self.prefs.get("last")
+        if documents:
+            self.open_document(documents[0], quiet=True)
+        elif last and os.path.exists(last):
+            self.open_document(last, quiet=True)
+        elif self.draft_path().exists():
+            self.open_document(str(self.draft_path()), quiet=True)
+        else:
+            self.new_document(archive=False)
+        if others:
+            QtCore.QTimer.singleShot(0, lambda: self.add_files(others, None))
+        if self.prefs.get("distress_view"):
+            QtCore.QTimer.singleShot(0, lambda: self.set_distress_view(True, quiet=True))
+
+    # -- prefs ---------------------------------------------------------------
+    def _read_prefs(self) -> dict:
+        try:
+            return json.loads((self.home / "prefs.json").read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def _write_prefs(self):
+        try:
+            (self.home / "prefs.json").write_text(json.dumps(self.prefs, indent=1))
+        except OSError:
+            pass
+
+    def _remember_recents(self, recents: list[str]):
+        self.prefs["recents"] = recents
+        self._write_prefs()
+
+    def draft_path(self) -> Path:
+        return self.home / "draft.ream"
+
+    # -- look ----------------------------------------------------------------
+    def th(self) -> dict:
+        return style.THEMES[self.theme]
+
+    def ink(self) -> QtGui.QColor:
+        """The ink, faded toward the paper as `ink` darkness drops."""
+        k = max(0.0, min(1.0, self.fmt.ink / 100.0))
+        dark, paper = style.qc(style.PAGE_INK), self.paper()
+        return QtGui.QColor(*(int(round(p + (d - p) * k)) for d, p in (
+            (dark.red(), paper.red()), (dark.green(), paper.green()), (dark.blue(), paper.blue()))))
+
+    def density(self) -> float:
+        """Past 100% the ink packs denser in the distress: 150% is 3×."""
+        return 1.0 + max(0.0, self.fmt.ink - 100.0) / 50.0 * 2.0
+
+    def weight(self) -> int:
+        """Past 100% the type strikes heavier: regular at 100, bold at 150.
+        IBM Plex Mono's weights share one width, so nothing reflows."""
+        return int(round(50 + max(0.0, min(50.0, self.fmt.ink - 100.0)) / 50.0 * 25))
+
+    def set_ink(self, value: float):
+        heavier = self.weight()
+        self.fmt.ink = max(5.0, min(150.0, value))
+        if self.weight() != heavier:
+            self.apply_format()
+        self.sheet.text.setDefaultTextColor(self.ink())
+        for thing in self.things.values():
+            if isinstance(thing, Note):
+                thing.editor.setDefaultTextColor(self.ink())
+        for panel in (self.distress_panel, self.page_panel):
+            if panel is not None and panel.isVisible():
+                panel.refresh()             # both panels carry an ink slider
+        self.changed()
+
+    def paper(self) -> QtGui.QColor:
+        value = style.PAPERS.get(self.fmt.paper, self.fmt.paper)
+        colour = QtGui.QColor(value)
+        return colour if colour.isValid() else style.qc("#ffffff")
+
+    def canvas_colour(self) -> str:
+        return self.prefs.get("canvas") or self.th()["canvas"]
+
+    def apply_theme(self):
+        self.view.set_background(style.qc(self.canvas_colour()))
+        self.prefs["theme"] = self.theme
+        self._write_prefs()
+
+    def set_canvas(self, colour: str):
+        self.prefs["canvas"] = QtGui.QColor(colour).name()
+        self.apply_theme()
+
+    def set_paper(self, colour: str):
+        self.fmt.paper = colour
+        self.sheet.set_paper(self.paper())
+        self.set_ink(self.fmt.ink)           # faded ink fades toward the new paper
+
+    def block_format(self) -> QtGui.QTextBlockFormat:
+        fmt = QtGui.QTextBlockFormat()
+        fmt.setLineHeight(self.fmt.line, QtGui.QTextBlockFormat.ProportionalHeight)
+        fmt.setBottomMargin(self.fmt.para)
+        return fmt
+
+    def face(self) -> str:
+        return self.fmt.font if self.fmt.font and style.installed(self.fmt.font) else style.default_face()
+
+    def apply_format(self):
+        """Page size, margins, face, paper - none of it in the undo history."""
+        w, h = style.PAGE_SIZES.get(self.fmt.page, style.PAGE_SIZES["a4"])
+        font = QtGui.QFont(self.face())
+        font.setPointSizeF(self.fmt.size)
+        font.setStyleHint(QtGui.QFont.Monospace)
+        font.setHintingPreference(QtGui.QFont.PreferNoHinting)
+        font.setWeight(self.weight())
+        undo = self.doc.isUndoRedoEnabled()
+        loading, self._loading = self._loading, True
+        steps = self.doc.availableUndoSteps()
+        self.doc.setDefaultFont(font)
+        self.sheet.set_geometry(w, h, self.fmt.margin, self.fmt.head)
+        self.sheet.text.setDefaultTextColor(self.ink())
+        self.sheet.set_paper(self.paper())
+        self._loading = loading
+        # a frame format change can land in Qt's undo stack; keep ours in step
+        extra = self.doc.availableUndoSteps() - steps
+        if undo and extra > 0:
+            for _ in range(extra):
+                self.history.append(("text", None))
+        self.page = min(self.page, self.sheet.pages())
+        self.sheet.set_offset(self.page * self.sheet.H)
+        self.restyle_notes()
+        self.view.viewport().update()
+
+    def doc_font(self) -> QtGui.QFont:
+        return self.doc.defaultFont()
+
+    def restyle_notes(self):
+        for thing in self.things.values():
+            if isinstance(thing, Note):
+                thing.style(self.doc_font(), self.block_format(), self.ink())
+
+    def _format_edit(self, key: str, edit):
+        """A layout change that Qt keeps in the words' undo stack (block and
+        frame formats).  Repeats of the same change in a row - a slider being
+        dragged - join one edit block, so they undo as one step."""
+        join = bool(self.history) and self.history[-1] == ("text", key) \
+            and self.doc.availableUndoSteps() > 0
+        cursor = QtGui.QTextCursor(self.doc)
+        if join:
+            self._joining = True
+            cursor.joinPreviousEditBlock()
+        else:
+            self._pending_key = key
+            cursor.beginEditBlock()
+        try:
+            edit(cursor)
+            cursor.endEditBlock()
+        finally:
+            self._joining = False
+            self._pending_key = None
+        self.changed()
+
+    def _merge_blocks(self, fmt: QtGui.QTextBlockFormat):
+        def edit(cursor):
+            cursor.select(QtGui.QTextCursor.Document)
+            cursor.mergeBlockFormat(fmt)
+        return edit
+
+    def set_line_height(self, value: float):
+        self.fmt.line = value
+        fmt = QtGui.QTextBlockFormat()
+        fmt.setLineHeight(value, QtGui.QTextBlockFormat.ProportionalHeight)
+        self._format_edit("line", self._merge_blocks(fmt))
+        self.restyle_notes()
+        self.caret_moved(follow=False)
+
+    def set_para(self, value: float):
+        self.fmt.para = value
+        fmt = QtGui.QTextBlockFormat()
+        fmt.setBottomMargin(value)
+        self._format_edit("para", self._merge_blocks(fmt))
+        self.restyle_notes()
+        self.caret_moved(follow=False)
+
+    def set_margins(self, side: float | None = None, head: float | None = None):
+        if side is not None:
+            self.fmt.margin = side
+        if head is not None:
+            self.fmt.head = head
+        self._format_edit("margin:side" if head is None else "margin:head",
+                          lambda cursor: self.sheet.set_margins(self.fmt.margin, self.fmt.head))
+        self.caret_moved(follow=False)
+
+    def set_size(self, value: float):
+        self.fmt.size = value
+        self.apply_format()
+        self.changed()
+
+    # -- overlay -------------------------------------------------------------
+    def page_rect_view(self) -> QtCore.QRectF:
+        return self.view.viewportTransform().mapRect(self.sheet.scene_page_rect())
+
+    def pages_shown(self) -> int:
+        return max(self.sheet.pages(), self.page + 1)
+
+    def paint_overlay(self, painter: QtGui.QPainter):
+        th = self.th()
+        rect = self.page_rect_view()
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        if th["edge"]:
+            pen = QtGui.QPen(style.qc(th["edge"]), 1.0)
+            if th["dotted"]:
+                pen.setStyle(QtCore.Qt.CustomDashLine)
+                pen.setDashPattern([1.0, 3.0])
+            painter.setPen(pen)
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.drawRect(rect.adjusted(-1, -1, 0, 0))
+        if self.drag and self.drag.get("mode") == "move" and self.drag.get("over"):
+            painter.setPen(QtGui.QPen(style.qc(style.INK if self.theme != "night" else "#ffffff"), 2.0))
+            painter.drawRect(rect.adjusted(-3, -3, 2, 2))
+
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
+        painter.setFont(style.ui_font(11))
+        painter.setPen(style.qc(th["meta"]))
+        label = f"{self.page + 1:02d} / {self.pages_shown():02d}"
+        if self.page >= self.sheet.pages():
+            label = f"{self.page + 1:02d} / blank"
+        painter.drawText(QtCore.QPointF(rect.left(), rect.bottom() + 20), label)
+        if self.preview is not None:
+            tag = f"distress · {self.distress.style}"
+            width = QtGui.QFontMetrics(painter.font()).horizontalAdvance(tag)
+            painter.drawText(QtCore.QPointF(rect.right() - width, rect.bottom() + 20), tag)
+
+        mark = style.qc(style.INK if self.canvas_is_light() else "#ffffff")
+        line = QtGui.QPen(mark, 1.0, QtCore.Qt.CustomDashLine)
+        line.setDashPattern([3.0, 3.0])
+        for thing in self.selection():
+            corners, knob, top = self._handles(thing)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            painter.setPen(line)
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.drawPolygon(corners)
+            painter.setPen(QtGui.QPen(mark, 1.0))
+            painter.drawLine(top, knob)
+            painter.setPen(QtGui.QPen(style.qc(style.INK), 1.0))
+            painter.setBrush(style.qc("#ffffff"))
+            painter.drawEllipse(knob, 4.0, 4.0)
+            painter.drawRect(self._handle_rect(corners[2]))
+        self._paint_live_caret(painter)
+        if self.drag and self.drag.get("mode") == "rotate":
+            thing = self.drag["thing"]
+            painter.setPen(style.qc(self.th()["meta"]))
+            painter.setFont(style.ui_font(11))
+            corner = self._handles(thing)[1]
+            painter.drawText(corner + QtCore.QPointF(10, -6), f"{thing.rotation() % 360:.0f}°")
+
+    def _paint_live_caret(self, painter: QtGui.QPainter):
+        """Over the live distress view the real words are hidden, so the
+        caret and the selection are drawn here, on top."""
+        if self.preview is None or not self.live():
+            return
+        if abs(self.sheet.offset - self.page * self.sheet.H) > 0.5:
+            return
+        focus = self.scene.focusItem()
+        if focus is self.sheet.text:
+            editor = focus
+        elif isinstance(focus, NoteText) and self.editing is focus.note:
+            editor = focus
+        else:
+            return
+        doc, layout = editor.document(), editor.document().documentLayout()
+        cursor = editor.textCursor()
+        transform = self.view.viewportTransform()
+        page = self.sheet.scene_page_rect()
+
+        def to_view(rect: QtCore.QRectF) -> QtGui.QPolygonF:
+            return transform.map(editor.mapToScene(rect))
+
+        painter.save()
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.setClipRect(transform.mapRect(page) if editor.note_pinned() else
+                            QtCore.QRectF(self.view.viewport().rect()))
+        if cursor.hasSelection():
+            start, end = cursor.selectionStart(), cursor.selectionEnd()
+            shade = QtGui.QColor(style.INK)
+            shade.setAlpha(55)
+            block = doc.findBlock(start)
+            while block.isValid() and block.position() <= end:
+                origin = layout.blockBoundingRect(block).topLeft()
+                lines = block.layout()
+                for i in range(lines.lineCount()):
+                    line = lines.lineAt(i)
+                    a = max(start, block.position() + line.textStart())
+                    b = min(end, block.position() + line.textStart() + line.textLength())
+                    if b < a:
+                        continue
+                    x0 = line.cursorToX(a - block.position())[0]
+                    x1 = line.cursorToX(b - block.position())[0]
+                    if b == block.position() + line.textStart() + line.textLength() and b < end:
+                        x1 += 4                     # the line break is chosen too
+                    rect = QtCore.QRectF(origin.x() + x0, origin.y() + line.y(),
+                                         max(1.0, x1 - x0), line.height())
+                    painter.setPen(QtCore.Qt.NoPen)
+                    painter.setBrush(shade)
+                    painter.drawPolygon(to_view(rect))
+                block = block.next()
+        block = cursor.block()
+        origin = layout.blockBoundingRect(block).topLeft()
+        lines = block.layout()
+        if lines is not None and lines.lineCount():
+            line = lines.lineForTextPosition(cursor.positionInBlock())
+            if not line.isValid():
+                line = lines.lineAt(lines.lineCount() - 1)
+            x = origin.x() + line.cursorToX(cursor.positionInBlock())[0]
+            y, height = origin.y() + line.y(), line.height()
+        else:
+            x, y = origin.x(), origin.y()
+            height = QtGui.QFontMetricsF(doc.defaultFont()).height()
+        caret = to_view(QtCore.QRectF(x, y, 0.0, height))
+        painter.setPen(QtGui.QPen(self.ink(), max(1.5, 1.2 * self.view.zoom())))
+        painter.drawLine(caret[0], caret[3])
+        painter.restore()
+
+    def paint_toast(self, painter: QtGui.QPainter, text: str):
+        painter.setFont(style.ui_font(11))
+        painter.setPen(style.qc(self.th()["meta"]))
+        area = QtCore.QRectF(self.view.viewport().rect()).adjusted(18, 0, -18, -16)
+        painter.drawText(area, QtCore.Qt.AlignLeft | QtCore.Qt.AlignBottom, text)
+
+    def _handle_rect(self, corner: QtCore.QPointF) -> QtCore.QRectF:
+        s = HANDLE_PX
+        return QtCore.QRectF(corner.x() - s / 2, corner.y() - s / 2, s, s)
+
+    def _handles(self, thing: Thing):
+        """In view pixels: the turned outline, the rotation knob, and the
+        middle of the top edge it hangs from."""
+        transform = self.view.viewportTransform()
+        corners = transform.map(thing.outline())
+        top = (corners[0] + corners[1]) / 2
+        middle = (corners[0] + corners[2]) / 2
+        up = top - middle
+        length = math.hypot(up.x(), up.y()) or 1.0
+        knob = top + up * (KNOB_PX / length)
+        return corners, knob, top
+
+    def canvas_is_light(self) -> bool:
+        return QtGui.QColor(self.canvas_colour()).lightness() > 110
+
+    def toast(self, text: str):
+        self.view.toast(text)
+
+    # -- selection -----------------------------------------------------------
+    def selection(self) -> list[Thing]:
+        return [i for i in self.scene.selectedItems() if isinstance(i, Thing) and i.alive]
+
+    def clear_selection(self):
+        if self.scene.selectedItems():
+            self.scene.clearSelection()
+            self.view.viewport().update()
+
+    def select(self, things: list[Thing]):
+        self.scene.clearSelection()
+        for thing in things:
+            thing.setSelected(True)
+        if things:
+            self.sheet.text.clearFocus()
+        self.view.viewport().update()
+
+    def typing(self) -> bool:
+        return not self.selection()
+
+    def focus_text(self):
+        if not self.view.hasFocus():
+            self.view.setFocus(QtCore.Qt.OtherFocusReason)
+        if self.scene.focusItem() is not self.sheet.text:
+            self.scene.setFocusItem(self.sheet.text, QtCore.Qt.OtherFocusReason)
+        self.sheet.text.setFocus()
+
+    def thing_at(self, scene_pos: QtCore.QPointF, behind: bool = False) -> Thing | None:
+        page = self.sheet.scene_page_rect()
+        for item in self.scene.items(scene_pos):
+            if isinstance(item, NoteText):
+                item = item.note
+            if not isinstance(item, Thing) or not item.alive:
+                continue
+            if item.pinned:
+                if not page.contains(scene_pos):
+                    continue
+                if item.zValue() < 0 and not behind:
+                    continue                # behind the words: Alt+click reaches it
+            return item
+        return None
+
+    def handle_at(self, view_pos: QtCore.QPointF) -> tuple[Thing, str] | None:
+        """(thing, "scale" | "rotate") under the pointer, for a selected thing."""
+        for thing in self.selection():
+            corners, knob, _top = self._handles(thing)
+            if math.hypot(view_pos.x() - knob.x(), view_pos.y() - knob.y()) <= 8:
+                return thing, "rotate"
+            if self._handle_rect(corners[2]).adjusted(-5, -5, 5, 5).contains(view_pos):
+                return thing, "scale"
+        return None
+
+    def pin(self, thing: Thing):
+        if thing.pinned:
+            return
+        at = thing.scenePos()
+        thing.setParentItem(self.sheet.strip)
+        thing.setPos(self.sheet.strip.mapFromScene(at))
+        front = [t.zValue() for t in self.sheet.pinned() if t is not thing and t.zValue() >= 0]
+        thing.setZValue(max(front, default=0.0) + 1.0)
+
+    def unpin(self, thing: Thing):
+        if not thing.pinned:
+            return
+        at = thing.scenePos()
+        thing.setParentItem(None)
+        thing.setPos(at)
+
+    def top_z(self) -> float:
+        return max((t.zValue() for t in self.things.values() if t.alive and not t.pinned),
+                   default=0.0)
+
+    # -- mouse ---------------------------------------------------------------
+    def press(self, event: QtGui.QMouseEvent) -> bool:
+        self._stale()
+        if event.button() != QtCore.Qt.LeftButton:
+            return event.button() == QtCore.Qt.RightButton
+        pos = event.localPos()
+        at = self.view.mapToScene(pos.toPoint())
+        mods = event.modifiers()
+        if self.editing is not None:
+            if self._inside(self.editing, at):
+                return False                # the note's editor places the caret
+            self.finish_editing()
+        if mods & QtCore.Qt.ControlModifier:
+            # Cmd+click: write from here, over whatever is there
+            hit = self.thing_at(at)
+            if isinstance(hit, Note):
+                self.start_editing(hit, at)
+                return True
+            self.new_note(at)
+            return True
+        grabbed = self.handle_at(pos)
+        if grabbed is not None:
+            thing, kind = grabbed
+            centre = thing.mapToScene(thing.transformOriginPoint())
+            self.drag = {"mode": kind, "thing": thing, "before": self.snapshot(),
+                         "w": thing.w, "h": thing.h, "centre": centre,
+                         "reach": max(1e-6, math.hypot(at.x() - centre.x(), at.y() - centre.y())),
+                         "angle": math.degrees(math.atan2(at.y() - centre.y(), at.x() - centre.x())),
+                         "rotation": thing.rotation()}
+            return True
+        thing = self.thing_at(at, behind=bool(mods & QtCore.Qt.AltModifier))
+        if thing is not None:
+            if mods & QtCore.Qt.ShiftModifier:
+                thing.setSelected(not thing.isSelected())
+            elif not thing.isSelected():
+                self.select([thing])
+            self.sheet.text.clearFocus()
+            self.drag = {"mode": "press", "lead": thing, "start": at, "press": pos,
+                         "before": self.snapshot()}
+            self.view.viewport().update()
+            return True
+        self.clear_selection()
+        page = self.sheet.scene_page_rect()
+        if page.contains(at):
+            y = at.y() - page.top() + self.page * self.sheet.H
+            if y >= self.sheet.text_pages() * self.sheet.H:
+                self.write_on(int(y // self.sheet.H))
+                return True
+            self.focus_text()
+            return False                    # the text editor places the caret
+        self.view.start_pan(pos)
+        return True
+
+    def move(self, event: QtGui.QMouseEvent) -> bool:
+        pos = event.localPos()
+        at = self.view.mapToScene(pos.toPoint())
+        drag = self.drag
+        if drag is None:
+            self._hover_cursor(pos, at)
+            return True
+        if drag["mode"] == "press":
+            if (pos - drag["press"]).manhattanLength() < 3:
+                return True
+            drag["mode"] = "move"
+            drag["things"] = self.selection() or [drag["lead"]]
+            for n, thing in enumerate(drag["things"]):
+                self.unpin(thing)
+                thing.setZValue(100000.0 + n)   # above everything while carried
+            drag["from"] = [t.pos() for t in drag["things"]]
+        if drag["mode"] == "move":
+            delta = at - drag["start"]
+            for thing, origin in zip(drag["things"], drag["from"]):
+                thing.setPos(origin + delta)
+            lead = drag["lead"]
+            drag["over"] = self.sheet.scene_page_rect().contains(lead.sceneBoundingRect().center())
+        elif drag["mode"] == "scale" and isinstance(drag["thing"], Note):
+            note = drag["thing"]
+            note.set_width(note.mapFromScene(at).x())
+        elif drag["mode"] == "scale":
+            thing, centre = drag["thing"], drag["centre"]
+            factor = max(0.02, math.hypot(at.x() - centre.x(), at.y() - centre.y()) / drag["reach"])
+            thing.resize(drag["w"] * factor, drag["h"] * factor)
+        elif drag["mode"] == "rotate":
+            thing, centre = drag["thing"], drag["centre"]
+            angle = math.degrees(math.atan2(at.y() - centre.y(), at.x() - centre.x()))
+            turned = drag["rotation"] + angle - drag["angle"]
+            if event.modifiers() & QtCore.Qt.ShiftModifier:
+                turned = round(turned / 15.0) * 15.0
+            thing.setRotation(turned % 360.0)
+        self.view.viewport().update()
+        return True
+
+    def release(self, event: QtGui.QMouseEvent):
+        drag, self.drag = self.drag, None
+        if drag is None:
+            return
+        if drag["mode"] == "move":
+            page = self.sheet.scene_page_rect()
+            carried = drag["things"]
+            z = max((t.zValue() for t in self.things.values()
+                     if t.alive and not t.pinned and t not in carried), default=0.0)
+            for thing in carried:
+                z += 1.0
+                thing.setZValue(z)
+                if page.contains(thing.sceneBoundingRect().center()):
+                    self.pin(thing)
+            self.push("things", drag["before"])
+            self.changed()
+        elif drag["mode"] in ("scale", "rotate"):
+            self.push("things", drag["before"])
+            self.changed()
+        self.view.viewport().update()
+
+    def double_click(self, event: QtGui.QMouseEvent) -> bool:
+        at = self.view.mapToScene(event.pos())
+        hit = self.thing_at(at)
+        if isinstance(hit, Note):
+            if self.editing is not hit:
+                self.start_editing(hit, at)
+                return True
+            return False                    # already writing: selects a word
+        if hit is not None:
+            return True
+        if self.sheet.scene_page_rect().contains(at):
+            return False                    # selects a word
+        self.browse_files(at)
+        return True
+
+    def _hover_cursor(self, pos: QtCore.QPointF, at: QtCore.QPointF):
+        viewport = self.view.viewport()
+        if self.view.space_down:
+            viewport.setCursor(QtCore.Qt.OpenHandCursor)
+        elif self.editing is not None and self._inside(self.editing, at):
+            viewport.setCursor(QtCore.Qt.IBeamCursor)
+        elif self.handle_at(pos) is not None:
+            kind = self.handle_at(pos)[1]
+            viewport.setCursor(QtCore.Qt.SizeFDiagCursor if kind == "scale"
+                               else QtCore.Qt.CrossCursor)
+        elif self.thing_at(at) is not None:
+            viewport.setCursor(QtCore.Qt.SizeAllCursor)
+        elif self.sheet.scene_page_rect().contains(at):
+            viewport.setCursor(QtCore.Qt.IBeamCursor)
+        else:
+            viewport.setCursor(QtCore.Qt.ArrowCursor)
+
+    def update_cursor(self):
+        pos = QtCore.QPointF(self.view.mapFromGlobal(QtGui.QCursor.pos()))
+        self._hover_cursor(pos, self.view.mapToScene(pos.toPoint()))
+
+    # -- turning pages -------------------------------------------------------
+    def turn_page(self, delta: int):
+        """Cmd+Left / Cmd+Right: the previous or next page, with the caret
+        moved to its first line so writing carries on there.  Past the last
+        page waits a blank one; click it to start writing on it."""
+        target = max(0, min(self.page + delta, self.sheet.pages()))
+        if target == self.page:
+            return
+        if self.editing is not None:
+            self.finish_editing()
+        self.clear_selection()
+        self.flip(target, reveal="top")
+        if target < self.sheet.text_pages():
+            self._caret_to_page(target)
+
+    def _caret_to_page(self, index: int):
+        layout = self.doc.documentLayout()
+        top_of_page = index * self.sheet.H
+        block = self.doc.begin()
+        while block.isValid():
+            top = layout.blockBoundingRect(block).top()
+            lines = block.layout()
+            for i in range(lines.lineCount()):
+                line = lines.lineAt(i)
+                if top + line.y() + line.height() / 2 >= top_of_page:
+                    cursor = QtGui.QTextCursor(self.doc)
+                    cursor.setPosition(block.position() + line.textStart())
+                    self.sheet.text.setTextCursor(cursor)
+                    self.focus_text()
+                    self.view.viewport().update()
+                    return
+            block = block.next()
+
+    def flip(self, target: int, reveal: str | None = None):
+        """Slide the strip to page `target`; `reveal` pans the view so the
+        head ("top") or foot ("bottom") of the page is in sight."""
+        target = max(0, min(int(target), self.sheet.pages()))
+        self._drop_overlay()
+        pan = 0.0
+        if reveal:
+            zoom = self.view.zoom()
+            seen, page = self.view.visible_scene_rect(), self.sheet.scene_page_rect()
+            margin = REVEAL_PX / zoom
+            if reveal == "top" and seen.top() > page.top() - margin:
+                pan = (seen.top() - (page.top() - margin)) * zoom
+            elif reveal == "bottom" and seen.bottom() < page.bottom() + margin:
+                pan = -((page.bottom() + margin) - seen.bottom()) * zoom
+        self.page = target
+        self.anim.stop()
+        self._flip = {"from": self.sheet.offset, "to": target * self.sheet.H,
+                      "pan": pan, "panned": 0.0}
+        self.anim.start()
+        self.view.viewport().update()
+        if self.live():
+            QtCore.QTimer.singleShot(self.anim.duration() + 20, self._refresh_live_preview)
+        else:
+            self.hide_preview()
+
+    def _animate(self, t):
+        t = float(t)
+        f = self._flip
+        self.sheet.set_offset(f["from"] + (f["to"] - f["from"]) * t)
+        step = f["pan"] * t - f["panned"]
+        if step:
+            self.view.pan_pixels(0, step)
+            f["panned"] += step
+        self.view.viewport().update()
+
+    def caret_moved(self, follow: bool = True):
+        if self._loading:
+            return
+        page = self.sheet.caret_page()
+        if page != self.page:
+            self.flip(page)
+        if follow:
+            self.keep_caret_in_view()
+        self.view.viewport().update()
+
+    def keep_caret_in_view(self):
+        top, bottom = self.sheet.caret_span()
+        page = self.sheet.scene_page_rect()
+        shift = self.page * self.sheet.H
+        y0, y1 = page.top() + top - shift, page.top() + bottom - shift
+        zoom = self.view.zoom()
+        seen = self.view.visible_scene_rect()
+        margin = 70 / zoom
+        if y1 + margin > seen.bottom():
+            self.view.pan_pixels(0, -(y1 + margin - seen.bottom()) * zoom)
+        elif y0 - margin < seen.top():
+            self.view.pan_pixels(0, (seen.top() - (y0 - margin)) * zoom)
+
+    def write_on(self, index: int):
+        """A click on a page past the words: break pages until the caret is
+        on it."""
+        breaks = min(500, index - self.sheet.text_pages() + 1)
+        cursor = QtGui.QTextCursor(self.doc)
+        cursor.movePosition(QtGui.QTextCursor.End)
+        cursor.beginEditBlock()             # (no layout happens inside one)
+        for _ in range(max(0, breaks)):
+            fmt = self.block_format()
+            fmt.setPageBreakPolicy(QtGui.QTextFormat.PageBreak_AlwaysBefore)
+            cursor.insertBlock(fmt)
+        cursor.endEditBlock()
+        self.sheet.text.setTextCursor(cursor)
+        self.focus_text()
+        self.caret_moved()
+
+    def new_page(self):
+        self.clear_selection()
+        cursor = self.sheet.text.textCursor()
+        fmt = QtGui.QTextBlockFormat(cursor.blockFormat())
+        fmt.setPageBreakPolicy(QtGui.QTextFormat.PageBreak_AlwaysBefore)
+        cursor.insertBlock(fmt)
+        self.sheet.text.setTextCursor(cursor)
+        self.focus_text()
+        self.caret_moved()
+
+    # -- keys ----------------------------------------------------------------
+    def key(self, event: QtGui.QKeyEvent) -> bool:
+        self._stale()
+        key, mods = event.key(), event.modifiers()
+        if (mods & QtCore.Qt.ControlModifier and not mods & QtCore.Qt.ShiftModifier
+                and key in (QtCore.Qt.Key_Left, QtCore.Qt.Key_Right)):
+            self.turn_page(1 if key == QtCore.Qt.Key_Right else -1)
+            return True
+        if self.editing is not None:
+            if key == QtCore.Qt.Key_Escape:
+                self.finish_editing()
+                self.focus_text()
+                return True
+            if event.matches(QtGui.QKeySequence.Undo):
+                self.undo()
+                return True
+            if event.matches(QtGui.QKeySequence.Redo):
+                self.redo()
+                return True
+            if event.matches(QtGui.QKeySequence.Paste):
+                text = QtWidgets.QApplication.clipboard().text()
+                if text:
+                    self.editing.editor.textCursor().insertText(text.replace("\r\n", "\n"))
+                    self.editing.fit()
+                return True
+            return False                    # to the note's editor
+        if event.matches(QtGui.QKeySequence.Undo):
+            self.undo()
+            return True
+        if event.matches(QtGui.QKeySequence.Redo):
+            self.redo()
+            return True
+        if event.matches(QtGui.QKeySequence.Paste):
+            return self.paste()
+        chosen = self.selection()
+        if chosen:
+            if key in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace):
+                self.delete_selection()
+                return True
+            if event.matches(QtGui.QKeySequence.Copy):
+                self.copy_selection()
+                return True
+            if event.matches(QtGui.QKeySequence.Cut):
+                self.copy_selection()
+                self.delete_selection()
+                return True
+            arrows = {QtCore.Qt.Key_Left: (-1, 0), QtCore.Qt.Key_Right: (1, 0),
+                      QtCore.Qt.Key_Up: (0, -1), QtCore.Qt.Key_Down: (0, 1)}
+            if key in arrows:
+                step = 10.0 if mods & QtCore.Qt.ShiftModifier else 1.0
+                dx, dy = arrows[key]
+                before = self.snapshot()
+                for thing in chosen:
+                    thing.moveBy(dx * step, dy * step)
+                self.push("things", before)
+                self.changed()
+                self.view.viewport().update()
+                return True
+            if key in (QtCore.Qt.Key_BracketLeft, QtCore.Qt.Key_BracketRight):
+                step = 1.0 if mods & QtCore.Qt.ShiftModifier else 15.0
+                self.rotate_selected(step if key == QtCore.Qt.Key_BracketRight else -step)
+                return True
+            if key == QtCore.Qt.Key_Escape:
+                self.clear_selection()
+                self.focus_text()
+                return True
+            if mods & QtCore.Qt.ControlModifier:
+                return True                 # no word to apply it to
+            self.clear_selection()          # typing goes back to the words
+        if key == QtCore.Qt.Key_Escape:
+            return True
+        self.focus_text()
+        return False
+
+    # -- history -------------------------------------------------------------
+    def snapshot(self) -> dict:
+        return {uid: (t.alive, t.pinned, t.pos().x(), t.pos().y(), t.w, t.h, t.zValue(),
+                      t.rotation()) for uid, t in self.things.items()}
+
+    def restore(self, snap: dict):
+        for uid, thing in self.things.items():
+            alive, pinned, x, y, w, h, z, turn = snap.get(
+                uid, (False, False, 0, 0, thing.w, thing.h, 0, 0))
+            if not alive:
+                if thing.scene() is not None:
+                    thing.setSelected(False)
+                    self.scene.removeItem(thing)
+                thing.alive = False
+                continue
+            thing.alive = True
+            if pinned:
+                if thing.parentItem() is not self.sheet.strip:
+                    thing.setParentItem(self.sheet.strip)
+            else:
+                if thing.parentItem() is not None:
+                    thing.setParentItem(None)
+                if thing.scene() is None:
+                    self.scene.addItem(thing)
+            thing.set_size(w, h)
+            thing.setPos(x, y)
+            thing.setZValue(z)
+            thing.setRotation(turn)
+        if self.editing is not None and not self.editing.alive:
+            self.editing = None
+            self.focus_text()
+        self.view.viewport().update()
+
+    def push(self, kind: str, data):
+        if self._loading or self._undoing or self._joining:
+            return
+        if kind == "text" and self._pending_key:
+            data, self._pending_key = self._pending_key, None
+            self._joining = True            # Qt may announce one block twice
+        self.history.append((kind, data))
+        del self.history[:-400]
+        self.future.clear()
+
+    def undo(self):
+        if not self.history:
+            self.toast("nothing to undo")
+            return
+        kind, data = self.history.pop()
+        self._undoing = True
+        try:
+            if kind == "text":
+                self.doc.undo()
+                self.future.append(("text", None))
+            elif kind == "note":
+                note = self.things.get(data)
+                if note is not None and note.alive:
+                    note.editor.document().undo()
+                self.future.append(("note", data))
+            else:
+                self.future.append(("things", self.snapshot()))
+                self.restore(data)
+        finally:
+            self._undoing = False
+        if kind == "text":
+            self.caret_moved()
+        self.changed()
+
+    def redo(self):
+        if not self.future:
+            return
+        kind, data = self.future.pop()
+        self._undoing = True
+        try:
+            if kind == "text":
+                self.doc.redo()
+                self.history.append(("text", None))
+            elif kind == "note":
+                note = self.things.get(data)
+                if note is not None and note.alive:
+                    note.editor.document().redo()
+                self.history.append(("note", data))
+            else:
+                self.history.append(("things", self.snapshot()))
+                self.restore(data)
+        finally:
+            self._undoing = False
+        if kind == "text":
+            self.caret_moved()
+        self.changed()
+
+    # -- things --------------------------------------------------------------
+    def pointer_scene(self) -> QtCore.QPointF:
+        pos = self.view.mapFromGlobal(QtGui.QCursor.pos())
+        if self.view.viewport().rect().contains(pos):
+            return self.view.mapToScene(pos)
+        return self.view.mapToScene(self.view.viewport().rect().center())
+
+    def _read_things(self, paths: list[str]) -> list[Thing]:
+        files: list[str] = []
+        for path in paths:
+            if os.path.isdir(path):
+                for name in sorted(os.listdir(path)):
+                    full = os.path.join(path, name)
+                    if os.path.isfile(full):
+                        files.append(full)
+            else:
+                files.append(path)
+        things: list[Thing] = []
+        for path in files:
+            ext = os.path.splitext(path)[1].lower()
+            name = os.path.splitext(os.path.basename(path))[0]
+            if ext == project.SUFFIX:
+                self.open_document(path)
+                continue
+            if ext != ".pdf" and ext not in project.IMAGE_SUFFIXES:
+                continue
+            try:
+                with open(path, "rb") as handle:
+                    blob = handle.read()
+            except OSError:
+                continue
+            things.extend(self._make_things(blob, ext, name))
+        return things
+
+    def _make_things(self, blob: bytes, ext: str, name: str) -> list[Thing]:
+        out: list[Thing] = []
+        if ext == ".pdf":
+            try:
+                count = project.pdf_count(blob)
+                for index in range(count):
+                    image, size = project.pdf_page(blob, index)
+                    out.append(Thing(image, size, blob, ext, index, f"{name} p{index + 1}"))
+            except Exception as exc:
+                self.toast(f"could not open {name}.pdf ({exc})")
+            return out
+        image = project.image_from_bytes(blob)
+        if image is None:
+            self.toast(f"could not read {name}{ext}")
+            return out
+        dpm = image.dotsPerMeterX()
+        dpi = dpm * 0.0254 if dpm else 0
+        dpi = dpi if 100 <= dpi <= 1200 else 150.0
+        w, h = image.width() * 72.0 / dpi, image.height() * 72.0 / dpi
+        longest = 420.0
+        if max(w, h) > longest:
+            k = longest / max(w, h)
+            w, h = w * k, h * k
+        out.append(Thing(image, QtCore.QSizeF(w, h), blob, ext, None, name))
+        return out
+
+    def place(self, things: list[Thing], at: QtCore.QPointF | None):
+        if not things:
+            return
+        at = at or self.palette_at or self.pointer_scene()
+        self.palette_at = None
+        before = self.snapshot()
+        page = self.sheet.scene_page_rect()
+        on_page = page.contains(at)
+        text_width = self.sheet.W - 2 * self.fmt.margin
+        x, y, row_h = at.x(), at.y(), 0.0
+        z = self.top_z()
+        for n, thing in enumerate(things):
+            if on_page and thing.w > text_width:
+                k = text_width / thing.w
+                thing.resize(thing.w * k, thing.h * k)
+            if n and x - at.x() > 1600:
+                x, y, row_h = at.x(), y + row_h + 24, 0.0
+            if on_page and len(things) == 1:
+                pos = QtCore.QPointF(at.x() - thing.w / 2, at.y() - thing.h / 2)
+            else:
+                pos = QtCore.QPointF(x, y)
+            self.things[thing.uid] = thing
+            self.scene.addItem(thing)
+            thing.setPos(pos)
+            z += 1.0
+            thing.setZValue(z)
+            if on_page:
+                self.pin(thing)
+            x += thing.w + 24
+            row_h = max(row_h, thing.h)
+        self.push("things", before)
+        self.select(things)
+        self.changed()
+        what = "pinned to the page" if on_page else "on the canvas"
+        self.toast(f"{len(things)} {'thing' if len(things) == 1 else 'things'} {what}")
+
+    def add_files(self, paths: list[str], at: QtCore.QPointF | None):
+        with busy():
+            things = self._read_things(paths)
+        self.place(things, at)
+
+    def browse_files(self, at: QtCore.QPointF | None = None):
+        at = at or self.palette_at or self.pointer_scene()
+        start = self.prefs.get("browse_dir", os.path.expanduser("~"))
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Add images or PDFs", start,
+            "Images and PDFs (*.png *.jpg *.jpeg *.gif *.bmp *.tif *.tiff *.webp *.heic *.pdf)")
+        if paths:
+            self.prefs["browse_dir"] = os.path.dirname(paths[0])
+            self._write_prefs()
+            self.add_files(paths, at)
+
+    def drop(self, mime: QtCore.QMimeData, at: QtCore.QPointF):
+        if mime.hasUrls():
+            paths = [u.toLocalFile() for u in mime.urls() if u.isLocalFile()]
+            docs = [p for p in paths if p.lower().endswith(project.SUFFIX)]
+            if docs:
+                self.open_document(docs[0])
+                return
+            self.add_files(paths, at)
+        elif mime.hasImage():
+            self._place_image(QtGui.QImage(mime.imageData()), at)
+
+    def _place_image(self, image: QtGui.QImage, at: QtCore.QPointF | None):
+        if image.isNull():
+            return
+        data = QtCore.QByteArray()
+        buffer = QtCore.QBuffer(data)
+        buffer.open(QtCore.QIODevice.WriteOnly)
+        image.save(buffer, "PNG")
+        self.place(self._make_things(bytes(data), ".png", "pasted"), at)
+
+    def paste(self) -> bool:
+        mime = QtWidgets.QApplication.clipboard().mimeData()
+        if mime is None:
+            return False
+        files = [u.toLocalFile() for u in mime.urls() if u.isLocalFile()] if mime.hasUrls() else []
+        media = [p for p in files if os.path.splitext(p)[1].lower()
+                 in project.IMAGE_SUFFIXES | {".pdf"}]
+        if media:
+            self.add_files(media, self.pointer_scene())
+            return True
+        if mime.hasImage() and not mime.hasText():
+            self._place_image(QtGui.QImage(mime.imageData()), self.pointer_scene())
+            return True
+        if mime.hasText():
+            self.clear_selection()
+            self.focus_text()
+            cursor = self.sheet.text.textCursor()
+            cursor.insertText(mime.text().replace("\r\n", "\n").replace("\r", "\n"))
+            self.sheet.text.setTextCursor(cursor)
+            self.caret_moved()
+            return True
+        return False
+
+    def copy_selection(self):
+        chosen = self.selection()
+        if chosen:
+            if isinstance(chosen[0], Note):
+                QtWidgets.QApplication.clipboard().setText(chosen[0].text())
+            else:
+                QtWidgets.QApplication.clipboard().setImage(chosen[0].image)
+            self.toast("copied")
+
+    def delete_selection(self):
+        chosen = self.selection()
+        if not chosen:
+            return
+        before = self.snapshot()
+        for thing in chosen:
+            thing.setSelected(False)
+            thing.alive = False
+            self.scene.removeItem(thing)
+        self.push("things", before)
+        self.focus_text()
+        self.changed()
+
+    def _each_selected(self, action):
+        chosen = self.selection()
+        if not chosen:
+            return
+        before = self.snapshot()
+        for thing in chosen:
+            action(thing)
+        self.push("things", before)
+        self.changed()
+        self.view.viewport().update()
+
+    def to_front(self):
+        def act(thing):
+            peers = self.sheet.pinned() if thing.pinned else \
+                [t for t in self.things.values() if t.alive and not t.pinned]
+            thing.setZValue(max((t.zValue() for t in peers), default=0.0) + 1.0)
+        self._each_selected(act)
+
+    def behind_text(self):
+        def act(thing):
+            if not thing.pinned:
+                return
+            thing.setZValue(min((t.zValue() for t in self.sheet.pinned()), default=0.0) - 1.0
+                            if thing.zValue() >= 0 else thing.zValue())
+            thing.setZValue(min(thing.zValue(), -1.0))
+        self._each_selected(act)
+        self.toast("behind the words: Alt+click to reach it")
+
+    def unpin_selected(self):
+        def act(thing):
+            if thing.pinned:
+                self.unpin(thing)
+                thing.setZValue(self.top_z() + 1.0)
+                page = self.sheet.scene_page_rect()
+                thing.setPos(page.right() + 40, thing.scenePos().y())
+        self._each_selected(act)
+
+    def natural_size(self):
+        def act(thing):
+            if isinstance(thing, Note):
+                return
+            w = thing.image.width() * 72.0 / 150.0
+            thing.resize(w, w / thing.natural_aspect())
+        self._each_selected(act)
+
+    def fit_width(self):
+        def act(thing):
+            w = self.sheet.W - 2 * self.fmt.margin
+            thing.resize(w, w / thing.natural_aspect())
+            if thing.pinned:
+                thing.setPos(self.fmt.margin, thing.pos().y())
+        self._each_selected(act)
+
+    # -- free text -----------------------------------------------------------
+    def _inside(self, note: Note, at: QtCore.QPointF) -> bool:
+        local = note.mapFromScene(at)
+        return note.boundingRect().adjusted(-4, -4, 4, 4).contains(local)
+
+    def new_note(self, at: QtCore.QPointF) -> Note:
+        """A block of text whose first line starts at `at`.  On the page it
+        is pinned and wraps at the right margin; on the canvas it is one
+        line that grows."""
+        self.clear_selection()
+        before = self.snapshot()
+        page = self.sheet.scene_page_rect()
+        on_page = page.contains(at)
+        wrap = -1.0
+        if on_page:
+            x = at.x() - page.left()
+            right = self.sheet.W - self.fmt.margin
+            wrap = (right - x) if right - x >= 60 else max(40.0, self.sheet.W - x - 8)
+        note = Note(self, "", wrap)
+        note.style(self.doc_font(), self.block_format(), self.ink())
+        metrics = QtGui.QFontMetricsF(self.doc_font())
+        line = metrics.height() * self.fmt.line / 100.0
+        self.things[note.uid] = note
+        self.scene.addItem(note)
+        # the click lands on the middle of the first line, not its top
+        note.setPos(at.x(), at.y() - line / 2)
+        note.setZValue(self.top_z() + 1.0)
+        if on_page:
+            self.pin(note)
+        self.push("things", before)
+        self._note_birth = (note.uid, len(self.history))
+        self.start_editing(note)
+        return note
+
+    def start_editing(self, note: Note, at: QtCore.QPointF | None = None):
+        if self.editing is not None and self.editing is not note:
+            self.finish_editing()
+        self.clear_selection()
+        self.editing = note
+        editor = note.editor
+        editor.setTextInteractionFlags(QtCore.Qt.TextEditorInteraction)
+        if not self.view.hasFocus():
+            self.view.setFocus(QtCore.Qt.OtherFocusReason)
+        self.scene.setFocusItem(editor, QtCore.Qt.MouseFocusReason)
+        editor.setFocus()
+        cursor = editor.textCursor()
+        if at is not None:
+            local = editor.mapFromScene(at)
+            hit = editor.document().documentLayout().hitTest(local, QtCore.Qt.FuzzyHit)
+            cursor.setPosition(max(0, hit))
+        else:
+            cursor.movePosition(QtGui.QTextCursor.End)
+        editor.setTextCursor(cursor)
+        self.view.viewport().update()
+
+    def finish_editing(self):
+        note, self.editing = self.editing, None
+        if note is None:
+            return
+        editor = note.editor
+        cursor = editor.textCursor()
+        cursor.clearSelection()
+        editor.setTextCursor(cursor)
+        editor.setTextInteractionFlags(QtCore.Qt.NoTextInteraction)
+        editor.clearFocus()
+        if not note.text().strip():
+            self._discard(note)
+        self._note_birth = None
+        self.view.viewport().update()
+
+    def _discard(self, note: Note):
+        """An empty note leaves no trace: not on the page, not in undo."""
+        self.history = [e for e in self.history if e != ("note", note.uid)]
+        self.future = [e for e in self.future if e != ("note", note.uid)]
+        born = self._note_birth
+        if born and born[0] == note.uid and len(self.history) == born[1]:
+            self.history.pop()
+        else:
+            self.push("things", self.snapshot())
+        note.setSelected(False)
+        note.alive = False
+        self.scene.removeItem(note)
+        self.changed()
+
+    def rotate_selected(self, degrees: float):
+        self._each_selected(lambda t: t.setRotation((t.rotation() + degrees) % 360.0))
+
+    def set_rotation(self, degrees: float):
+        self._each_selected(lambda t: t.setRotation(degrees % 360.0))
+
+    # -- view ----------------------------------------------------------------
+    def fit_page(self):
+        self.view.frame(self.sheet.scene_page_rect(), margin=48)
+
+    def fit_all(self):
+        rect = self.sheet.scene_page_rect()
+        for thing in self.things.values():
+            if thing.alive and not thing.pinned:
+                rect = rect.united(thing.sceneBoundingRect())
+        self.view.frame(rect, margin=48)
+
+    def actual_size(self):
+        self.view.set_zoom(1.0)
+        self.view.centerOn(self.sheet.scene_page_rect().center())
+
+    # -- distress ------------------------------------------------------------
+    def toggle_preview(self):
+        if self.preview is not None:
+            self.hide_preview()
+        else:
+            self.show_preview()
+
+    def _ink(self, dpi: float, box: tuple[int, int, int, int]):
+        """The current page's ink layer (or the `box` of it), rendered once
+        per state of the page."""
+        key = (self.page, dpi, box, self.doc.revision(), self.doc.toPlainText().__hash__(),
+               tuple(sorted(self.snapshot().items())), tuple(asdict(self.fmt).items()),
+               tuple(t.text() for t in self.things.values() if isinstance(t, Note) and t.alive))
+        if self._ink_cache is None or self._ink_cache[0] != key:
+            self._ink_cache = (key, export.ink_layer(self.sheet, self.page, dpi, self.ink(), box))
+        return self._ink_cache[1]
+
+    def _preview_area(self) -> tuple[float, QtCore.QRectF | None]:
+        """The dpi that matches the screen right now (zoom × Retina), and
+        the part of the page in sight, in page points.  Only that part is
+        rendered, so the preview is sharp at any zoom and costs about one
+        screenful of pixels."""
+        ratio = self.view.devicePixelRatioF() if hasattr(self.view, "devicePixelRatioF") else 1.0
+        dpi = max(72.0, min(PREVIEW_MAX_DPI, 72.0 * self.view.zoom() * ratio))
+        page = self.sheet.scene_page_rect()
+        seen = self.view.visible_scene_rect().intersected(page)
+        if seen.isEmpty():
+            return dpi, None
+        pad = 120.0 / max(1e-6, self.view.zoom())     # room to pan before a re-render
+        area = seen.translated(-page.topLeft()).adjusted(-pad, -pad, pad, pad)
+        return dpi, area
+
+    def _set_preview_image(self, image: QtGui.QImage, dpi: float,
+                           box: tuple[int, int, int, int] = (0, 0, 0, 0)):
+        if self.preview is None:
+            self.preview = QtWidgets.QGraphicsPixmapItem(self.sheet)
+            self.preview.setTransformationMode(QtCore.Qt.SmoothTransformation)
+            self.preview.setZValue(1000)
+        self.preview.setPixmap(QtGui.QPixmap.fromImage(image))
+        self.preview.setScale(72.0 / dpi)
+        self.preview.setPos(box[0] * 72.0 / dpi, box[1] * 72.0 / dpi)
+        self.view.viewport().update()
+
+    def show_preview(self):
+        """The current page distressed, in place - rendered now."""
+        self._preview_gen += 1
+        dpi, area = self._preview_area()
+        box = export.crop_box(self.sheet, dpi, area)
+        settings = replace(self.distress, enabled=True)
+        with busy():
+            layer = self._ink(dpi, box)
+            out = distress.compose(layer, export.rgb(self.paper()), settings, dpi,
+                                   origin=(box[1], box[0]), density=self.density())
+        self._set_preview_image(export.from_rgb(out), dpi, box)
+
+    def request_preview(self, fast: bool = False):
+        """The same, worked out on a thread: the newest request wins, and
+        stale ones are dropped before they start.  `fast` (while typing or
+        dragging a slider) renders at 60% of the screen's resolution."""
+        self._preview_gen += 1
+        gen = self._preview_gen
+        dpi, area = self._preview_area()
+        if area is None:
+            return
+        if fast:
+            dpi = max(72.0, dpi * 0.6)
+        box = export.crop_box(self.sheet, dpi, area)
+        layer = self._ink(dpi, box)
+        settings = replace(self.distress, enabled=True)
+        paper = export.rgb(self.paper())
+        density = self.density()
+
+        def work():
+            if gen != self._preview_gen:
+                return
+            try:
+                out = distress.compose(layer, paper, settings, dpi, origin=(box[1], box[0]),
+                                       density=density)
+            except Exception as exc:            # never let the worker die quietly
+                print("ream: preview failed:", exc, file=sys.stderr)
+                return
+            self.preview_ready.emit(gen, (out, dpi, box))
+        self._pool.submit(work)
+
+    def _preview_arrived(self, gen: int, payload):
+        if gen != self._preview_gen:
+            return
+        out, dpi, box = payload
+        self._set_preview_image(export.from_rgb(out), dpi, box)
+
+    def view_changed(self):
+        """Zoomed or panned: sharpen and re-crop the live view once it rests."""
+        if getattr(self, "distress_view", False):
+            self._view_timer.start()
+
+    def hide_preview(self):
+        self._preview_gen += 1
+        if self.preview is not None:
+            self.scene.removeItem(self.preview)
+            self.preview = None
+            self.view.viewport().update()
+
+    def live(self) -> bool:
+        return self.distress_view
+
+    def _refresh_live_preview(self, fast: bool = False):
+        if self.live():
+            self.request_preview(fast)
+
+    def _stale(self):
+        """Something is about to change the page.  A still preview goes; the
+        live view stays and re-renders once the change has landed."""
+        if not self.live():
+            self.hide_preview()
+
+    def _drop_overlay(self):
+        """Take the picture off while the pages slide (the live view comes
+        back when they stop)."""
+        self._preview_gen += 1
+        if self.preview is not None:
+            self.scene.removeItem(self.preview)
+            self.preview = None
+            self.view.viewport().update()
+
+    def _schedule_live(self):
+        self._last_edit = time.monotonic()
+        if not self._live_timer.isActive():
+            self._live_timer.start()
+        self._idle_timer.start()
+
+    def _render_live(self, fast: bool):
+        if not self.live() or self.anim.state() == QtCore.QAbstractAnimation.Running:
+            return
+        self.request_preview(fast=fast and time.monotonic() - self._last_edit < 0.45)
+
+    def set_distress_view(self, on: bool, quiet: bool = False):
+        self.distress_view = on
+        self._view_from_panel = False
+        self.prefs["distress_view"] = on
+        self._write_prefs()
+        if on:
+            self.request_preview()
+        else:
+            self.hide_preview()
+        if self.distress_panel is not None:
+            self.distress_panel.refresh()
+        if not quiet:
+            self.toast("writing on the distressed page" if on else "distress view off")
+
+    def toggle_distress_view(self):
+        self.set_distress_view(not self.distress_view)
+
+    def distress_changed(self, fast: bool = False):
+        still = self.preview is not None and not self.live()
+        self.changed()
+        if self.live():
+            self._live_timer.stop()
+            self.request_preview(fast)
+        elif still:
+            self.show_preview()
+
+    def set_style(self, name: str):
+        self.distress.style = name
+        self.distress.enabled = True
+        self.toast(f"distress · {name}")
+        self.distress_changed()
+
+    def set_fade_style(self, name: str):
+        self.distress.fade_style = name
+        self.toast(f"fade texture · {name}")
+        self.distress_changed()
+
+    def toggle_distress(self):
+        self.distress.enabled = not self.distress.enabled
+        self.toast("distress on" if self.distress.enabled else "distress off: exports are clean vector")
+        self.changed()
+        if self.distress_panel is not None:
+            self.distress_panel.refresh()
+
+    def reset_distress(self):
+        keep = self.distress.enabled
+        self.distress = distress.Settings(enabled=keep)
+        self.toast("distress reset")
+        if self.distress_panel is not None:
+            self.distress_panel.refresh()
+        self.distress_changed()
+
+    def set_param(self, name: str, value: float):
+        if name in distress.PARAMS:
+            lo, hi, _ = distress.PARAMS[name]
+            value = max(lo, min(hi, value))
+            setattr(self.distress, name, value)
+            self.toast(f"{name} {value:g}")
+            if self.distress_panel is not None:
+                self.distress_panel.refresh()
+            self.distress_changed()
+            return
+        if name == "page":
+            self.flip(int(value) - 1, reveal="top")
+            return
+        if name == "rotate":
+            self.set_rotation(value)
+            return
+        lo, hi = FORMAT_PARAMS[name]
+        value = max(lo, min(hi, value))
+        setters = {"line": self.set_line_height, "para": self.set_para, "size": self.set_size,
+                   "ink": self.set_ink,
+                   "margin": lambda v: self.set_margins(side=v),
+                   "head": lambda v: self.set_margins(head=v)}
+        if name in setters:
+            setters[name](value)
+        else:
+            setattr(self.fmt, name, value)
+        if self.page_panel is not None:
+            self.page_panel.refresh()
+        self.toast(f"{name} {value:g}")
+        self.changed()
+
+    def set_format(self, **values):
+        for key, value in values.items():
+            setattr(self.fmt, key, value)
+        self.apply_format()
+        self.changed()
+        if self.page_panel is not None:
+            self.page_panel.refresh()
+
+    # -- panels --------------------------------------------------------------
+    def _slider_held(self) -> bool:
+        focus = QtWidgets.QApplication.focusWidget()
+        return isinstance(focus, QtWidgets.QSlider) and focus.isSliderDown()
+
+    def _distress_put(self, name: str):
+        def put(value):
+            setattr(self.distress, name, value)
+            self.distress_changed(fast=self._slider_held())
+        return put
+
+    def build_distress_panel(self) -> Panel:
+        panel = Panel(self, "distress", on_close=self._distress_panel_closed,
+                      on_tab=self.open_palette)
+        d = lambda: self.distress                                       # noqa: E731
+        panel.toggle("see", lambda: self.distress_view,
+                     lambda v: self.set_distress_view(v, quiet=True), on="distressed", off="clean")
+        panel.toggle("export", lambda: d().enabled,
+                     lambda v: (setattr(d(), "enabled", v), self.changed()),
+                     on="distressed", off="clean")
+        panel.slider("ink", 5, 150, lambda: self.fmt.ink, self.set_ink, unit="%", default=100)
+        panel.choice("style", distress.edge_styles, lambda: d().style,
+                     lambda v: (setattr(d(), "style", v), self.distress_changed()))
+        panel.choice("wear", distress.fade_styles, lambda: d().fade_style,
+                     lambda v: (setattr(d(), "fade_style", v), self.distress_changed()))
+        defaults = distress.Settings()
+        for name, (lo, hi, _what) in distress.PARAMS.items():
+            if name == "misfire":
+                panel.section("ream's own")
+            panel.slider(name, lo, hi, lambda n=name: getattr(d(), n), self._distress_put(name),
+                         unit="%" if name == "scale" else "", default=getattr(defaults, name))
+        panel.section("export")
+        panel.slider("dpi", 72, 600, lambda: self.fmt.dpi,
+                     lambda v: (setattr(self.fmt, "dpi", v), self.changed()), step=12, default=300)
+        panel.buttons([("reset", self.reset_distress),
+                       ("new seed", self._new_seed),
+                       ("export pdf", self.export_pdf)])
+        panel.on_release = lambda: self._refresh_live_preview(fast=False)
+        return panel
+
+    def _new_seed(self):
+        self.distress.seed = (int(self.distress.seed) + 1) % 26
+        self.distress_panel.refresh()
+        self.distress_changed()
+
+    def build_page_panel(self) -> Panel:
+        panel = Panel(self, "page", on_tab=self.open_palette)
+        f = lambda: self.fmt                                            # noqa: E731
+        panel.section("type")
+        panel.choice("font", style.faces, self.face, lambda v: self.set_format(font=v))
+        panel.slider("size", 5, 24, lambda: f().size, self.set_size, step=0.5, unit=" pt",
+                     default=9)
+        panel.slider("line", 80, 300, lambda: f().line, self.set_line_height, step=5, unit="%",
+                     default=150)
+        panel.slider("para", 0, 36, lambda: f().para, self.set_para, unit=" pt", default=0)
+        panel.slider("ink", 5, 150, lambda: f().ink, self.set_ink, unit="%", default=100)
+        panel.section("page")
+        panel.choice("format", lambda: list(style.PAGE_SIZES), lambda: f().page,
+                     lambda v: self.set_format(page=v))
+        panel.slider("sides", 0, 200, lambda: f().margin, lambda v: self.set_margins(side=v),
+                     unit=" pt", default=64)
+        panel.slider("top/bot", 0, 200, lambda: f().head, lambda v: self.set_margins(head=v),
+                     unit=" pt", default=70)
+        panel.swatches("paper", list(style.PAPERS.values()) + ["#e4e1d6", "#d8d2c2"],
+                       lambda: self.paper().name(), self.set_paper)
+        panel.section("canvas")
+        panel.swatches("colour", CANVAS_SWATCHES, self.canvas_colour, self.set_canvas)
+        panel.choice("edge", lambda: list(style.THEMES), lambda: self.theme, self._set_edge_theme)
+        panel.buttons([("fit page", self.fit_page), ("close", panel.close_panel)])
+        return panel
+
+    def _open_beside(self, panel: Panel, other: Panel | None):
+        """Open a panel; the first time, next to the other one if it is up."""
+        fresh = not panel.placed
+        panel.open()
+        if fresh and other is not None and other.isVisible() and \
+                panel.geometry().intersects(other.geometry()):
+            panel.move(other.x() - panel.width() - 12, other.y())
+            panel.keep_inside()
+
+    def open_distress_panel(self):
+        if self.distress_panel is None:
+            self.distress_panel = self.build_distress_panel()
+        self._open_beside(self.distress_panel, self.page_panel)
+        if not self.distress_view:
+            self.distress_view = True
+            self._view_from_panel = True    # closing the panel turns it off again
+            self.distress_panel.refresh()
+        self.request_preview()
+
+    def _distress_panel_closed(self):
+        if self._view_from_panel:
+            self.distress_view = False
+            self._view_from_panel = False
+            self.hide_preview()
+
+    def open_page_panel(self):
+        if self.page_panel is None:
+            self.page_panel = self.build_page_panel()
+        self._open_beside(self.page_panel, self.distress_panel)
+
+    def toggle_distress_panel(self):
+        if self.distress_panel is not None and self.distress_panel.isVisible():
+            self.distress_panel.close_panel()
+        else:
+            self.open_distress_panel()
+
+    def toggle_page_panel(self):
+        if self.page_panel is not None and self.page_panel.isVisible():
+            self.page_panel.close_panel()
+        else:
+            self.open_page_panel()
+
+    # -- export --------------------------------------------------------------
+    def stem(self) -> str:
+        if self.path:
+            return os.path.splitext(os.path.basename(self.path))[0]
+        first = self.doc.toPlainText().strip().split("\n", 1)[0][:40].strip()
+        slug = re.sub(r"[^a-z0-9]+", "-", first.lower()).strip("-")
+        return slug or "untitled"
+
+    def _export_target(self, title: str, suffix: str, filt: str) -> str | None:
+        folder = self.prefs.get("export_dir", os.path.expanduser("~/Desktop"))
+        default = os.path.join(folder, self.stem() + suffix)
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, title, default, filt)
+        if path:
+            self.prefs["export_dir"] = os.path.dirname(path)
+            self._write_prefs()
+        return path or None
+
+    def export_pdf(self, clean: bool = False, path: str | None = None) -> str | None:
+        path = path or self._export_target("Export PDF", ".pdf", "PDF (*.pdf)")
+        if not path:
+            return None
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+        settings = replace(self.distress, enabled=self.distress.enabled and not clean)
+        pages = list(range(self.sheet.pages()))
+        with busy():
+            export.write_pdf(path, self.sheet, pages, dpi=self.fmt.dpi, settings=settings,
+                             paper=self.paper(), ink=self.ink(), title=self.stem(),
+                             density=self.density(),
+                             progress=lambda n, total: self.toast(f"page {n + 1} of {total}"))
+        how = f"distressed · {settings.style}" if settings.enabled else "clean"
+        self.toast(f"{len(pages)} {'page' if len(pages) == 1 else 'pages'} {how} → {path}")
+        return path
+
+    def export_png(self, path: str | None = None) -> list[str]:
+        path = path or self._export_target("Export pages as PNG", ".png", "PNG (*.png)")
+        if not path:
+            return []
+        stem = path[:-4] if path.lower().endswith(".png") else path
+        pages = list(range(self.sheet.pages()))
+        with busy():
+            written = export.write_pngs(stem, self.sheet, pages, dpi=self.fmt.dpi,
+                                        settings=self.distress, paper=self.paper(), ink=self.ink(),
+                                        density=self.density(),
+                                        progress=lambda n, t: self.toast(f"page {n + 1} of {t}"))
+        self.toast(f"{len(written)} png → {os.path.dirname(stem)}")
+        return written
+
+    # -- documents -----------------------------------------------------------
+    def state(self) -> tuple[dict, dict[str, bytes]]:
+        media: dict[str, bytes] = {}
+        things = []
+        for thing in self.things.values():
+            if not thing.alive:
+                continue
+            if isinstance(thing, Note):
+                if thing is self.editing or thing.text().strip():
+                    things.append({"uid": thing.uid, "kind": "text", "text": thing.text(),
+                                   "wrap": thing.wrap, "pinned": thing.pinned,
+                                   "x": thing.pos().x(), "y": thing.pos().y(),
+                                   "z": thing.zValue(), "r": thing.rotation()})
+                continue
+            name = project.media_name(thing.blob, thing.ext)
+            media[name] = thing.blob
+            things.append({"uid": thing.uid, "media": name, "pdf_page": thing.pdf_page,
+                           "name": thing.name, "pinned": thing.pinned,
+                           "x": thing.pos().x(), "y": thing.pos().y(),
+                           "w": thing.w, "h": thing.h, "z": thing.zValue(),
+                           "r": thing.rotation()})
+        centre = self.view.mapToScene(self.view.viewport().rect().center())
+        return {
+            "app": f"ream {__version__}",
+            "text": project.doc_to_text(self.doc),
+            "caret": self.sheet.text.textCursor().position(),
+            "format": asdict(self.fmt),
+            "distress": self.distress.to_dict(),
+            "page": self.page,
+            "view": {"zoom": self.view.zoom(), "x": centre.x(), "y": centre.y()},
+            "things": things,
+        }, media
+
+    def _clear(self):
+        self.hide_preview()
+        self.editing = None
+        for thing in self.things.values():
+            if thing.scene() is not None:
+                self.scene.removeItem(thing)
+        self.things.clear()
+        self.history.clear()
+        self.future.clear()
+
+    def load_state(self, state: dict, media: dict[str, bytes]):
+        self._loading = True
+        try:
+            self._clear()
+            self.fmt = Format.from_dict(state.get("format"))
+            self.distress = distress.Settings.from_dict(state.get("distress"))
+            self.doc.setUndoRedoEnabled(False)
+            project.text_to_doc(self.doc, state.get("text", ""), self.block_format())
+            self.doc.setUndoRedoEnabled(False)
+            self.apply_format()
+            pdf_cache: dict[tuple[str, int], tuple] = {}
+            for entry in state.get("things", []):
+                if entry.get("kind") == "text":
+                    note = Note(self, entry.get("text", ""), entry.get("wrap", -1.0),
+                                uid=entry.get("uid"))
+                    note.style(self.doc_font(), self.block_format(), self.ink())
+                    self.things[note.uid] = note
+                    if entry.get("pinned"):
+                        note.setParentItem(self.sheet.strip)
+                    else:
+                        self.scene.addItem(note)
+                    note.setPos(entry["x"], entry["y"])
+                    note.setRotation(entry.get("r", 0.0))
+                    note.setZValue(entry.get("z", 1.0))
+                    continue
+                blob = media.get(entry.get("media", ""))
+                if blob is None:
+                    continue
+                ext = os.path.splitext(entry["media"])[1]
+                index = entry.get("pdf_page")
+                try:
+                    if index is not None:
+                        key = (entry["media"], index)
+                        if key not in pdf_cache:
+                            pdf_cache[key] = project.pdf_page(blob, index)
+                        image = pdf_cache[key][0]
+                    else:
+                        image = project.image_from_bytes(blob)
+                except Exception:
+                    image = None
+                if image is None:
+                    continue
+                thing = Thing(image, QtCore.QSizeF(entry["w"], entry["h"]), blob, ext, index,
+                              entry.get("name", ""), uid=entry.get("uid"))
+                self.things[thing.uid] = thing
+                if entry.get("pinned"):
+                    thing.setParentItem(self.sheet.strip)
+                else:
+                    self.scene.addItem(thing)
+                thing.setPos(entry["x"], entry["y"])
+                thing.setRotation(entry.get("r", 0.0))
+                thing.setZValue(entry.get("z", 1.0))
+            self.page = max(0, min(int(state.get("page", 0)), self.sheet.pages()))
+            self.sheet.set_offset(self.page * self.sheet.H)
+            cursor = QtGui.QTextCursor(self.doc)
+            cursor.setPosition(max(0, min(int(state.get("caret", 0)),
+                                          self.doc.characterCount() - 1)))
+            self.sheet.text.setTextCursor(cursor)
+        finally:
+            self.doc.setUndoRedoEnabled(True)
+            self._loading = False
+        view = state.get("view")
+        if view:
+            self.view.setTransform(QtGui.QTransform.fromScale(view["zoom"], view["zoom"]))
+            self.view.centerOn(view["x"], view["y"])
+        else:
+            QtCore.QTimer.singleShot(0, self.fit_page)
+        self.view.viewport().update()
+
+    def open_document(self, path: str, quiet: bool = False):
+        self.autosave()
+        try:
+            state, media = project.load(path)
+        except Exception as exc:
+            if not quiet:
+                self.toast(f"could not open {os.path.basename(path)}: {exc}")
+            self.new_document(archive=False)
+            return
+        self.load_state(state, media)
+        draft = os.path.abspath(path) == os.path.abspath(self.draft_path())
+        self.path = None if draft else os.path.abspath(path)
+        self._ready = True
+        self._titled()
+        if not quiet:
+            self.toast(f"opened {os.path.basename(path)}")
+        QtCore.QTimer.singleShot(0, self.focus_text)
+
+    def new_document(self, archive: bool = True):
+        self.autosave()
+        if archive and self.path is None and self.draft_path().exists() and \
+                (self.doc.toPlainText().strip() or any(t.alive for t in self.things.values())):
+            drafts = self.home / "drafts"
+            drafts.mkdir(exist_ok=True)
+            target = drafts / time.strftime("draft-%Y%m%d-%H%M%S.ream")
+            os.replace(self.draft_path(), target)
+            self.toast(f"old draft filed in {drafts}")
+        keep_format = asdict(self.fmt) if archive else None
+        self.load_state({"text": "", "format": keep_format, "distress": self.distress.to_dict()}, {})
+        self.path = None
+        self._ready = True
+        self._titled()
+        QtCore.QTimer.singleShot(0, self.fit_page)
+        QtCore.QTimer.singleShot(0, self.focus_text)
+
+    def browse_open(self):
+        start = os.path.dirname(self.path) if self.path else os.path.expanduser("~")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open", start, "ream (*.ream)")
+        if path:
+            self.open_document(path)
+
+    def save(self):
+        if self.path is None:
+            self.save_as()
+            return
+        self.autosave()
+        self.toast(f"saved {self.path}")
+
+    def save_as(self, path: str | None = None):
+        if path is None:
+            start = os.path.join(self.prefs.get("export_dir", os.path.expanduser("~/Documents")),
+                                 self.stem() + project.SUFFIX)
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save as", start, "ream (*.ream)")
+            if not path:
+                return
+        if not path.lower().endswith(project.SUFFIX):
+            path += project.SUFFIX
+        self.path = os.path.abspath(path)
+        self.autosave()
+        self._titled()
+        self.toast(f"saved {self.path}")
+
+    def _titled(self):
+        name = os.path.basename(self.path) if self.path else "draft"
+        self.setWindowTitle(f"ream — {name}")
+        self.prefs["last"] = self.path or str(self.draft_path())
+        self._write_prefs()
+
+    def changed(self):
+        if self._loading:
+            return
+        self.save_timer.start()
+        if self.live():
+            self._schedule_live()
+        elif self.preview is not None:
+            self.hide_preview()             # never leave a stale picture over the page
+        self.view.viewport().update()
+
+    def autosave(self):
+        self.save_timer.stop()
+        if self._loading or not self._ready:
+            return
+        state, media = self.state()
+        try:
+            project.save(self.path or str(self.draft_path()), state, media)
+        except OSError as exc:
+            self.toast(f"could not save: {exc}")
+
+    # -- palette -------------------------------------------------------------
+    def open_palette(self, global_pos: QtCore.QPoint | None = None, text: str = ""):
+        global_pos = global_pos or QtGui.QCursor.pos()
+        local = self.view.mapFromGlobal(global_pos)
+        if self.view.viewport().rect().contains(local):
+            self.palette_at = self.view.mapToScene(local)
+        else:
+            self.palette_at = None
+            global_pos = self.view.mapToGlobal(self.view.viewport().rect().center())
+        self.palette.popup(global_pos, text)
+
+    def caption(self) -> str:
+        words = len(self.doc.toPlainText().split())
+        name = os.path.basename(self.path) if self.path else "draft"
+        mark = f"distress · {self.distress.style}" if self.distress.enabled else "clean"
+        return f"{name} · page {self.page + 1} of {self.pages_shown()} · {words} words · {mark}"
+
+    def commands(self) -> list[Command]:
+        C = Command
+        d, f = self.distress, self.fmt
+        dot = "●"
+        out = [
+            C("export pdf", self.export_pdf, "⌘E", "save print distressed"),
+            C("export pdf · clean", partial(self.export_pdf, True), "⇧⌘E", "vector no distress"),
+            C("export png pages", self.export_png, "", "images raster"),
+            C("distress panel", self.toggle_distress_panel, "⌘D", "sliders live preview dial"),
+            C("page panel", self.toggle_page_panel, "⌘L",
+              "sliders margins line spacing paragraph size background canvas colour paper"),
+            C("distress view off" if self.distress_view else "distress view",
+              self.toggle_distress_view, "⇧⌘D", "see write live preview distressed page"),
+            C("ink", None, f"{self.fmt.ink:g} %", "darkness ribbon fade tone", fill="ink "),
+            C("distress on" if not d.enabled else "distress off", self.toggle_distress,
+              "off" if not d.enabled else "on", "toggle"),
+        ]
+        out += [C(f"style · {s}", partial(self.set_style, s), dot if s == d.style else "",
+                  "distress texture look") for s in distress.edge_styles()]
+        out += [C(f"fade texture · {s}", partial(self.set_fade_style, s),
+                  dot if s == d.fade_style else "", "distress wear") for s in distress.fade_styles()]
+        out += [C(name, None, f"{getattr(d, name):g}", f"distress {spec[2]}", fill=f"{name} ")
+                for name, spec in distress.PARAMS.items()]
+        out += [C("reset distress", self.reset_distress, "", "defaults")]
+        out += [
+            C("add image or pdf", self.browse_files, "⌘O", "import place insert"),
+            C("new page", self.new_page, "⌘↵", "page break"),
+            C("next page", partial(self.turn_page, 1), "⌘→", "turn"),
+            C("previous page", partial(self.turn_page, -1), "⌘←", "turn back"),
+            C("go to page", None, f"{self.page + 1}", "jump", fill="page "),
+        ]
+        out += [C(f"page size · {name}", partial(self.set_format, page=name),
+                  dot if name == f.page else "", "paper format") for name in style.PAGE_SIZES]
+        out += [C(f"paper · {name}", partial(self.set_format, paper=name),
+                  dot if name == f.paper else "", "colour stock") for name in style.PAPERS]
+        out += [C(f"font · {face}", partial(self.set_format, font=face),
+                  dot if face == self.face() else "", "typeface") for face in style.faces()]
+        out += [
+            C("size", None, f"{f.size:g} pt", "font text", fill="size "),
+            C("line", None, f"{f.line:g} %", "line height leading spacing", fill="line "),
+            C("para", None, f"{f.para:g} pt", "paragraph spacing space after", fill="para "),
+            C("margin", None, f"{f.margin:g} pt", "page sides left right", fill="margin "),
+            C("head", None, f"{f.head:g} pt", "margin top bottom page", fill="head "),
+            C("canvas colour…", self._pick_canvas, self.canvas_colour(), "background color"),
+            C("paper colour…", self._pick_paper, self.paper().name(), "page stock color"),
+            C("dpi", None, f"{f.dpi:g}", "export resolution", fill="dpi "),
+        ]
+        out += [C(f"theme · {name}", partial(self._set_theme, name),
+                  dot if name == self.theme else "", "canvas colour") for name in style.THEMES]
+        out += [
+            C("fit page", self.fit_page, "⌘0", "zoom view"),
+            C("actual size", self.actual_size, "⌘1", "zoom 100"),
+            C("fit everything", self.fit_all, "⇧⌘0", "zoom canvas all"),
+        ]
+        if self.selection():
+            turn = self.selection()[0].rotation()
+            out += [
+                C("rotate 90° right", partial(self.rotate_selected, 90), "]", "turn clockwise"),
+                C("rotate 90° left", partial(self.rotate_selected, -90), "[", "turn counter"),
+                C("rotate", None, f"{turn:g}°", "angle turn", fill="rotate "),
+                C("straighten", partial(self.set_rotation, 0), "", "rotation reset level"),
+            ]
+            out += [
+                C("delete selected", self.delete_selection, "⌫", "remove image"),
+                C("bring to front", self.to_front, "", "order raise"),
+                C("send behind text", self.behind_text, "", "order back"),
+                C("unpin from page", self.unpin_selected, "", "detach canvas"),
+                C("fit to text width", self.fit_width, "", "size image"),
+                C("natural size", self.natural_size, "", "size image reset"),
+            ]
+        out += [
+            C("new document", self.new_document, "⌘N", "blank clear"),
+            C("open…", self.browse_open, "⇧⌘O", "load project"),
+            C("save", self.save, "⌘S", "project"),
+            C("save as…", self.save_as, "⇧⌘S", "project"),
+            C("show drafts", lambda: QtGui.QDesktopServices.openUrl(
+                QtCore.QUrl.fromLocalFile(str(self.home))), "", "folder autosave"),
+            C("word count", lambda: self.toast(
+                f"{len(self.doc.toPlainText().split())} words · "
+                f"{len(self.doc.toPlainText())} characters"), "", "stats"),
+            C("quit", self.close, "⌘Q", "exit"),
+        ]
+        return out
+
+    def dynamic(self, text: str) -> list[Command]:
+        colour = re.match(r"^\s*(canvas|background|paper)\s+(#?[0-9a-f]{3}|#?[0-9a-f]{6})\s*$",
+                          text.lower())
+        if colour:
+            value = "#" + colour.group(2).lstrip("#")
+            if QtGui.QColor(value).isValid():
+                if colour.group(1) == "paper":
+                    return [Command(f"paper → {value}", partial(self.set_paper, value),
+                                    self.paper().name(), key="set:paper")]
+                return [Command(f"canvas → {value}", partial(self.set_canvas, value),
+                                self.canvas_colour(), key="set:canvas")]
+        match = re.match(r"^\s*([a-z][a-z ]*?)\s*(-?\d+(?:\.\d+)?)\s*$", text.lower())
+        if not match:
+            return []
+        word, value = match.group(1).strip(), float(match.group(2))
+        out = []
+        names = list(distress.PARAMS) + list(FORMAT_PARAMS) + ["page"]
+        if self.selection():
+            names.append("rotate")
+        for name in names:
+            if not name.startswith(word):
+                continue
+            if name == "page":
+                now = self.page + 1
+            elif name == "rotate":
+                now = self.selection()[0].rotation()
+            elif name in distress.PARAMS:
+                now = getattr(self.distress, name)
+            else:
+                now = getattr(self.fmt, name)
+            out.append(Command(f"{name} → {value:g}", partial(self.set_param, name, value),
+                               f"now {now:g}", key=f"set:{name}"))
+        return out
+
+    def _set_theme(self, name: str):
+        """A theme sets the canvas colour too."""
+        self.theme = name
+        self.prefs.pop("canvas", None)
+        self.apply_theme()
+        if self.page_panel is not None:
+            self.page_panel.refresh()
+
+    def _set_edge_theme(self, name: str):
+        """Only the page edge and greys; the canvas colour stays."""
+        self.theme = name
+        self.apply_theme()
+
+    def _pick_canvas(self):
+        colour = QtWidgets.QColorDialog.getColor(style.qc(self.canvas_colour()), self, "canvas")
+        if colour.isValid():
+            self.set_canvas(colour.name())
+
+    def _pick_paper(self):
+        colour = QtWidgets.QColorDialog.getColor(self.paper(), self, "paper")
+        if colour.isValid():
+            self.set_paper(colour.name())
+
+    def _shortcuts(self):
+        bindings = [
+            ("Ctrl+E", self.export_pdf), ("Ctrl+Shift+E", partial(self.export_pdf, True)),
+            ("Ctrl+D", self.toggle_distress_panel), ("Ctrl+L", self.toggle_page_panel),
+            ("Ctrl+Shift+D", self.toggle_distress_view),
+            ("Ctrl+O", self.browse_files),
+            ("Ctrl+Shift+O", self.browse_open), ("Ctrl+S", self.save),
+            ("Ctrl+Shift+S", self.save_as), ("Ctrl+N", self.new_document),
+            ("Ctrl+0", self.fit_page), ("Ctrl+Shift+0", self.fit_all),
+            ("Ctrl+1", self.actual_size), ("Ctrl+Return", self.new_page),
+            ("Ctrl+=", lambda: self.view.zoom_by(1.25)), ("Ctrl++", lambda: self.view.zoom_by(1.25)),
+            ("Ctrl+-", lambda: self.view.zoom_by(0.8)), ("Ctrl+Q", self.close),
+        ]
+        for keys, slot in bindings:
+            action = QtWidgets.QAction(self)
+            action.setShortcut(QtGui.QKeySequence(keys))
+            action.setShortcutContext(QtCore.Qt.WindowShortcut)
+            action.triggered.connect(lambda _checked=False, s=slot: s())
+            self.addAction(action)
+
+    # -- window --------------------------------------------------------------
+    def showEvent(self, event):
+        super().showEvent(event)
+        QtCore.QTimer.singleShot(0, self.focus_text)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        for panel in (self.distress_panel, self.page_panel):
+            if panel is not None and panel.isVisible():
+                panel.keep_inside()
+
+    def closeEvent(self, event):
+        self._pool.shutdown(wait=False)
+        self.autosave()
+        self.prefs["geometry"] = bytes(self.saveGeometry().toHex()).decode()
+        self.prefs["last"] = self.path or str(self.draft_path())
+        self._write_prefs()
+        super().closeEvent(event)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="ream", description=__doc__.strip().split("\n")[0])
+    parser.add_argument("paths", nargs="*", help="a .ream document, images, PDFs or folders")
+    parser.add_argument("--theme", choices=sorted(style.THEMES))
+    parser.add_argument("--version", action="version", version=f"ream {__version__}")
+    args = parser.parse_args(argv)
+
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+    app = QtWidgets.QApplication(sys.argv[:1])
+    app.setApplicationName("ream")
+    window = Ream([os.path.abspath(p) for p in args.paths], theme=args.theme)
+    window.show()
+    window.raise_()
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

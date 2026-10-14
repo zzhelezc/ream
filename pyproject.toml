@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ream"
+version = "0.1.0"
+description = "One page on an infinite canvas: write, pin images and PDFs to it, export a distressed PDF"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Zhulien Zhelezchev", email = "zhulien@hartleyultrafast.com" }]
+keywords = ["writing", "canvas", "pdf", "distress", "qt"]
+classifiers = [
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Topic :: Text Editors",
+]
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",   # distance fields, blurs, resampling for distress
+    "pypdfium2>=4.20",               # rendering PDF pages dropped on the canvas
+    "psd-tools>=1.9",                # reading the Distressor's texture patterns
+    "PyQt5>=5.15",
+]
+
+[project.scripts]
+ream = "ream.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ream"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "README.md", "pyproject.toml"]

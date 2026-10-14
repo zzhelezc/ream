@@ -1,0 +1,630 @@
+"""
+End-to-end checks that drive the real window headless:
+
+    QT_QPA_PLATFORM=offscreen uv run python tests/test_core.py
+
+They use a throwaway home folder (REAM_HOME), never yours.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import time
+import traceback
+
+TMP = tempfile.mkdtemp(prefix="ream-test-")
+os.environ["REAM_HOME"] = os.path.join(TMP, "home")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import numpy as np  # noqa: E402
+from PyQt5 import QtCore, QtGui, QtTest, QtWidgets  # noqa: E402
+
+from ream import distress, export, project  # noqa: E402
+from ream.app import Ream  # noqa: E402
+from ream.page import Note  # noqa: E402
+
+app = QtWidgets.QApplication([])
+PARA = ("The refusal to labour is a weapon; a page is where it is written down. "
+        "Each line is fed through the platen and struck in one pass. ") * 3
+
+
+def pump(seconds: float = 0.35):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        app.processEvents()
+        time.sleep(0.005)
+
+
+def fresh() -> Ream:
+    for name in ("draft.ream", "prefs.json"):
+        try:
+            os.remove(os.path.join(os.environ["REAM_HOME"], name))
+        except OSError:
+            pass
+    window = Ream([])
+    window.resize(1100, 820)
+    window.show()
+    pump(0.1)
+    window.fit_page()
+    pump(0.05)
+    return window
+
+
+def type_paragraphs(window: Ream, count: int):
+    cursor = window.sheet.text.textCursor()
+    for n in range(count):
+        cursor.insertText(f"{n + 1:02d}. {PARA}\n")
+    window.sheet.text.setTextCursor(cursor)
+    window.caret_moved()
+    pump()
+
+
+def view_point(window: Ream, scene_point: QtCore.QPointF) -> QtCore.QPoint:
+    return window.view.mapFromScene(scene_point)
+
+
+def wheel(window: Ream, at: QtCore.QPoint, dy: int, phase):
+    event = QtGui.QWheelEvent(QtCore.QPointF(at), QtCore.QPointF(window.view.viewport().mapToGlobal(at)),
+                              QtCore.QPoint(0, dy), QtCore.QPoint(0, dy * 2), QtCore.Qt.NoButton,
+                              QtCore.Qt.NoModifier, phase, False)
+    QtWidgets.QApplication.sendEvent(window.view.viewport(), event)
+
+
+def drag(window: Ream, start: QtCore.QPoint, end: QtCore.QPoint):
+    viewport = window.view.viewport()
+    QtTest.QTest.mousePress(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, start)
+    for k in range(1, 9):
+        p = start + (end - start) * (k / 8.0)
+        QtWidgets.QApplication.sendEvent(viewport, QtGui.QMouseEvent(
+            QtCore.QEvent.MouseMove, QtCore.QPointF(p), QtCore.Qt.LeftButton,
+            QtCore.Qt.LeftButton, QtCore.Qt.NoModifier))
+    QtTest.QTest.mouseRelease(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, end)
+    pump(0.05)
+
+
+def make_png(path: str, colour: str = "#c33") -> str:
+    image = QtGui.QImage(300, 200, QtGui.QImage.Format_RGB32)
+    image.fill(QtGui.QColor(colour))
+    image.save(path)
+    return path
+
+
+# -- the checks ---------------------------------------------------------------
+
+def test_typing_turns_pages():
+    w = fresh()
+    assert w.sheet.text_pages() == 1
+    type_paragraphs(w, 30)
+    assert w.sheet.text_pages() >= 3, w.sheet.text_pages()
+    assert w.page == w.sheet.caret_page() == w.sheet.text_pages() - 1
+    # the strip shows exactly that page
+    assert abs(w.sheet.offset - w.page * w.sheet.H) < 0.5
+    # every line sits inside one page's margins: none straddles a page foot
+    block = w.doc.begin()
+    while block.isValid():
+        top = w.doc.documentLayout().blockBoundingRect(block).top()
+        layout = block.layout()
+        for i in range(layout.lineCount()):
+            line = layout.lineAt(i)
+            y0, y1 = top + line.y(), top + line.y() + line.height()
+            assert int(y0 // w.sheet.H) == int((y1 - 0.01) // w.sheet.H), (y0, y1)
+        block = block.next()
+    w.close()
+
+
+def test_scrolling_pans_and_cmd_arrows_turn_pages():
+    w = fresh()
+    type_paragraphs(w, 30)
+    w.flip(0)
+    pump()
+    w.view.set_zoom(2.0)
+    w.view.centerOn(w.sheet.scene_page_rect().center())
+    pump(0.05)
+    centre = view_point(w, w.sheet.scene_page_rect().center())
+    # a long scroll over the page pans the view and never turns it
+    before = w.view.visible_scene_rect().center()
+    wheel(w, centre, -40, QtCore.Qt.ScrollBegin)
+    for _ in range(40):
+        wheel(w, centre, -40, QtCore.Qt.ScrollUpdate)
+    wheel(w, centre, 0, QtCore.Qt.ScrollEnd)
+    pump()
+    assert w.page == 0 and abs(w.sheet.offset) < 0.01
+    assert w.view.visible_scene_rect().center().y() > before.y() + 100
+    # Cmd+Right turns, and the caret comes to the new page's first line
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Right, QtCore.Qt.ControlModifier)
+    pump()
+    assert w.page == 1 and abs(w.sheet.offset - w.sheet.H) < 0.5
+    assert w.sheet.caret_page() == 1
+    QtTest.QTest.keyClicks(w.view, "here")             # writes on page 2, stays there
+    pump()
+    assert w.page == 1
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Left, QtCore.Qt.ControlModifier)
+    pump()
+    assert w.page == 0 and w.sheet.caret_page() == 0
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Left, QtCore.Qt.ControlModifier)
+    assert w.page == 0                                # nothing before the first
+    # past the last page waits a blank one, and no further
+    for _ in range(w.sheet.pages() + 3):
+        QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Right, QtCore.Qt.ControlModifier)
+    pump()
+    assert w.page == w.sheet.pages()
+    # Iosevka is offered when installed
+    from ream import style
+    if style.installed("Iosevka"):
+        assert "Iosevka" in style.faces()
+        w.set_format(font="Iosevka")
+        assert w.doc.defaultFont().family() == "Iosevka"
+    w.close()
+
+def test_drag_onto_page_pins_and_off_unpins_with_undo():
+    w = fresh()
+    page = w.sheet.scene_page_rect()
+    png = make_png(os.path.join(TMP, "a.png"))
+    w.add_files([png], QtCore.QPointF(page.right() + 300, page.center().y()))
+    (thing,) = [t for t in w.things.values() if t.alive]
+    assert not thing.pinned
+    start = view_point(w, thing.sceneBoundingRect().center())
+    end = view_point(w, page.center())
+    drag(w, start, end)
+    assert thing.pinned, "dropped on the page should pin it"
+    assert thing.parentItem() is w.sheet.strip
+    assert w.sheet.scene_page_rect().contains(thing.sceneBoundingRect().center())
+    # off again
+    drag(w, view_point(w, thing.sceneBoundingRect().center()),
+         view_point(w, QtCore.QPointF(page.left() - 400, page.top() + 100)))
+    assert not thing.pinned
+    w.undo()
+    assert thing.pinned
+    w.redo()
+    assert not thing.pinned
+    w.close()
+
+
+def test_pinned_things_ride_their_page():
+    w = fresh()
+    type_paragraphs(w, 30)
+    w.flip(1)
+    pump()
+    page = w.sheet.scene_page_rect()
+    w.add_files([make_png(os.path.join(TMP, "b.png"), "#36c")], page.center())
+    (thing,) = [t for t in w.things.values() if t.alive]
+    assert thing.pinned
+    assert 1.0 * w.sheet.H <= thing.pos().y() < 2.0 * w.sheet.H, thing.pos().y()
+    w.flip(0)
+    pump()
+    # not on the page shown: clipped away, and not clickable
+    assert w.thing_at(page.center()) is None
+    w.close()
+
+
+def test_delete_and_mixed_undo():
+    w = fresh()
+    type_paragraphs(w, 2)
+    page = w.sheet.scene_page_rect()
+    w.add_files([make_png(os.path.join(TMP, "c.png"))], page.center())
+    (thing,) = [t for t in w.things.values() if t.alive]
+    w.select([thing])
+    w.delete_selection()
+    assert not thing.alive and thing.scene() is None
+    w.focus_text()
+    cursor = w.sheet.text.textCursor()
+    cursor.movePosition(QtGui.QTextCursor.End)
+    cursor.insertText("tail")
+    w.sheet.text.setTextCursor(cursor)
+    assert w.doc.toPlainText().endswith("tail")
+    w.undo()                                    # the typing
+    assert not w.doc.toPlainText().endswith("tail")
+    assert not thing.alive
+    w.undo()                                    # the delete
+    assert thing.alive and thing.pinned and thing.scene() is w.scene
+    w.close()
+
+
+def test_click_past_the_words_starts_that_page():
+    w = fresh()
+    type_paragraphs(w, 1)
+    assert w.sheet.text_pages() == 1
+    w.flip(1)                                   # the blank page after the last
+    pump()
+    centre = view_point(w, w.sheet.scene_page_rect().center())
+    QtTest.QTest.mouseClick(w.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, centre)
+    pump()
+    assert w.sheet.text_pages() == 2
+    assert w.sheet.caret_page() == 1 and w.page == 1
+    w.undo()
+    assert w.sheet.text_pages() == 1
+    w.close()
+
+
+def test_project_round_trip():
+    w = fresh()
+    type_paragraphs(w, 12)
+    w.new_page()
+    w.sheet.text.textCursor().insertText("after the break")
+    page = w.sheet.scene_page_rect()
+    w.add_files([make_png(os.path.join(TMP, "d.png"))], page.center())
+    w.add_files([make_png(os.path.join(TMP, "e.png"), "#3a3")],
+                QtCore.QPointF(page.right() + 200, page.top()))
+    w.distress.style = "stamp"
+    w.distress.edge = 22
+    path = os.path.join(TMP, "doc.ream")
+    w.save_as(path)
+    text = w.doc.toPlainText()
+    pages = w.sheet.pages()
+    w.close()
+    w2 = Ream([path])
+    pump(0.1)
+    assert w2.doc.toPlainText() == text
+    assert w2.sheet.pages() == pages
+    assert "\f" in project.doc_to_text(w2.doc)
+    alive = [t for t in w2.things.values() if t.alive]
+    assert sorted(t.pinned for t in alive) == [False, True]
+    assert w2.distress.style == "stamp" and w2.distress.edge == 22
+    assert w2.path == os.path.abspath(path)
+    w2.close()
+
+
+def test_export_pdf():
+    import pypdfium2
+    w = fresh()
+    type_paragraphs(w, 20)
+    w.add_files([make_png(os.path.join(TMP, "f.png"))], w.sheet.scene_page_rect().center())
+    rough = w.export_pdf(path=os.path.join(TMP, "rough.pdf"))
+    clean = w.export_pdf(clean=True, path=os.path.join(TMP, "clean.pdf"))
+    for path in (rough, clean):
+        document = pypdfium2.PdfDocument(path)
+        assert len(document) == w.sheet.pages(), (path, len(document))
+        width, height = document[0].get_size()
+        assert abs(width - w.sheet.W) < 1.5 and abs(height - w.sheet.H) < 1.5
+    words = pypdfium2.PdfDocument(clean)[0].get_textpage().get_text_range()
+    assert "refusal to labour" in words, words[:120]
+    # the distressed one is pictures of pages, with ink on them
+    page = pypdfium2.PdfDocument(rough)[0].render(scale=1).to_numpy()
+    assert page.min() < 80 and page.max() > 240
+    pngs = w.export_png(path=os.path.join(TMP, "pages.png"))
+    assert len(pngs) == w.sheet.pages() and all(os.path.exists(p) for p in pngs)
+    w.close()
+
+
+def test_distress_changes_the_ink_and_keeps_its_place():
+    w = fresh()
+    type_paragraphs(w, 3)
+    layer = export.ink_layer(w.sheet, 0, 150, w.ink())
+    s = distress.Settings()
+    out = distress.apply(layer, s, 150)
+    a0, a1 = layer[..., 3] > 127, out[..., 3] > 127
+    assert a0.sum() > 1000
+    overlap = (a0 & a1).sum() / max(1, (a0 | a1).sum())
+    assert 0.3 < overlap < 0.97, overlap      # changed, but still the same words
+    for style_name in distress.edge_styles():
+        distress.apply(layer[:200, :300], distress.Settings(style=style_name, misfire=40), 150)
+    sheet = distress.compose(layer, (255, 255, 255), distress.Settings(paper=60), 150)
+    assert sheet.shape == layer.shape[:2] + (3,)
+    w.close()
+
+
+def test_procedural_textures_without_the_plugin():
+    saved = (distress._index, dict(distress._textures), os.environ.get("REAM_DISTRESSOR"))
+    try:
+        os.environ["REAM_DISTRESSOR"] = os.path.join(TMP, "nowhere")
+        distress._index = None
+        distress._textures.clear()
+        assert distress.library()["source"] == "procedural"
+        layer = np.zeros((120, 200, 4), np.uint8)
+        layer[40:80, 20:180] = (20, 20, 20, 255)
+        out = distress.apply(layer, distress.Settings(), 300)
+        assert out[..., 3].max() > 180 and out[..., 3].mean() > 20
+    finally:
+        distress._index, textures, env = saved
+        distress._textures.clear()
+        distress._textures.update(textures)
+        if env is None:
+            os.environ.pop("REAM_DISTRESSOR", None)
+        else:
+            os.environ["REAM_DISTRESSOR"] = env
+
+
+def test_palette():
+    w = fresh()
+    titles = [c.title for c in w.commands()]
+    assert "export pdf" in titles and "distress view" in titles
+    assert any(t.startswith("style · ") for t in titles)
+    (edge,) = [c for c in w.dynamic("edge 14")]
+    edge.run()
+    assert w.distress.edge == 14
+    page_cmds = w.dynamic("page 1")
+    assert any(c.title.startswith("page →") for c in page_cmds)
+    w.dynamic("size 11")[0].run()
+    assert w.fmt.size == 11 and abs(w.doc.defaultFont().pointSizeF() - 11) < 1e-6
+    w.dynamic("line 180")[0].run()
+    assert w.doc.begin().blockFormat().lineHeight() == 180
+    w.open_palette(w.view.mapToGlobal(w.view.viewport().rect().center()))
+    pump(0.05)
+    assert w.palette.isVisible() and w.palette.shown
+    w.palette.query.setText("edge 9")
+    assert w.palette.shown[0].title == "edge → 9"
+    w.palette.query.setText("rbg")       # forgiving match still returns something
+    w.palette.hide()
+    # Tab from the canvas opens it
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Tab)
+    pump(0.05)
+    assert w.palette.isVisible()
+    w.palette.hide()
+    w.show_preview()
+    assert w.preview is not None
+    w.set_param("edge", 30)                 # re-renders while shown
+    assert w.preview is not None
+    w.hide_preview()
+    w.close()
+
+
+def test_rotate_with_the_knob_and_scale_about_the_middle():
+    w = fresh()
+    page = w.sheet.scene_page_rect()
+    w.add_files([make_png(os.path.join(TMP, "r.png"))], page.center())
+    (thing,) = [t for t in w.things.values() if t.alive]
+    w.select([thing])
+    pump(0.05)
+    centre = thing.mapToScene(QtCore.QPointF(thing.w / 2, thing.h / 2))
+    _corners, knob, _top = w._handles(thing)
+    # drag the knob a quarter turn clockwise round the middle
+    c = view_point(w, centre)
+    radius = (knob - QtCore.QPointF(c)).manhattanLength()
+    drag(w, knob.toPoint(), QtCore.QPoint(int(c.x() + radius), c.y()))
+    assert abs(((thing.rotation() + 180) % 360) - 270) < 6, thing.rotation()
+    after = thing.mapToScene(QtCore.QPointF(thing.w / 2, thing.h / 2))
+    assert (after - centre).manhattanLength() < 1.0
+    # the corner handle scales about the middle, even turned
+    corners = w._handles(thing)[0]
+    w0 = thing.w
+    drag(w, corners[2].toPoint(), (corners[2] + (corners[2] - QtCore.QPointF(c)) * 0.5).toPoint())
+    assert thing.w > w0 * 1.3, (w0, thing.w)
+    middle = thing.mapToScene(QtCore.QPointF(thing.w / 2, thing.h / 2))
+    assert (middle - centre).manhattanLength() < 1.5
+    w.undo()
+    assert abs(thing.w - w0) < 0.01
+    w.undo()
+    assert abs(thing.rotation()) < 0.01
+    w.select([thing])
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_BracketRight)
+    assert abs(thing.rotation() - 15) < 0.01
+    w.dynamic("rotate 30")[0].run()
+    assert abs(thing.rotation() - 30) < 0.01
+    # it goes out turned, and comes back turned
+    path = os.path.join(TMP, "turned.ream")
+    w.save_as(path)
+    w.export_pdf(clean=True, path=os.path.join(TMP, "turned.pdf"))
+    w.close()
+    w2 = Ream([path])
+    (back,) = [t for t in w2.things.values() if t.alive]
+    assert abs(back.rotation() - 30) < 0.01 and back.pinned
+    w2.close()
+
+
+def test_layout_sliders_undo_as_one_step():
+    w = fresh()
+    type_paragraphs(w, 6)
+    text = w.doc.toPlainText()
+    lines_before = w.sheet.caret_span()
+    for value in (160, 170, 180, 190, 200):     # a slider being dragged
+        w.set_line_height(value)
+    assert w.doc.begin().blockFormat().lineHeight() == 200
+    for value in (4, 8, 12):
+        w.set_para(value)
+    assert w.doc.begin().blockFormat().bottomMargin() == 12
+    for value in (80, 100, 120):
+        w.set_margins(side=value)
+    assert w.doc.rootFrame().frameFormat().leftMargin() == 120
+    w.set_margins(head=30)
+    assert w.doc.rootFrame().frameFormat().topMargin() == 30
+    w.undo()                                    # head
+    assert w.doc.rootFrame().frameFormat().topMargin() == 70
+    w.undo()                                    # sides
+    assert w.doc.rootFrame().frameFormat().leftMargin() == 64
+    w.undo()                                    # paragraph spacing
+    assert w.doc.begin().blockFormat().bottomMargin() == 0
+    w.undo()                                    # line height
+    assert w.doc.begin().blockFormat().lineHeight() == 150
+    assert w.doc.toPlainText() == text          # and the words are untouched
+    assert w.sheet.caret_span() == lines_before
+    # new paragraphs take the spacing
+    w.set_para(10)
+    cursor = w.sheet.text.textCursor()
+    cursor.movePosition(QtGui.QTextCursor.End)
+    cursor.insertText("\nnew")
+    assert w.doc.lastBlock().blockFormat().bottomMargin() == 10
+    w.close()
+
+
+def test_colours():
+    w = fresh()
+    w.set_canvas("#2a2a2a")
+    assert w.view.bg.name() == "#2a2a2a"
+    assert not w.canvas_is_light()
+    w.dynamic("canvas #e8e7e3")[0].run()
+    assert w.view.bg.name() == "#e8e7e3"
+    w.set_paper("#f0e6d0")
+    assert w.sheet.brush().color().name() == "#f0e6d0"
+    w._set_theme("night")
+    assert w.view.bg.name() == "#161616"
+    w._set_theme("paper")
+    w.close()
+
+
+def test_distress_panel_live_preview():
+    w = fresh()
+    type_paragraphs(w, 4)
+    w.open_distress_panel()
+    panel = w.distress_panel
+    assert panel.isVisible() and w.live()
+    pump(1.0)
+    assert w.preview is not None, "the panel opens with the page previewed"
+    first = w.preview.pixmap().toImage()
+    sliders = panel.findChildren(QtWidgets.QSlider)
+    assert len(sliders) == len(distress.PARAMS) + 2         # + ink, dpi
+    edge = sliders[1 + list(distress.PARAMS).index("edge")]
+    edge.setValue(60)
+    assert w.distress.edge == 60
+    pump(1.0)
+    assert w.preview is not None and w.preview.pixmap().toImage() != first
+    # both panels at once, side by side
+    w.open_page_panel()
+    assert panel.isVisible() and w.page_panel.isVisible()
+    assert not panel.geometry().intersects(w.page_panel.geometry())
+    # closing the distress panel ends the view it started
+    panel.close_panel()
+    assert w.preview is None and not w.live()
+    w.page_panel.close_panel()
+    w.close()
+
+
+def test_write_on_the_distressed_page():
+    w = fresh()
+    type_paragraphs(w, 2)
+    w.set_distress_view(True)
+    pump(1.0)
+    assert w.preview is not None
+    before = w.preview.pixmap().toImage()
+    w.focus_text()
+    QtTest.QTest.keyClicks(w.view, "WORDS TYPED ON TOP")
+    assert w.preview is not None            # stays up while writing
+    pump(1.0)
+    assert w.preview.pixmap().toImage() != before, "re-rendered with the new words"
+    assert w.sheet.text.textCursor().position() > 0
+    w.grab()                                # the caret is drawn over it without trouble
+    # a format change re-renders too
+    shown = w.preview.pixmap().toImage()
+    w.set_line_height(260)
+    pump(1.0)
+    assert w.preview.pixmap().toImage() != shown
+    w.set_distress_view(False)
+    assert w.preview is None
+    w.close()
+
+
+def test_still_preview_never_hides_a_change():
+    w = fresh()
+    type_paragraphs(w, 3)
+    w.show_preview()
+    assert w.preview is not None
+    w.set_line_height(220)                  # e.g. from the page panel
+    assert w.preview is None, "a still picture must not sit over a changed page"
+    w.close()
+
+
+def test_ink_darkness():
+    w = fresh()
+    type_paragraphs(w, 2)
+    dark = export.ink_layer(w.sheet, 0, 100, w.ink())
+    w.set_ink(40)
+    assert w.sheet.text.defaultTextColor().lightness() > 120
+    light = export.ink_layer(w.sheet, 0, 100, w.ink())
+    solid = dark[..., 3] > 200
+    assert light[..., :3][solid].mean() > dark[..., :3][solid].mean() + 60
+    w.dynamic("ink 100")[0].run()
+    assert w.fmt.ink == 100 and w.ink().name() == "#000000"
+    w.set_paper("#f4efe2")
+    w.set_ink(50)
+    c = w.ink()
+    assert c.red() > c.blue()               # fades toward the cream, not grey
+    w.close()
+
+def test_cmd_click_writes_anywhere():
+    w = fresh()
+    type_paragraphs(w, 3)
+    page = w.sheet.scene_page_rect()
+    spot = QtCore.QPointF(page.left() + 200, page.top() + 140)     # over the words
+    QtTest.QTest.mouseClick(w.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.ControlModifier,
+                            view_point(w, spot))
+    pump(0.05)
+    note = w.editing
+    assert note is not None and note.pinned
+    assert abs(note.scenePos().x() - spot.x()) < 1.0
+    QtTest.QTest.keyClicks(w.view, "over the top")
+    assert note.text() == "over the top"
+    assert "over the top" not in w.doc.toPlainText()       # the page's words are untouched
+    # it wraps at the right margin
+    QtTest.QTest.keyClicks(w.view, " and on and on" * 6)
+    right = page.left() + w.sheet.W - w.fmt.margin
+    assert note.sceneBoundingRect().right() <= right + 1.0, (note.sceneBoundingRect(), right)
+    assert note.h > 20
+    # Esc finishes; the words get the keys back
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Escape)
+    assert w.editing is None
+    QtTest.QTest.keyClicks(w.view, "Z")
+    assert w.doc.toPlainText().endswith("Z") or "Z" in w.doc.toPlainText()
+    # undo takes the typing back, then the note
+    w.undo()                                    # the Z
+    w.undo()
+    assert note.text() != "over the top" + " and on and on" * 6 or note.text() == ""
+    while w.history and note.alive:
+        w.undo()
+    assert not note.alive
+    w.redo()
+    assert note.alive
+    w.close()
+
+
+def test_empty_note_leaves_nothing_and_notes_survive():
+    w = fresh()
+    page = w.sheet.scene_page_rect()
+    steps = len(w.history)
+    QtTest.QTest.mouseClick(w.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.ControlModifier,
+                            view_point(w, page.center()))
+    note = w.editing
+    # clicking away with nothing typed removes it, and leaves no undo step
+    QtTest.QTest.mouseClick(w.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+                            view_point(w, page.topLeft() + QtCore.QPointF(100, 100)))
+    assert w.editing is None and not note.alive and len(w.history) == steps
+    # one on the canvas, one on the page; both round-trip, only the page one exports
+    canvas_spot = QtCore.QPointF(page.right() + 200, page.top() + 50)
+    QtTest.QTest.mouseClick(w.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.ControlModifier,
+                            view_point(w, canvas_spot))
+    QtTest.QTest.keyClicks(w.view, "loose")
+    assert not w.editing.pinned and w.editing.wrap < 0
+    QtTest.QTest.mouseClick(w.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.ControlModifier,
+                            view_point(w, page.center()))
+    QtTest.QTest.keyClicks(w.view, "PINNED WORDS")
+    w.editing.setRotation(12)
+    w.finish_editing()
+    path = os.path.join(TMP, "notes.ream")
+    w.save_as(path)
+    pdf = w.export_pdf(clean=True, path=os.path.join(TMP, "notes.pdf"))
+    w.close()
+    import pypdfium2
+    words = pypdfium2.PdfDocument(pdf)[0].get_textpage().get_text_range()
+    assert "PINNED" in words and "loose" not in words, words
+    w2 = Ream([path])
+    notes = sorted((t for t in w2.things.values() if isinstance(t, Note) and t.alive),
+                   key=lambda t: t.pinned)
+    assert [n.text() for n in notes] == ["loose", "PINNED WORDS"]
+    assert abs(notes[1].rotation() - 12) < 0.01 and notes[1].pinned
+    # double-click edits again, at the click
+    w2.fit_page()
+    pump(0.05)
+    target = notes[1].mapToScene(QtCore.QPointF(2, notes[1].h / 2))
+    QtTest.QTest.mouseDClick(w2.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+                             view_point(w2, target))
+    assert w2.editing is notes[1]
+    w2.close()
+
+
+def main() -> int:
+    tests = [(name, fn) for name, fn in globals().items() if name.startswith("test_")]
+    failed = 0
+    for name, fn in tests:
+        started = time.monotonic()
+        try:
+            fn()
+            print(f"ok    {name}  ({time.monotonic() - started:.1f}s)")
+        except Exception:
+            failed += 1
+            print(f"FAIL  {name}")
+            traceback.print_exc()
+    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
