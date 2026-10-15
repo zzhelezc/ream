@@ -325,8 +325,19 @@ class Sheet(QtWidgets.QGraphicsRectItem):
         self.offset = y
         self.strip.setPos(0.0, -y)
 
-    def set_paper(self, colour: QtGui.QColor):
+    def set_paper(self, colour: QtGui.QColor, surface: QtGui.QImage | None = None):
+        """Flat colour, or a paper stock image drawn over the whole page."""
         self.setBrush(QtGui.QBrush(colour))
+        self.surface = surface
+        self.update()
+
+    def paint(self, painter, option, widget=None):
+        surface = getattr(self, "surface", None)
+        if surface is None:
+            super().paint(painter, option, widget)
+            return
+        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
+        painter.drawImage(self.rect(), surface)
 
     # -- pages ---------------------------------------------------------------
     def text_pages(self) -> int:

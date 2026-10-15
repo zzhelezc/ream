@@ -16,7 +16,7 @@ from typing import Callable
 import numpy as np
 from PyQt5 import QtCore, QtGui
 
-from . import distress
+from . import distress, papers
 
 
 def draw_page(painter: QtGui.QPainter, sheet, index: int, ink: QtGui.QColor):
@@ -99,15 +99,25 @@ def rgb(colour: QtGui.QColor) -> tuple[int, int, int]:
     return colour.red(), colour.green(), colour.blue()
 
 
+def stock(sheet, dpi: float, box, paper: QtGui.QColor, texture: str, grain: float):
+    """The paper stock for a page (or `box` of it), or None for flat colour."""
+    if not texture or grain <= 0:
+        return None
+    return papers.sheet(texture, sheet.W, sheet.H, dpi, box, rgb(paper), grain)
+
+
 def raster_page(sheet, index: int, dpi: float, settings: distress.Settings,
-                paper: QtGui.QColor, ink: QtGui.QColor, density: float = 1.0) -> QtGui.QImage:
+                paper: QtGui.QColor, ink: QtGui.QColor, density: float = 1.0,
+                texture: str = "", grain: float = 0.0) -> QtGui.QImage:
     """A finished page as an RGB image: ink, distressed when it is on, on paper."""
     layer = ink_layer(sheet, index, dpi, ink)
-    return from_rgb(distress.compose(layer, rgb(paper), settings, dpi, density=density))
+    base = stock(sheet, dpi, None, paper, texture, grain)
+    return from_rgb(distress.compose(layer, rgb(paper), settings, dpi, density=density, base=base))
 
 
 def write_pdf(path: str, sheet, pages: list[int], *, dpi: float, settings: distress.Settings,
               paper: QtGui.QColor, ink: QtGui.QColor, title: str = "", density: float = 1.0,
+              texture: str = "", grain: float = 0.0,
               progress: Callable[[int, int], None] | None = None):
     raster = settings.enabled
     writer = QtGui.QPdfWriter(path)
@@ -125,11 +135,16 @@ def write_pdf(path: str, sheet, pages: list[int], *, dpi: float, settings: distr
         if n:
             writer.newPage()
         if raster:
-            painter.drawImage(target, raster_page(sheet, index, dpi, settings, paper, ink, density))
+            painter.drawImage(target, raster_page(sheet, index, dpi, settings, paper, ink, density,
+                                                  texture, grain))
         else:
+            base = stock(sheet, min(dpi, 300.0), None, paper, texture, grain)
+            if base is not None:
+                painter.drawImage(target, from_rgb(base))   # the stock under vector words
             painter.save()
             painter.scale(writer.width() / sheet.W, writer.height() / sheet.H)
-            painter.fillRect(QtCore.QRectF(0, 0, sheet.W, sheet.H), paper)
+            if base is None:
+                painter.fillRect(QtCore.QRectF(0, 0, sheet.W, sheet.H), paper)
             draw_page(painter, sheet, index, ink)
             painter.restore()
     painter.end()
@@ -137,13 +152,14 @@ def write_pdf(path: str, sheet, pages: list[int], *, dpi: float, settings: distr
 
 def write_pngs(stem: str, sheet, pages: list[int], *, dpi: float, settings: distress.Settings,
                paper: QtGui.QColor, ink: QtGui.QColor, density: float = 1.0,
+               texture: str = "", grain: float = 0.0,
                progress: Callable[[int, int], None] | None = None) -> list[str]:
     written = []
     for n, index in enumerate(pages):
         if progress:
             progress(n, len(pages))
         path = f"{stem}_{index + 1:02d}.png"
-        image = raster_page(sheet, index, dpi, settings, paper, ink, density)
+        image = raster_page(sheet, index, dpi, settings, paper, ink, density, texture, grain)
         image.setDotsPerMeterX(int(dpi / 0.0254))
         image.setDotsPerMeterY(int(dpi / 0.0254))
         image.save(path)

@@ -673,6 +673,58 @@ def test_spread_and_all_pages():
     w.close()
 
 
+def test_paper_stock():
+    import cv2
+    import pypdfium2
+    from ream import papers
+    folder = papers.folder()
+    folder.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(3)
+    grain = cv2.GaussianBlur(rng.normal(0, 1, (900, 1300)).astype(np.float32), (0, 0), 2)
+    light = np.linspace(150, 210, 1300, dtype=np.float32)[None, :]     # uneven lighting
+    photo = np.clip(light + grain * 25, 0, 255).astype(np.uint8)
+    cv2.imwrite(str(folder / "test_stock.jpg"), photo)
+    (folder / "index.json").write_text('{"test_stock.jpg": "Test stock"}')
+    w = fresh()
+    type_paragraphs(w, 3)
+    assert "Test stock" in w.stock_labels()
+    w.set_paper("#f4efe2")
+    w.set_texture("test_stock.jpg")
+    assert w.stock() == "test_stock.jpg" and w._surface is not None
+    screen = export.to_numpy(w._surface)[..., :3].astype(float)
+    # the stock keeps the chosen colour, evenly lit - only its tooth shows
+    mean = screen.reshape(-1, 3).mean(0)
+    assert np.abs(mean - np.array([0xf4, 0xef, 0xe2])).max() < 6, mean
+    halves = screen[:, : screen.shape[1] // 2].mean(), screen[:, screen.shape[1] // 2:].mean()
+    assert abs(halves[0] - halves[1]) < 3, halves                    # lighting removed
+    assert screen[..., 0].std() > 2                                  # tooth is there
+    flat_before = w.grab()
+    w.set_grain(0)
+    assert w._surface is None and w.stock() == ""
+    w.set_grain(80)
+    # exports carry it: clean (stock under vector words) and distressed
+    clean = w.export_pdf(clean=True, path=os.path.join(TMP, "stock_clean.pdf"))
+    doc = pypdfium2.PdfDocument(clean)
+    assert "refusal to labour" in doc[0].get_textpage().get_text_range()
+    blank = doc[0].render(scale=1).to_numpy()[700:800, 60:200, :3].astype(float)
+    assert blank.std() > 1.5, "the clean PDF prints on the stock"
+    rough = w.export_pdf(path=os.path.join(TMP, "stock_rough.pdf"))
+    page = pypdfium2.PdfDocument(rough)[0].render(scale=1).to_numpy()[700:800, 60:200, :3].astype(float)
+    assert page.std() > 1.5
+    # the live preview and the other pages use it too
+    w.set_distress_view(True)
+    pump(1.2)
+    assert w.preview is not None
+    w.set_distress_view(False)
+    # a document whose stock is missing falls back to flat paper
+    (folder / "test_stock.jpg").unlink()
+    papers._detail.clear()
+    papers._surfaces.clear()
+    w._apply_paper()
+    assert w.stock() == "" and w._surface is None
+    w.close()
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in globals().items() if name.startswith("test_")]
     failed = 0

@@ -367,11 +367,16 @@ def apply(rgba: np.ndarray, s: Settings, dpi: float, origin: tuple[int, int] = (
 
 
 def paper(shape: tuple[int, int], colour: tuple[int, int, int], s: Settings,
-          dpi: float, origin: tuple[int, int] = (0, 0)) -> np.ndarray:
-    """The sheet: (h, w, 3) uint8, aged by the fade texture when `paper` > 0."""
+          dpi: float, origin: tuple[int, int] = (0, 0),
+          base: np.ndarray | None = None) -> np.ndarray:
+    """The sheet: (h, w, 3) uint8 - flat `colour`, or `base` (a paper stock,
+    see papers.py) - aged by the fade texture when `paper` > 0."""
     h, w = shape
-    sheet = np.empty((h, w, 3), np.float32)
-    sheet[...] = colour
+    if base is not None:
+        sheet = base.astype(np.float32)
+    else:
+        sheet = np.empty((h, w, 3), np.float32)
+        sheet[...] = colour
     if s.enabled and s.paper > 0:
         rng = np.random.default_rng(31337 + int(s.seed) * 7)
         wear = _field(_texture("fade", s.fade_style), (h, w), (s.scale / 100.0) * dpi / 300.0,
@@ -383,11 +388,19 @@ def paper(shape: tuple[int, int], colour: tuple[int, int, int], s: Settings,
 
 
 def compose(layer: np.ndarray, colour: tuple[int, int, int], s: Settings,
-            dpi: float, origin: tuple[int, int] = (0, 0), density: float = 1.0) -> np.ndarray:
+            dpi: float, origin: tuple[int, int] = (0, 0), density: float = 1.0,
+            base: np.ndarray | None = None) -> np.ndarray:
     """Distress a page's ink layer (straight RGBA) and lay it on paper:
-    (h, w, 3) uint8 RGB.  `origin` places a crop on the page."""
+    (h, w, 3) uint8 RGB.  `origin` places a crop on the page; `base` is a
+    paper stock to print on instead of the flat colour."""
     ink = apply(layer, s, dpi, origin, density) if s.enabled else layer
-    sheet = paper(layer.shape[:2], colour, s, dpi, origin).astype(np.float32)
+    sheet = paper(layer.shape[:2], colour, s, dpi, origin, base).astype(np.float32)
     a = ink[..., 3:4].astype(np.float32) / 255.0
-    out = sheet * (1.0 - a) + ink[..., :3].astype(np.float32) * a
+    pigment = ink[..., :3].astype(np.float32)
+    if base is not None:
+        # ink sits in the paper's tooth: the stock's light and shade carry
+        # through it (multiply), most visibly in faded or coloured ink
+        tone = base.astype(np.float32) / np.maximum(np.array(colour, np.float32), 1.0)
+        pigment = pigment * np.clip(tone, 0.0, 1.3)
+    out = sheet * (1.0 - a) + pigment * a
     return np.clip(out + 0.5, 0, 255).astype(np.uint8)

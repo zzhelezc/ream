@@ -168,6 +168,7 @@ closes it. Matching is forgiving, and the commands you used last come first.
 | `size 10` | text size, pt |
 | `line 140` | line height, % |
 | `para 6` | space after each paragraph, pt |
+| `grain 40` | how strongly the paper stock shows, % |
 | `ink 70`, `ink 130` | ink darkness, %: below 100 fades, above 100 strikes heavier |
 | `margin 72` | left and right margins, pt |
 | `head 80` | top and bottom margins, pt |
@@ -206,8 +207,9 @@ step.
 - **type:** font (‹ › or click for the list; every Iosevka family you have
   installed is offered too: Iosevka, Term, Slab, Term Slab, Aile, Etoile), size, line height, paragraph
   spacing and ink darkness;
-- **page:** format, side margins, top and bottom margins, and paper colour
-  (swatches, or **+** for any colour);
+- **page:** format, side margins, top and bottom margins, paper colour
+  (swatches, or **+** for any colour), and the paper **stock** and its
+  **grain** (below);
 - **canvas:** the background colour (swatches or **+**), and the edge style
   (paper / white / night) on its own, without changing the colour.
 
@@ -260,6 +262,40 @@ as it will export, and you keep writing on it.
 
 It is saved with the document and applies to clean and distressed exports
 alike. Images are not changed.
+
+## Paper stock
+
+A paper stock lays a photographed paper's surface under the page, on screen,
+in the distress view, on the other pages and in both PDF exports.
+
+- **Choosing one:** **stock** in the page panel (‹ › or click for the list),
+  or **paper stock · …** in the palette. **flat** turns it off.
+- **grain** (0–100%) sets how strongly it shows. Also `grain 40` in the
+  palette.
+- **Only the surface is used.** ream takes the photo's tooth, fibres and
+  grain, strips out its colour and uneven lighting, and lays that onto your
+  paper colour. The page stays your colour and evenly lit.
+- **Distressed ink sits in the tooth.** The stock's light and shade carry
+  through the ink, most visibly when the ink is faded.
+- **Placement is fixed.** The texture is fitted to cover the page, turned to
+  its orientation, and lands on the same spot at every resolution, so the
+  preview and the export line up.
+- **Clean PDFs** keep vector text on top of the stock image (about 2 MB a page
+  at 300 dpi).
+- **Saving:** the document stores the stock's file name. Elsewhere, without
+  that file, it falls back to flat paper.
+
+**Where the papers come from.** ream ships no textures. It reads any images in
+`~/Library/Application Support/ream/papers/` (**show paper folder** in the
+palette opens it). Drop your own scans in there too. An optional `index.json`
+in that folder names them: `{"file.jpg": "Display name"}`.
+
+The 12 clean papers there now were downloaded from
+[Texturelabs](https://texturelabs.org/?ct=666&st=667), large size, for your own
+use. Texturelabs' terms allow using them in your work, commercial work
+included. They do not allow redistributing them or bundling them with a tool,
+so they live in your user folder and never in this repo or package. Don't
+commit them or put them in a shared `.ream`.
 
 ## Distress
 
@@ -348,4 +384,5 @@ Choosing a theme sets its canvas colour. Any colour from the page panel or
 | `src/ream/distress.py` | finding the Distressor, extracting its textures, applying them |
 | `src/ream/export.py` | drawing pages for the PDF, PNGs and the preview |
 | `src/ream/project.py` | reading images and PDFs, the `.ream` file |
+| `src/ream/papers.py` | paper stock: the papers folder, the tooth map, laying it on a page |
 | `src/ream/style.py` | ink, paper, themes, page sizes, faces |
