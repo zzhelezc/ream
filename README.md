@@ -192,6 +192,7 @@ the number.
 | Views | one page (`⌘1`), spread (`⌘2`), all pages (`⌘3`), fit page (`⌘0`) |
 | Look | theme · paper / white / night |
 | Selection (images and text blocks) | rotate 90° right / left, rotate, straighten, delete, bring to front, send behind text, unpin from page, fit to text width, natural size |
+| Profiles | save profile (`⌥⌘S`), save profile as…, new profile, profile · name (`⌥⌘1`–`9`), delete profile · name |
 | File | new document (`⌘N`), open… (`⇧⌘O`), save (`⌘S`), save as… (`⇧⌘S`), show drafts, word count, quit |
 
 ## Panels
@@ -262,6 +263,39 @@ as it will export, and you keep writing on it.
 
 It is saved with the document and applies to clean and distressed exports
 alike. Images are not changed.
+
+## Profiles
+
+A profile is a named set of settings you can switch between: everything
+about how the page looks and comes out, nothing about what is on it.
+
+| In a profile | Not in a profile |
+| --- | --- |
+| page format, font, size, line and paragraph spacing, margins | your words |
+| paper colour, stock and grain, ink | images and text blocks |
+| every distress setting, the export dpi | the view (one page, spread, all) |
+| canvas colour and theme | |
+
+Profiles are yours, not a document's. They live in
+`~/Library/Application Support/ream/profiles.json`, and any document can take
+any of them.
+
+**The flow:**
+
+1. Set things up, then **save** (`⌥⌘S`). With no profile active yet, that
+   makes `profile1`.
+2. Change things; the active profile shows a `*` (in the panels and the
+   palette caption) while the settings differ from it.
+3. **save** puts the changes into the active profile, or **new** saves them as
+   the next `profileN`, leaving the old one as it was.
+4. Switch with `⌥⌘1` … `⌥⌘9` (in the order the profiles were made), the
+   **profile** chooser at the top of either panel, or **profile · name** in the
+   palette.
+
+To name a profile, type `save profile zine` in the palette (an existing name
+is replaced). **delete** in a panel removes the active profile; **delete
+profile · name** in the palette removes any one. Switching re-lays the page in
+one step, so `⌘Z` takes back a switch's line and paragraph spacing.
 
 ## Paper stock
 
@@ -384,5 +418,6 @@ Choosing a theme sets its canvas colour. Any colour from the page panel or
 | `src/ream/distress.py` | finding the Distressor, extracting its textures, applying them |
 | `src/ream/export.py` | drawing pages for the PDF, PNGs and the preview |
 | `src/ream/project.py` | reading images and PDFs, the `.ream` file |
+| `src/ream/profiles.py` | profiles: the store of named settings |
 | `src/ream/papers.py` | paper stock: the papers folder, the tooth map, laying it on a page |
 | `src/ream/style.py` | ink, paper, themes, page sizes, faces |

@@ -35,7 +35,7 @@ from pathlib import Path
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from . import __version__, distress, export, papers, project, style
+from . import __version__, distress, export, papers, profiles, project, style
 from .canvas import CanvasView
 from .page import GhostPage, Note, NoteText, Sheet, Thing
 from .palette import Command, CommandPalette
@@ -140,6 +140,9 @@ class Ream(QtWidgets.QMainWindow):
         if self.layout not in LAYOUTS:
             self.layout = "single"
         self.ghosts: dict[int, GhostPage] = {}
+        self._profiles = profiles.load()
+        self._panel_timer = QtCore.QTimer(self, singleShot=True, interval=200)
+        self._panel_timer.timeout.connect(self._refresh_panels)
         self._grid_cols = 4
         self.ghost_ready.connect(self._ghost_arrived)
         self.distress_view = False                  # write on the distressed page
@@ -1854,6 +1857,103 @@ class Ream(QtWidgets.QMainWindow):
         if self.page_panel is not None:
             self.page_panel.refresh()
 
+    # -- profiles ------------------------------------------------------------
+    def settings_snapshot(self) -> dict:
+        """Everything a profile holds: how the page looks and comes out."""
+        return {"format": asdict(self.fmt), "distress": self.distress.to_dict(),
+                "theme": self.theme, "canvas": self.canvas_colour()}
+
+    def profile_names(self) -> list[str]:
+        return list(self._profiles)
+
+    def active_profile(self) -> str | None:
+        name = self.prefs.get("profile")
+        return name if name in self._profiles else None
+
+    def profile_dirty(self) -> bool:
+        """True when the settings no longer match the active profile."""
+        name = self.active_profile()
+        if name is None:
+            return False
+        return json.loads(json.dumps(self.settings_snapshot())) != self._profiles[name]
+
+    def save_profile(self, name: str | None = None):
+        """Save the current settings: to `name`, else to the active profile,
+        else to a new one (profile1, profile2, ...)."""
+        name = (name or "").strip() or self.active_profile() or profiles.next_name(self._profiles)
+        self._profiles[name] = json.loads(json.dumps(self.settings_snapshot()))
+        profiles.store(self._profiles)
+        self.prefs["profile"] = name
+        self._write_prefs()
+        self.toast(f"saved to {name}")
+        self._refresh_panels()
+
+    def new_profile(self):
+        self.save_profile(profiles.next_name(self._profiles))
+
+    def switch_profile(self, name: str):
+        snap = self._profiles.get(name)
+        if snap is None:
+            return
+        self.prefs["profile"] = name
+        self._write_prefs()
+        self.apply_settings(snap)
+        self.toast(f"profile · {name}")
+
+    def switch_profile_number(self, number: int):
+        names = self.profile_names()
+        if 1 <= number <= len(names):
+            self.switch_profile(names[number - 1])
+
+    def delete_profile(self, name: str | None = None):
+        name = name or self.active_profile()
+        if not name or name not in self._profiles:
+            return
+        del self._profiles[name]
+        profiles.store(self._profiles)
+        if self.prefs.get("profile") == name:
+            self.prefs.pop("profile", None)
+            self._write_prefs()
+        self.toast(f"deleted {name}")
+        self._refresh_panels()
+
+    def _choose_profile(self, name: str):
+        if name in self._profiles and name != self.active_profile():
+            self.switch_profile(name)
+
+    def apply_settings(self, snap: dict):
+        """Take on a profile's settings: type, layout, paper, ink, distress,
+        canvas.  Line and paragraph spacing change as one undo step."""
+        old, new = self.fmt, Format.from_dict(snap.get("format"))
+        self.distress = distress.Settings.from_dict(snap.get("distress"))
+        if snap.get("theme") in style.THEMES:
+            self.theme = snap["theme"]
+        if snap.get("canvas"):
+            self.prefs["canvas"] = snap["canvas"]
+        self.apply_theme()
+        self.fmt = new
+        self.apply_format()
+        if (new.line, new.para) != (old.line, old.para):
+            block = QtGui.QTextBlockFormat()
+            block.setLineHeight(new.line, QtGui.QTextBlockFormat.ProportionalHeight)
+            block.setBottomMargin(new.para)
+            self._format_edit("profile", self._merge_blocks(block))
+            self.restyle_notes()
+        self.caret_moved(follow=False)
+        self._refresh_panels()
+        self.distress_changed()
+
+    def _profile_rows(self, panel: Panel):
+        panel.choice("profile", lambda: self.profile_names() or ["none"],
+                     lambda: self.active_profile() or "none", self._choose_profile)
+        panel.links("", [(lambda: "save *" if self.profile_dirty() else "save", self.save_profile),
+                         ("new", self.new_profile), ("delete", self.delete_profile)])
+
+    def _refresh_panels(self):
+        for panel in (self.distress_panel, self.page_panel):
+            if panel is not None and panel.isVisible():
+                panel.refresh()
+
     # -- panels --------------------------------------------------------------
     def _slider_held(self) -> bool:
         focus = QtWidgets.QApplication.focusWidget()
@@ -1869,6 +1969,7 @@ class Ream(QtWidgets.QMainWindow):
         panel = Panel(self, "distress", on_close=self._distress_panel_closed,
                       on_tab=self.open_palette)
         d = lambda: self.distress                                       # noqa: E731
+        self._profile_rows(panel)
         panel.toggle("see", lambda: self.distress_view,
                      lambda v: self.set_distress_view(v, quiet=True), on="distressed", off="clean")
         panel.toggle("export", lambda: d().enabled,
@@ -1902,6 +2003,7 @@ class Ream(QtWidgets.QMainWindow):
     def build_page_panel(self) -> Panel:
         panel = Panel(self, "page", on_tab=self.open_palette)
         f = lambda: self.fmt                                            # noqa: E731
+        self._profile_rows(panel)
         panel.section("type")
         panel.choice("font", style.faces, self.face, lambda v: self.set_format(font=v))
         panel.slider("size", 5, 24, lambda: f().size, self.set_size, step=0.5, unit=" pt",
@@ -2207,6 +2309,9 @@ class Ream(QtWidgets.QMainWindow):
         if self._loading:
             return
         self.save_timer.start()
+        if (self.distress_panel and self.distress_panel.isVisible()) or \
+                (self.page_panel and self.page_panel.isVisible()):
+            self._panel_timer.start()
         self._refresh_ghosts()
         if self.live():
             self._schedule_live()
@@ -2239,6 +2344,9 @@ class Ream(QtWidgets.QMainWindow):
         words = len(self.doc.toPlainText().split())
         name = os.path.basename(self.path) if self.path else "draft"
         mark = f"distress · {self.distress.style}" if self.distress.enabled else "clean"
+        profile = self.active_profile()
+        if profile:
+            mark += f" · {profile}{' *' if self.profile_dirty() else ''}"
         return f"{name} · page {self.page + 1} of {self.pages_shown()} · {words} words · {mark}"
 
     def commands(self) -> list[Command]:
@@ -2327,6 +2435,17 @@ class Ream(QtWidgets.QMainWindow):
                 C("natural size", self.natural_size, "", "size image reset"),
             ]
         out += [
+            C("save profile", self.save_profile,
+              (self.active_profile() or "new") + (" *" if self.profile_dirty() else "") + "  ⌥⌘S",
+              "settings preset store keep"),
+            C("save profile as…", None, "", "settings preset name", fill="save profile "),
+            C("new profile", self.new_profile, "", "settings preset add"),
+            *[C(f"profile · {name}", partial(self.switch_profile, name),
+                ("● " if name == self.active_profile() else "") + (f"⌥⌘{n}" if n <= 9 else ""),
+                "switch settings preset load")
+              for n, name in enumerate(self.profile_names(), 1)],
+            *[C(f"delete profile · {name}", partial(self.delete_profile, name), "", "remove preset")
+              for name in self.profile_names()],
             C("new document", self.new_document, "⌘N", "blank clear"),
             C("open…", self.browse_open, "⇧⌘O", "load project"),
             C("save", self.save, "⌘S", "project"),
@@ -2341,6 +2460,12 @@ class Ream(QtWidgets.QMainWindow):
         return out
 
     def dynamic(self, text: str) -> list[Command]:
+        named = re.match(r"^\s*save profile\s+(\S.*?)\s*$", text, re.IGNORECASE)
+        if named:
+            name = named.group(1)
+            hint = "replace" if name in self._profiles else "new"
+            return [Command(f"save profile → {name}", partial(self.save_profile, name), hint,
+                            key="save-profile-as")]
         colour = re.match(r"^\s*(canvas|background|paper)\s+(#?[0-9a-f]{3}|#?[0-9a-f]{6})\s*$",
                           text.lower())
         if colour:
@@ -2402,6 +2527,8 @@ class Ream(QtWidgets.QMainWindow):
             ("Ctrl+E", self.export_pdf), ("Ctrl+Shift+E", partial(self.export_pdf, True)),
             ("Ctrl+D", self.toggle_distress_panel), ("Ctrl+L", self.toggle_page_panel),
             ("Ctrl+Shift+D", self.toggle_distress_view),
+            ("Ctrl+Alt+S", self.save_profile),
+            *[(f"Ctrl+Alt+{n}", partial(self.switch_profile_number, n)) for n in range(1, 10)],
             ("Ctrl+O", self.browse_files),
             ("Ctrl+Shift+O", self.browse_open), ("Ctrl+S", self.save),
             ("Ctrl+Shift+S", self.save_as), ("Ctrl+N", self.new_document),

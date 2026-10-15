@@ -725,6 +725,68 @@ def test_paper_stock():
     w.close()
 
 
+def test_profiles():
+    from ream import profiles
+    try:
+        profiles.path().unlink()
+    except OSError:
+        pass
+    w = fresh()
+    type_paragraphs(w, 6)
+    text = w.doc.toPlainText()
+    # profile1: the defaults, slightly changed
+    w.set_size(10)
+    w.distress.edge = 22
+    w.save_profile()
+    assert w.active_profile() == "profile1" and not w.profile_dirty()
+    # change a lot, and it shows as unsaved
+    w.set_size(12)
+    w.set_line_height(210)
+    w.set_para(8)
+    w.set_margins(side=40, head=50)
+    w.set_ink(130)
+    w.set_paper("#f4efe2")
+    w.set_canvas("#2a2a2a")
+    w.distress.style = "stamp"
+    w.distress.edge = 40
+    assert w.profile_dirty()
+    assert "*" in w.caption()
+    # save as a new profile, then switch back and forth
+    w.new_profile()
+    assert w.active_profile() == "profile2" and w.profile_names() == ["profile1", "profile2"]
+    w.switch_profile("profile1")
+    assert w.fmt.size == 10 and w.fmt.line == 150 and w.fmt.para == 0 and w.fmt.margin == 64
+    assert w.fmt.ink == 100 and w.distress.style == "rough" and w.distress.edge == 22
+    assert w.doc.begin().blockFormat().lineHeight() == 150
+    assert abs(w.doc.defaultFont().pointSizeF() - 10) < 1e-6
+    assert w.view.bg.name() != "#2a2a2a"
+    assert not w.profile_dirty()
+    w.switch_profile("profile2")
+    assert w.fmt.size == 12 and w.fmt.line == 210 and w.fmt.para == 8 and w.fmt.margin == 40
+    assert w.doc.begin().blockFormat().lineHeight() == 210
+    assert w.doc.begin().blockFormat().bottomMargin() == 8
+    assert w.distress.style == "stamp" and w.view.bg.name() == "#2a2a2a"
+    assert w.doc.toPlainText() == text, "profiles never touch the words"
+    # shortcuts: Cmd+Alt+1 goes to the first profile
+    w.switch_profile_number(1)
+    assert w.active_profile() == "profile1" and w.fmt.size == 10
+    # the palette saves under a typed name
+    (named,) = w.dynamic("save profile zine")
+    named.run()
+    assert "zine" in w.profile_names() and w.active_profile() == "zine"
+    # both panels carry the profile rows
+    w.open_page_panel()
+    w.open_distress_panel()
+    w.page_panel.refresh()
+    w.close()
+    # they outlive the window
+    w2 = Ream([])
+    assert w2.profile_names() == ["profile1", "profile2", "zine"]
+    w2.delete_profile("zine")
+    assert w2.profile_names() == ["profile1", "profile2"] and w2.active_profile() is None
+    w2.close()
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in globals().items() if name.startswith("test_")]
     failed = 0

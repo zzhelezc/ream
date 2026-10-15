@@ -280,6 +280,29 @@ class Panel(QtWidgets.QFrame):
         self.grid.addLayout(box, row, 1, 1, 2)
         self._refreshers.append(refresh)
 
+    def links(self, name: str, entries: list[tuple[str | Callable[[], str], Callable[[], None]]]):
+        """A row of words that are buttons; a word may be a function, so it
+        can change ("save" becomes "save *" when there is something to save)."""
+        row = self._row()
+        box = QtWidgets.QHBoxLayout()
+        box.setSpacing(4)
+        made = []
+        for text, run in entries:
+            link = _Link(text() if callable(text) else text)
+            link.clicked.connect(lambda r=run: (r(), self.refresh()))
+            box.addWidget(link)
+            made.append((link, text))
+        box.addStretch(1)
+
+        def refresh():
+            for link, text in made:
+                if callable(text):
+                    link.setText(text())
+
+        self.grid.addWidget(self._name(name), row, 0)
+        self.grid.addLayout(box, row, 1, 1, 2)
+        self._refreshers.append(refresh)
+
     def buttons(self, entries: list[tuple[str, Callable[[], None]]]):
         self.column.addSpacing(4)
         self.column.addWidget(self._rule())
