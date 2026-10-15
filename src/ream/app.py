@@ -33,11 +33,12 @@ from dataclasses import asdict, dataclass, fields, replace
 from functools import partial
 from pathlib import Path
 
+import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from . import __version__, distress, export, papers, profiles, project, style
 from .canvas import CanvasView
-from .page import GhostPage, Note, NoteText, Sheet, Thing
+from .page import GhostPage, Note, NoteText, Sheet, Thing, draw_stock
 from .palette import Command, CommandPalette
 from .panel import Panel
 
@@ -70,7 +71,9 @@ class Format:
     para: float = 0.0           # pt of space after each paragraph
     paper: str = "white"        # a name from style.PAPERS or "#rrggbb"
     texture: str = ""           # a paper stock from the papers folder ("" = flat)
-    grain: float = 60.0         # % how much of the stock's tooth shows
+    grain: float = 60.0         # % the stock's amount: tooth strength, or blend opacity
+    blend: str = "tooth"        # tooth, multiply, overlay, soft light, screen, normal
+    stock_scale: float = 100.0  # % the paper's size: 100 covers the page
     ink: float = 100.0          # %: 100 is solid black, lower fades toward the paper,
                                 # higher strikes heavier and packs the ink denser
     dpi: float = 300.0          # export
@@ -83,7 +86,7 @@ class Format:
 
 FORMAT_PARAMS = {"size": (5, 72), "line": (80, 300), "para": (0, 72), "margin": (0, 200),
                  "head": (0, 200), "dpi": (72, 1200), "ink": (5, 150),
-                 "grain": (0, 100)}
+                 "grain": (0, 100), "stock": (25, 400)}
 
 
 @contextmanager
@@ -285,18 +288,46 @@ class Ream(QtWidgets.QMainWindow):
         key = self.fmt.texture
         return key if key and self.fmt.grain > 0 and (papers.folder() / key).is_file() else ""
 
+    def blend_mode(self) -> str:
+        return self.fmt.blend if self.fmt.blend in papers.BLENDS else "tooth"
+
+    def paper_stock(self) -> export.Stock:
+        """The stock as one render needs it (empty when there is none)."""
+        return export.Stock(self.stock(), self.fmt.grain, self.blend_mode(), self.fmt.stock_scale)
+
     def _apply_paper(self):
-        surface = None
-        key = self.stock()
-        if key:
+        """Tooth: a stock image painted as the page.  A blend: flat paper,
+        with the photo blended over everything on it by the stock layer."""
+        surface = layer = None
+        key, mode = self.stock(), self.blend_mode()
+        if key and mode == "tooth":
             sheet = papers.sheet(key, self.sheet.W, self.sheet.H, STOCK_SCREEN_DPI, None,
-                                 export.rgb(self.paper()), self.fmt.grain)
+                                 export.rgb(self.paper()), self.fmt.grain, self.fmt.stock_scale)
             if sheet is not None:
                 surface = export.from_rgb(sheet)
-        self._surface = surface
+        elif key:
+            photo = papers.surface(key, self.sheet.W, self.sheet.H, STOCK_SCREEN_DPI, None,
+                                   self.fmt.stock_scale, mode)
+            if photo is not None:
+                layer = export.from_rgb(np.clip(photo * 255.0 + 0.5, 0, 255).astype(np.uint8))
+        self._surface, self._stock_layer = surface, layer
         self.sheet.set_paper(self.paper(), surface)
+        self.sheet.stock.set(layer, mode, self.fmt.grain / 100.0)
         for ghost in getattr(self, "ghosts", {}).values():
             ghost.update()
+
+    def set_blend(self, mode: str):
+        self.fmt.blend = mode if mode in papers.BLENDS else "tooth"
+        self._apply_paper()
+        self.toast(f"stock blend · {self.fmt.blend}")
+        if self.page_panel is not None:
+            self.page_panel.refresh()
+        self.changed()
+
+    def set_stock_scale(self, value: float):
+        self.fmt.stock_scale = max(25.0, min(400.0, value))
+        self._apply_paper()
+        self.changed()
 
     def set_texture(self, key: str):
         self.fmt.texture = key
@@ -938,13 +969,18 @@ class Ream(QtWidgets.QMainWindow):
             painter.drawImage(rect, self._surface)
         else:
             painter.fillRect(rect, self.paper())
+        layer = getattr(self, "_stock_layer", None)
         if ghost.index >= self.sheet.pages():
+            if layer is not None:
+                draw_stock(painter, rect, layer, self.blend_mode(), self.fmt.grain / 100.0)
             return                                  # the blank page after the words
         if self.live() and ghost.distressed is not None and ghost.distressed[0] == self._ghost_key(ghost.index):
             painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
-            painter.drawImage(rect, ghost.distressed[1])
+            painter.drawImage(rect, ghost.distressed[1])    # the blend is in it already
             return
         export.draw_page(painter, self.sheet, ghost.index, self.ink())
+        if layer is not None:
+            draw_stock(painter, rect, layer, self.blend_mode(), self.fmt.grain / 100.0)
 
     def _ghost_key(self, index: int) -> tuple:
         return (index, self.doc.revision(), tuple(sorted(self.snapshot().items())),
@@ -959,7 +995,7 @@ class Ream(QtWidgets.QMainWindow):
         dpi = max(60.0, min(200.0, 72.0 * self.view.zoom() * ratio))
         settings = replace(self.distress, enabled=True)
         paper, density = export.rgb(self.paper()), self.density()
-        texture, grain, paper_colour = self.stock(), self.fmt.grain, self.paper()
+        paper_stock, paper_colour = self.paper_stock(), self.paper()
         for index, ghost in self.ghosts.items():
             if index >= self.sheet.pages() or not ghost.sceneBoundingRect().intersects(seen):
                 continue
@@ -970,8 +1006,9 @@ class Ream(QtWidgets.QMainWindow):
 
             def work(index=index, key=key, layer=layer):
                 try:
-                    base = export.stock(self.sheet, dpi, None, paper_colour, texture, grain)
-                    out = distress.compose(layer, paper, settings, dpi, density=density, base=base)
+                    base = export.stock(self.sheet, dpi, None, paper_colour, paper_stock)
+                    out = distress.compose(layer, paper, settings, dpi, density=density, base=base,
+                                           over=export.over(self.sheet, dpi, None, paper_stock))
                 except Exception as exc:
                     print("ream: page preview failed:", exc, file=sys.stderr)
                     return
@@ -1674,9 +1711,11 @@ class Ream(QtWidgets.QMainWindow):
         settings = replace(self.distress, enabled=True)
         with busy():
             layer = self._ink(dpi, box)
-            base = export.stock(self.sheet, dpi, box, self.paper(), self.stock(), self.fmt.grain)
+            paper_stock = self.paper_stock()
+            base = export.stock(self.sheet, dpi, box, self.paper(), paper_stock)
             out = distress.compose(layer, export.rgb(self.paper()), settings, dpi,
-                                   origin=(box[1], box[0]), density=self.density(), base=base)
+                                   origin=(box[1], box[0]), density=self.density(), base=base,
+                                   over=export.over(self.sheet, dpi, box, paper_stock))
         self._set_preview_image(export.from_rgb(out), dpi, box)
 
     def request_preview(self, fast: bool = False):
@@ -1695,15 +1734,16 @@ class Ream(QtWidgets.QMainWindow):
         settings = replace(self.distress, enabled=True)
         paper = export.rgb(self.paper())
         density = self.density()
-        texture, grain, paper_colour = self.stock(), self.fmt.grain, self.paper()
+        paper_stock, paper_colour = self.paper_stock(), self.paper()
 
         def work():
             if gen != self._preview_gen:
                 return
             try:
-                base = export.stock(self.sheet, dpi, box, paper_colour, texture, grain)
+                base = export.stock(self.sheet, dpi, box, paper_colour, paper_stock)
                 out = distress.compose(layer, paper, settings, dpi, origin=(box[1], box[0]),
-                                       density=density, base=base)
+                                       density=density, base=base,
+                                       over=export.over(self.sheet, dpi, box, paper_stock))
             except Exception as exc:            # never let the worker die quietly
                 print("ream: preview failed:", exc, file=sys.stderr)
                 return
@@ -1837,7 +1877,7 @@ class Ream(QtWidgets.QMainWindow):
         lo, hi = FORMAT_PARAMS[name]
         value = max(lo, min(hi, value))
         setters = {"line": self.set_line_height, "para": self.set_para, "size": self.set_size,
-                   "ink": self.set_ink, "grain": self.set_grain,
+                   "ink": self.set_ink, "grain": self.set_grain, "stock": self.set_stock_scale,
                    "margin": lambda v: self.set_margins(side=v),
                    "head": lambda v: self.set_margins(head=v)}
         if name in setters:
@@ -2022,7 +2062,10 @@ class Ream(QtWidgets.QMainWindow):
         panel.swatches("paper", list(style.PAPERS.values()) + ["#e4e1d6", "#d8d2c2"],
                        lambda: self.paper().name(), self.set_paper)
         panel.choice("stock", self.stock_labels, self.stock_label, self.set_stock_label)
-        panel.slider("grain", 0, 100, lambda: f().grain, self.set_grain, unit="%", default=60)
+        panel.choice("blend", lambda: list(papers.BLENDS), self.blend_mode, self.set_blend)
+        panel.slider("amount", 0, 100, lambda: f().grain, self.set_grain, unit="%", default=60)
+        panel.slider("scale", 25, 400, lambda: f().stock_scale, self.set_stock_scale, step=5,
+                     unit="%", default=100)
         panel.section("canvas")
         panel.swatches("colour", CANVAS_SWATCHES, self.canvas_colour, self.set_canvas)
         panel.choice("edge", lambda: list(style.THEMES), lambda: self.theme, self._set_edge_theme)
@@ -2102,7 +2145,7 @@ class Ream(QtWidgets.QMainWindow):
         with busy():
             export.write_pdf(path, self.sheet, pages, dpi=self.fmt.dpi, settings=settings,
                              paper=self.paper(), ink=self.ink(), title=self.stem(),
-                             density=self.density(), texture=self.stock(), grain=self.fmt.grain,
+                             density=self.density(), paper_stock=self.paper_stock(),
                              progress=lambda n, total: self.toast(f"page {n + 1} of {total}"))
         how = f"distressed · {settings.style}" if settings.enabled else "clean"
         self.toast(f"{len(pages)} {'page' if len(pages) == 1 else 'pages'} {how} → {path}")
@@ -2117,8 +2160,8 @@ class Ream(QtWidgets.QMainWindow):
         with busy():
             written = export.write_pngs(stem, self.sheet, pages, dpi=self.fmt.dpi,
                                         settings=self.distress, paper=self.paper(), ink=self.ink(),
-                                        density=self.density(), texture=self.stock(),
-                                        grain=self.fmt.grain,
+                                        density=self.density(),
+                                        paper_stock=self.paper_stock(),
                                         progress=lambda n, t: self.toast(f"page {n + 1} of {t}"))
         self.toast(f"{len(written)} png → {os.path.dirname(stem)}")
         return written
@@ -2331,14 +2374,13 @@ class Ream(QtWidgets.QMainWindow):
 
     # -- palette -------------------------------------------------------------
     def open_palette(self, global_pos: QtCore.QPoint | None = None, text: str = ""):
-        global_pos = global_pos or QtGui.QCursor.pos()
-        local = self.view.mapFromGlobal(global_pos)
-        if self.view.viewport().rect().contains(local):
-            self.palette_at = self.view.mapToScene(local)
-        else:
-            self.palette_at = None
-            global_pos = self.view.mapToGlobal(self.view.viewport().rect().center())
-        self.palette.popup(global_pos, text)
+        """The palette always opens in the middle of the window.  Things it
+        adds (images, paste) still land where the pointer was."""
+        pointer = self.view.mapFromGlobal(global_pos or QtGui.QCursor.pos())
+        self.palette_at = (self.view.mapToScene(pointer)
+                           if self.view.viewport().rect().contains(pointer) else None)
+        centre = self.view.mapToGlobal(self.view.viewport().rect().center())
+        self.palette.popup(centre, text, centred=True)
 
     def caption(self) -> str:
         words = len(self.doc.toPlainText().split())
@@ -2394,7 +2436,13 @@ class Ream(QtWidgets.QMainWindow):
             C("head", None, f"{f.head:g} pt", "margin top bottom page", fill="head "),
             C("canvas colour…", self._pick_canvas, self.canvas_colour(), "background color"),
             C("paper colour…", self._pick_paper, self.paper().name(), "page stock color"),
-            C("grain", None, f"{self.fmt.grain:g} %", "paper stock texture tooth", fill="grain "),
+            C("grain", None, f"{self.fmt.grain:g} %", "paper stock amount opacity tooth",
+              fill="grain "),
+            C("stock scale", None, f"{self.fmt.stock_scale:g} %", "paper texture size zoom",
+              fill="stock "),
+            *[C(f"stock blend · {mode}", partial(self.set_blend, mode),
+                "●" if mode == self.blend_mode() else "", "paper blend mode overlay multiply")
+              for mode in papers.BLENDS],
             C("paper stock · flat", partial(self.set_texture, ""),
               "●" if not self.stock() else "", "texture none plain"),
             *[C(f"paper stock · {label}", partial(self.set_texture, key),
@@ -2494,7 +2542,7 @@ class Ream(QtWidgets.QMainWindow):
             elif name in distress.PARAMS:
                 now = getattr(self.distress, name)
             else:
-                now = getattr(self.fmt, name)
+                now = getattr(self.fmt, {"stock": "stock_scale"}.get(name, name))
             out.append(Command(f"{name} → {value:g}", partial(self.set_param, name, value),
                                f"now {now:g}", key=f"set:{name}"))
         return out

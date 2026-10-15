@@ -389,10 +389,11 @@ def paper(shape: tuple[int, int], colour: tuple[int, int, int], s: Settings,
 
 def compose(layer: np.ndarray, colour: tuple[int, int, int], s: Settings,
             dpi: float, origin: tuple[int, int] = (0, 0), density: float = 1.0,
-            base: np.ndarray | None = None) -> np.ndarray:
+            base: np.ndarray | None = None, over: tuple | None = None) -> np.ndarray:
     """Distress a page's ink layer (straight RGBA) and lay it on paper:
     (h, w, 3) uint8 RGB.  `origin` places a crop on the page; `base` is a
-    paper stock to print on instead of the flat colour."""
+    paper stock to print on instead of the flat colour (the tooth blend);
+    `over` is (photo, mode, amount), a paper blended over the finished page."""
     ink = apply(layer, s, dpi, origin, density) if s.enabled else layer
     sheet = paper(layer.shape[:2], colour, s, dpi, origin, base).astype(np.float32)
     a = ink[..., 3:4].astype(np.float32) / 255.0
@@ -403,4 +404,9 @@ def compose(layer: np.ndarray, colour: tuple[int, int, int], s: Settings,
         tone = base.astype(np.float32) / np.maximum(np.array(colour, np.float32), 1.0)
         pigment = pigment * np.clip(tone, 0.0, 1.3)
     out = sheet * (1.0 - a) + pigment * a
-    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+    page = np.clip(out + 0.5, 0, 255).astype(np.uint8)
+    if over is not None:
+        from . import papers
+        layer, mode, amount = over
+        page = papers.blend(page, layer, mode, amount)
+    return page

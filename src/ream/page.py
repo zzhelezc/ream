@@ -282,6 +282,52 @@ class PageText(QtWidgets.QGraphicsTextItem):
         event.ignore()
 
 
+class StockLayer(QtWidgets.QGraphicsItem):
+    """A paper photograph blended over the whole page - words, images and
+    all - with one of Qt's blend modes, as a paper texture on top in
+    Photoshop.  It sits above the strip and below the distress preview,
+    which renders the same blend itself.  It takes no clicks."""
+
+    MODES = {
+        "multiply": QtGui.QPainter.CompositionMode_Multiply,
+        "overlay": QtGui.QPainter.CompositionMode_Overlay,
+        "soft light": QtGui.QPainter.CompositionMode_SoftLight,
+        "screen": QtGui.QPainter.CompositionMode_Screen,
+        "normal": QtGui.QPainter.CompositionMode_SourceOver,
+    }
+
+    def __init__(self, sheet):
+        super().__init__(sheet)
+        self.sheet = sheet
+        self.image: QtGui.QImage | None = None
+        self.mode = "multiply"
+        self.amount = 1.0
+        self.setZValue(500)
+        self.setAcceptedMouseButtons(QtCore.Qt.NoButton)
+
+    def set(self, image: QtGui.QImage | None, mode: str, amount: float):
+        self.image, self.mode, self.amount = image, mode, amount
+        self.setVisible(image is not None)
+        self.update()
+
+    def boundingRect(self) -> QtCore.QRectF:
+        return self.sheet.rect()
+
+    def paint(self, painter, option, widget=None):
+        if self.image is not None:
+            draw_stock(painter, self.boundingRect(), self.image, self.mode, self.amount)
+
+
+def draw_stock(painter: QtGui.QPainter, rect: QtCore.QRectF, image: QtGui.QImage, mode: str,
+               amount: float):
+    painter.save()
+    painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
+    painter.setCompositionMode(StockLayer.MODES.get(mode, QtGui.QPainter.CompositionMode_Multiply))
+    painter.setOpacity(max(0.0, min(1.0, amount)))
+    painter.drawImage(rect, image)
+    painter.restore()
+
+
 class Sheet(QtWidgets.QGraphicsRectItem):
     """The one page on the canvas: paper, a clip, and the strip of pages."""
 
@@ -301,6 +347,8 @@ class Sheet(QtWidgets.QGraphicsRectItem):
         self.text.setZValue(0)
         self.offset = 0.0
         self.W, self.H = 595.0, 842.0
+        self.stock = StockLayer(self)
+        self.stock.setVisible(False)
 
     # -- geometry ------------------------------------------------------------
     def set_geometry(self, w: float, h: float, side: float, head: float):

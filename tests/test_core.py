@@ -787,6 +787,78 @@ def test_profiles():
     w2.close()
 
 
+def test_paper_blend_modes_and_scale():
+    import cv2
+    import pypdfium2
+    from ream import papers
+    folder = papers.folder()
+    folder.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(5)
+    noise = cv2.GaussianBlur(rng.normal(0, 1, (900, 1300)).astype(np.float32), (0, 0), 3)
+    photo = np.clip(185 + noise * 30, 0, 255).astype(np.uint8)
+    cv2.imwrite(str(folder / "blend_stock.png"), cv2.merge([photo - 6, photo, photo + 4]))
+    papers._photos.clear()
+    papers._surfaces.clear()
+    w = fresh()
+    type_paragraphs(w, 3)
+    w.set_texture("blend_stock.png")
+    w.set_grain(100)
+    flat = export.raster_page(w.sheet, 0, 60, distress.Settings(enabled=False), w.paper(), w.ink())
+    flat = export.to_numpy(flat)[..., :3].astype(float)
+    means = {}
+    for mode in ("multiply", "overlay", "soft light", "screen", "normal"):
+        w.set_blend(mode)
+        assert w.sheet.stock.isVisible() and w._surface is None, mode
+        page = export.raster_page(w.sheet, 0, 60, distress.Settings(enabled=False), w.paper(),
+                                  w.ink(), paper_stock=w.paper_stock())
+        means[mode] = export.to_numpy(page)[..., :3].astype(float)[400:, :].mean()
+        w.grab()                                        # draws with Qt's blend mode
+    paper_mean = flat[400:, :].mean()
+    assert means["multiply"] < paper_mean - 10          # the paper darkens a white page
+    assert means["normal"] < paper_mean - 30            # the photo as photographed
+    assert abs(means["overlay"] - paper_mean) < 8       # overlay barely moves white
+    assert means["screen"] >= paper_mean - 1
+    # tooth is the old behaviour: the stock painted as the page, no layer
+    w.set_blend("tooth")
+    assert not w.sheet.stock.isVisible() and w._surface is not None
+    # scale sizes the paper
+    w.set_blend("multiply")
+    a = papers.surface("blend_stock.png", w.sheet.W, w.sheet.H, 40, None, 100, "multiply")
+    w.dynamic("stock 250")[0].run()
+    assert w.fmt.stock_scale == 250
+    b = papers.surface("blend_stock.png", w.sheet.W, w.sheet.H, 40, None, 250, "multiply")
+    assert a.shape == b.shape and not np.allclose(a, b)
+    # exports: the distressed one blends over the page, the clean one keeps words
+    rough = w.export_pdf(path=os.path.join(TMP, "blend_rough.pdf"))
+    clean = w.export_pdf(clean=True, path=os.path.join(TMP, "blend_clean.pdf"))
+    assert "refusal to labour" in pypdfium2.PdfDocument(clean)[0].get_textpage().get_text_range()
+    for path in (rough, clean):
+        corner = pypdfium2.PdfDocument(path)[0].render(scale=1).to_numpy()[760:820, 20:120, :3]
+        assert corner.mean() < 250, path                 # blank paper is 255: the paper is in both
+    # profiles carry the blend and scale
+    w.save_profile("multiplied")
+    w.set_blend("tooth")
+    w.switch_profile("multiplied")
+    assert w.blend_mode() == "multiply" and w.fmt.stock_scale == 250
+    w.close()
+
+
+def test_palette_opens_centred():
+    w = fresh()
+    centre = w.view.mapToGlobal(w.view.viewport().rect().center())
+    for corner in (QtCore.QPoint(20, 20), QtCore.QPoint(900, 700)):
+        QtGui.QCursor.setPos(w.view.mapToGlobal(corner))
+        w.open_palette(w.view.mapToGlobal(corner))
+        pump(0.05)
+        middle = w.palette.geometry().center().x()
+        assert abs(middle - centre.x()) <= 2, (middle, centre.x())
+        top = w.palette.geometry().top()
+        w.palette.query.setText("zzzz-nothing")        # a short list keeps the same top
+        assert w.palette.geometry().top() == top
+        w.palette.hide()
+    w.close()
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in globals().items() if name.startswith("test_")]
     failed = 0

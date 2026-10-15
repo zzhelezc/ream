@@ -99,25 +99,48 @@ def rgb(colour: QtGui.QColor) -> tuple[int, int, int]:
     return colour.red(), colour.green(), colour.blue()
 
 
-def stock(sheet, dpi: float, box, paper: QtGui.QColor, texture: str, grain: float):
-    """The paper stock for a page (or `box` of it), or None for flat colour."""
-    if not texture or grain <= 0:
+class Stock:
+    """A paper stock as used for one render: which paper, how it blends,
+    how much, how big."""
+
+    def __init__(self, texture: str = "", grain: float = 0.0, blend: str = "tooth",
+                 scale: float = 100.0):
+        self.texture, self.grain, self.blend, self.scale = texture, grain, blend, scale
+
+    def __bool__(self):
+        return bool(self.texture) and self.grain > 0
+
+
+def stock(sheet, dpi: float, box, paper: QtGui.QColor, paper_stock: Stock | None):
+    """The paper to print on (tooth blend), or None for flat colour."""
+    if not paper_stock or paper_stock.blend != "tooth":
         return None
-    return papers.sheet(texture, sheet.W, sheet.H, dpi, box, rgb(paper), grain)
+    s = paper_stock
+    return papers.sheet(s.texture, sheet.W, sheet.H, dpi, box, rgb(paper), s.grain, s.scale)
+
+
+def over(sheet, dpi: float, box, paper_stock: Stock | None):
+    """(photo, mode, amount) to blend over the page, or None."""
+    if not paper_stock or paper_stock.blend == "tooth":
+        return None
+    s = paper_stock
+    layer = papers.surface(s.texture, sheet.W, sheet.H, dpi, box, s.scale, s.blend)
+    return None if layer is None else (layer, s.blend, s.grain)
 
 
 def raster_page(sheet, index: int, dpi: float, settings: distress.Settings,
                 paper: QtGui.QColor, ink: QtGui.QColor, density: float = 1.0,
-                texture: str = "", grain: float = 0.0) -> QtGui.QImage:
+                paper_stock: Stock | None = None) -> QtGui.QImage:
     """A finished page as an RGB image: ink, distressed when it is on, on paper."""
     layer = ink_layer(sheet, index, dpi, ink)
-    base = stock(sheet, dpi, None, paper, texture, grain)
-    return from_rgb(distress.compose(layer, rgb(paper), settings, dpi, density=density, base=base))
+    base = stock(sheet, dpi, None, paper, paper_stock)
+    return from_rgb(distress.compose(layer, rgb(paper), settings, dpi, density=density, base=base,
+                                     over=over(sheet, dpi, None, paper_stock)))
 
 
 def write_pdf(path: str, sheet, pages: list[int], *, dpi: float, settings: distress.Settings,
               paper: QtGui.QColor, ink: QtGui.QColor, title: str = "", density: float = 1.0,
-              texture: str = "", grain: float = 0.0,
+              paper_stock: Stock | None = None,
               progress: Callable[[int, int], None] | None = None):
     raster = settings.enabled
     writer = QtGui.QPdfWriter(path)
@@ -136,9 +159,16 @@ def write_pdf(path: str, sheet, pages: list[int], *, dpi: float, settings: distr
             writer.newPage()
         if raster:
             painter.drawImage(target, raster_page(sheet, index, dpi, settings, paper, ink, density,
-                                                  texture, grain))
+                                                  paper_stock))
         else:
-            base = stock(sheet, min(dpi, 300.0), None, paper, texture, grain)
+            # vector words stay words: a blended paper goes into the sheet
+            # under them (PDF via Qt has no blend modes); dark ink barely differs
+            base = stock(sheet, min(dpi, 300.0), None, paper, paper_stock)
+            blended = over(sheet, min(dpi, 300.0), None, paper_stock)
+            if blended is not None:
+                flat = np.empty(blended[0].shape, np.uint8)
+                flat[...] = rgb(paper)
+                base = papers.blend(flat, *blended)
             if base is not None:
                 painter.drawImage(target, from_rgb(base))   # the stock under vector words
             painter.save()
@@ -152,14 +182,14 @@ def write_pdf(path: str, sheet, pages: list[int], *, dpi: float, settings: distr
 
 def write_pngs(stem: str, sheet, pages: list[int], *, dpi: float, settings: distress.Settings,
                paper: QtGui.QColor, ink: QtGui.QColor, density: float = 1.0,
-               texture: str = "", grain: float = 0.0,
+               paper_stock: Stock | None = None,
                progress: Callable[[int, int], None] | None = None) -> list[str]:
     written = []
     for n, index in enumerate(pages):
         if progress:
             progress(n, len(pages))
         path = f"{stem}_{index + 1:02d}.png"
-        image = raster_page(sheet, index, dpi, settings, paper, ink, density, texture, grain)
+        image = raster_page(sheet, index, dpi, settings, paper, ink, density, paper_stock)
         image.setDotsPerMeterX(int(dpi / 0.0254))
         image.setDotsPerMeterY(int(dpi / 0.0254))
         image.save(path)

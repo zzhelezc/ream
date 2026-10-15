@@ -1,8 +1,9 @@
 """
 The command palette, and the only UI: Tab, type, Enter.
 
-It drops at the pointer as in TouchDesigner (and stik), so a command that adds
-something puts it where the palette was opened.  It is set as a slip of paper:
+It opens in the middle of the window, its top fixed so it never jumps as the
+list filters.  A command that adds something still puts it where the pointer
+was when Tab was pressed.  It is set as a slip of paper:
 a grey caption line, a query after a ✱, a dotted rule and the matches, the
 chosen one printed in solid ink.
 
@@ -181,7 +182,7 @@ class CommandPalette(QtWidgets.QFrame):
         self.setFixedWidth(WIDTH)
 
     # -- showing -----------------------------------------------------------
-    def popup(self, global_pos: QtCore.QPoint, text: str = ""):
+    def popup(self, global_pos: QtCore.QPoint, text: str = "", centred: bool = False):
         self.commands = self.provider()
         self.caption.setText(self.caption_text() if self.caption_text else "")
         self.query.blockSignals(True)
@@ -190,8 +191,15 @@ class CommandPalette(QtWidgets.QFrame):
         self._filter(text)
         screen = QtWidgets.QApplication.screenAt(global_pos) or QtWidgets.QApplication.primaryScreen()
         area = screen.availableGeometry()
-        x = global_pos.x() - 30
-        y = global_pos.y() - self.caption.sizeHint().height() - 18
+        if centred:
+            # centred on the point, the top fixed where the tallest list would
+            # start, so filtering never makes it jump
+            tallest = self.caption.sizeHint().height() + 50 + MAX_ROWS * 24 + 10
+            x = global_pos.x() - self.width() // 2
+            y = global_pos.y() - tallest // 2
+        else:
+            x = global_pos.x() - 30
+            y = global_pos.y() - self.caption.sizeHint().height() - 18
         x = max(area.left() + 4, min(area.right() - self.width() - 4, x))
         y = max(area.top() + 4, min(area.bottom() - self.height() - 4, y))
         self.move(x, y)

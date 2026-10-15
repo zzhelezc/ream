@@ -155,8 +155,9 @@ text width if it is wider.
 
 ## Command palette
 
-Press **Tab** anywhere (or right-click). The palette opens at the pointer as a
-slip of paper. Its grey caption gives the document, the page, the word count
+Press **Tab** anywhere (or right-click). The palette opens in the middle of
+the window as a slip of paper. Its top stays put while the list filters, and
+anything it adds (images, paste) still lands where the pointer was. Its grey caption gives the document, the page, the word count
 and the distress style. Type to filter, `Enter` runs the command, and `Esc`
 closes it. Matching is forgiving, and the commands you used last come first.
 
@@ -168,7 +169,8 @@ closes it. Matching is forgiving, and the commands you used last come first.
 | `size 10` | text size, pt |
 | `line 140` | line height, % |
 | `para 6` | space after each paragraph, pt |
-| `grain 40` | how strongly the paper stock shows, % |
+| `grain 40` | the paper stock's amount, % (tooth strength or blend opacity) |
+| `stock 200` | the paper stock's scale, % |
 | `ink 70`, `ink 130` | ink darkness, %: below 100 fades, above 100 strikes heavier |
 | `margin 72` | left and right margins, pt |
 | `head 80` | top and bottom margins, pt |
@@ -304,18 +306,34 @@ in the distress view, on the other pages and in both PDF exports.
 
 - **Choosing one:** **stock** in the page panel (‹ › or click for the list),
   or **paper stock · …** in the palette. **flat** turns it off.
-- **grain** (0–100%) sets how strongly it shows. Also `grain 40` in the
-  palette.
-- **Only the surface is used.** ream takes the photo's tooth, fibres and
-  grain, strips out its colour and uneven lighting, and lays that onto your
-  paper colour. The page stays your colour and evenly lit.
+- **blend** sets how the paper goes on (below), **amount** (0–100%) how
+  strongly, and **scale** (25–400%) how big. At 100% the paper is fitted to
+  cover the page; above, it is blown up; below, it repeats, mirrored at the
+  seams. In the palette: **stock blend · …**, `grain 40` for the amount,
+  `stock 200` for the scale.
+
+| Blend | What it does |
+| --- | --- |
+| **tooth** (default) | Only the paper's surface: its tooth and fibres, without its colour or uneven lighting, laid onto your paper colour. The page stays your colour and evenly lit. |
+| **multiply** | The actual paper photo over the whole page (ink, images, text blocks), levelled so its whites are white. Fibres and shadows darken; black ink stays black. |
+| **overlay** | The photo as a "grey to overlay" (centred on mid-grey, detail stretched). Textures mid-tones: faded ink, greys, images. It barely shows on white paper; that is how overlay works. |
+| **soft light** | A gentler overlay. |
+| **screen** | The photo levelled so its blacks are black, lightening the page; dark ink lifts. |
+| **normal** | The photo exactly as photographed, covering the page at the amount's opacity. It greys the ink below 100%. |
+
+For a white page with the real paper on it, start with **multiply**. To make
+faded ink take the paper, try **overlay** with `ink` below 100.
 - **Distressed ink sits in the tooth.** The stock's light and shade carry
   through the ink, most visibly when the ink is faded.
 - **Placement is fixed.** The texture is fitted to cover the page, turned to
   its orientation, and lands on the same spot at every resolution, so the
   preview and the export line up.
-- **Clean PDFs** keep vector text on top of the stock image (about 2 MB a page
-  at 300 dpi).
+- **On screen** the blend is Qt's own (the same formulas). The distress view,
+  distressed PDFs and PNGs blend in the same way, over everything on the page.
+- **Clean PDFs** keep vector text: Qt's PDF output has no blend modes, so the
+  paper is blended into the paper colour under the words, which go on top.
+  With dark ink that looks the same; faded ink and images are not textured
+  there. That's about 2 MB a page at 300 dpi.
 - **Saving:** the document stores the stock's file name. Elsewhere, without
   that file, it falls back to flat paper.
 
