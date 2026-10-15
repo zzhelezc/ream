@@ -1002,7 +1002,7 @@ class Ream(QtWidgets.QMainWindow):
             key = self._ghost_key(index)
             if ghost.distressed is not None and ghost.distressed[0] == key:
                 continue
-            layer = export.ink_layer(self.sheet, index, dpi, self.ink())
+            layer = export.page_layers(self.sheet, index, dpi, self.ink())
 
             def work(index=index, key=key, layer=layer):
                 try:
@@ -1160,8 +1160,11 @@ class Ream(QtWidgets.QMainWindow):
 
     # -- keys ----------------------------------------------------------------
     def key(self, event: QtGui.QKeyEvent) -> bool:
-        self._stale()
         key, mods = event.key(), event.modifiers()
+        if key in (QtCore.Qt.Key_Shift, QtCore.Qt.Key_Control, QtCore.Qt.Key_Alt,
+                   QtCore.Qt.Key_Meta, QtCore.Qt.Key_CapsLock, QtCore.Qt.Key_AltGr):
+            return True                     # a modifier alone is not typing: keep the selection
+        self._stale()
         if (mods & QtCore.Qt.ControlModifier and not mods & QtCore.Qt.ShiftModifier
                 and key in (QtCore.Qt.Key_Left, QtCore.Qt.Key_Right)):
             self.turn_page(1 if key == QtCore.Qt.Key_Right else -1)
@@ -1215,6 +1218,16 @@ class Ream(QtWidgets.QMainWindow):
                 self.push("things", before)
                 self.changed()
                 self.view.viewport().update()
+                return True
+            if mods & QtCore.Qt.ControlModifier and key in (
+                    QtCore.Qt.Key_BracketLeft, QtCore.Qt.Key_BracketRight,
+                    QtCore.Qt.Key_BraceLeft, QtCore.Qt.Key_BraceRight):
+                ahead = key in (QtCore.Qt.Key_BracketRight, QtCore.Qt.Key_BraceRight)
+                if mods & QtCore.Qt.ShiftModifier or key in (QtCore.Qt.Key_BraceLeft,
+                                                              QtCore.Qt.Key_BraceRight):
+                    self.restack("front" if ahead else "back")
+                else:
+                    self.restack("forward" if ahead else "backward")
                 return True
             if key in (QtCore.Qt.Key_BracketLeft, QtCore.Qt.Key_BracketRight):
                 step = 1.0 if mods & QtCore.Qt.ShiftModifier else 15.0
@@ -1510,22 +1523,62 @@ class Ream(QtWidgets.QMainWindow):
         self.changed()
         self.view.viewport().update()
 
+    def restack(self, how: str):
+        """Move the selection in the stacking order: "forward", "backward"
+        (one step, ⌘] / ⌘[), "front" or "back" (all the way, ⇧⌘] / ⇧⌘[).
+        On the page, the words are one step in that order, so an image can go
+        behind or over them."""
+        chosen = self.selection()
+        if not chosen:
+            return
+        before = self.snapshot()
+        note = ""
+        for pinned in (True, False):
+            group = [t for t in chosen if t.pinned == pinned]
+            if not group:
+                continue
+            if pinned:
+                peers = sorted(self.sheet.pinned(), key=lambda t: t.zValue())
+                order = [t for t in peers if t.zValue() < 0] + ["words"] + \
+                    [t for t in peers if t.zValue() >= 0]
+            else:
+                order = sorted((t for t in self.things.values() if t.alive and not t.pinned),
+                               key=lambda t: t.zValue())
+            mine = [e for e in order if any(e is t for t in group)]
+            rest = [e for e in order if not any(e is t for t in group)]
+            if how == "front":
+                order = rest + mine
+            elif how == "back":
+                order = mine + rest
+            else:
+                ahead = how == "forward"
+                indices = range(len(order) - 2, -1, -1) if ahead else range(1, len(order))
+                for i in indices:
+                    j = i + 1 if ahead else i - 1
+                    if any(order[i] is t for t in group) and not any(order[j] is t for t in group):
+                        order[i], order[j] = order[j], order[i]
+            if pinned:
+                words = order.index("words")
+                for i, entry in enumerate(order):
+                    if entry != "words":
+                        entry.setZValue(float(i - words))
+                below = sum(1 for t in group if t.zValue() < 0)
+                note = ("behind the words · Alt+click reaches it" if below == len(group)
+                        else "over the words" if below == 0 else "")
+            else:
+                for i, entry in enumerate(order):
+                    entry.setZValue(float(i + 1))
+        self.push("things", before)
+        self.changed()
+        self.view.viewport().update()
+        self.toast({"forward": "forward", "backward": "backward", "front": "to the front",
+                    "back": "to the back"}[how] + (f" · {note}" if note else ""))
+
     def to_front(self):
-        def act(thing):
-            peers = self.sheet.pinned() if thing.pinned else \
-                [t for t in self.things.values() if t.alive and not t.pinned]
-            thing.setZValue(max((t.zValue() for t in peers), default=0.0) + 1.0)
-        self._each_selected(act)
+        self.restack("front")
 
     def behind_text(self):
-        def act(thing):
-            if not thing.pinned:
-                return
-            thing.setZValue(min((t.zValue() for t in self.sheet.pinned()), default=0.0) - 1.0
-                            if thing.zValue() >= 0 else thing.zValue())
-            thing.setZValue(min(thing.zValue(), -1.0))
-        self._each_selected(act)
-        self.toast("behind the words: Alt+click to reach it")
+        self.restack("back")
 
     def unpin_selected(self):
         def act(thing):
@@ -1674,7 +1727,7 @@ class Ream(QtWidgets.QMainWindow):
                tuple(sorted(self.snapshot().items())), tuple(asdict(self.fmt).items()),
                tuple(t.text() for t in self.things.values() if isinstance(t, Note) and t.alive))
         if self._ink_cache is None or self._ink_cache[0] != key:
-            self._ink_cache = (key, export.ink_layer(self.sheet, self.page, dpi, self.ink(), box))
+            self._ink_cache = (key, export.page_layers(self.sheet, self.page, dpi, self.ink(), box))
         return self._ink_cache[1]
 
     def _preview_area(self) -> tuple[float, QtCore.QRectF | None]:
@@ -1850,6 +1903,15 @@ class Ream(QtWidgets.QMainWindow):
         if self.distress_panel is not None:
             self.distress_panel.refresh()
 
+    def set_distress_images(self, on: bool):
+        """Distress images as well as words, or leave them clean (words on
+        them are distressed either way)."""
+        self.distress.images = bool(on)
+        self.toast("images distressed" if on else "images clean · words still distressed")
+        if self.distress_panel is not None:
+            self.distress_panel.refresh()
+        self.distress_changed()
+
     def reset_distress(self):
         keep = self.distress.enabled
         self.distress = distress.Settings(enabled=keep)
@@ -2014,6 +2076,8 @@ class Ream(QtWidgets.QMainWindow):
                      lambda v: self.set_distress_view(v, quiet=True), on="distressed", off="clean")
         panel.toggle("export", lambda: d().enabled,
                      lambda v: (setattr(d(), "enabled", v), self.changed()),
+                     on="distressed", off="clean")
+        panel.toggle("images", lambda: d().images, self.set_distress_images,
                      on="distressed", off="clean")
         panel.slider("ink", 5, 150, lambda: self.fmt.ink, self.set_ink, unit="%", default=100)
         panel.choice("style", distress.edge_styles, lambda: d().style,
@@ -2402,6 +2466,9 @@ class Ream(QtWidgets.QMainWindow):
             C("distress panel", self.toggle_distress_panel, "⌘D", "sliders live preview dial"),
             C("page panel", self.toggle_page_panel, "⌘L",
               "sliders margins line spacing paragraph size background canvas colour paper"),
+            C("distress images off" if self.distress.images else "distress images on",
+              partial(self.set_distress_images, not self.distress.images),
+              "on" if self.distress.images else "off", "pictures pdf clean"),
             C("distress view off" if self.distress_view else "distress view",
               self.toggle_distress_view, "⇧⌘D", "see write live preview distressed page"),
             C("ink", None, f"{self.fmt.ink:g} %", "darkness ribbon fade tone", fill="ink "),
@@ -2476,8 +2543,12 @@ class Ream(QtWidgets.QMainWindow):
             ]
             out += [
                 C("delete selected", self.delete_selection, "⌫", "remove image"),
-                C("bring to front", self.to_front, "", "order raise"),
-                C("send behind text", self.behind_text, "", "order back"),
+                C("bring forward", partial(self.restack, "forward"), "⌘]", "order raise up"),
+                C("send backward", partial(self.restack, "backward"), "⌘[",
+                  "order lower down behind words"),
+                C("bring to front", partial(self.restack, "front"), "⇧⌘]", "order raise top"),
+                C("send to back", partial(self.restack, "back"), "⇧⌘[",
+                  "order lower bottom behind text words"),
                 C("unpin from page", self.unpin_selected, "", "detach canvas"),
                 C("fit to text width", self.fit_width, "", "size image"),
                 C("natural size", self.natural_size, "", "size image reset"),

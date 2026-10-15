@@ -38,6 +38,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+from typing import NamedTuple
 import threading
 import zlib
 from dataclasses import asdict, dataclass, fields
@@ -64,9 +65,20 @@ PARAMS = {
 }
 
 
+class Layer(NamedTuple):
+    """One thing on the page, rendered on its own: straight RGBA, placed at
+    (y, x) px in the canvas being composed.  `kind` is "text" (the words, a
+    text block) or "image"."""
+    rgba: np.ndarray
+    y: int
+    x: int
+    kind: str
+
+
 @dataclass
 class Settings:
     enabled: bool = True
+    images: bool = True                 # distress images too, not only words
     style: str = "rough"
     fade_style: str = "grain"
     scale: float = 100
@@ -387,26 +399,44 @@ def paper(shape: tuple[int, int], colour: tuple[int, int, int], s: Settings,
     return np.clip(sheet, 0, 255).astype(np.uint8)
 
 
-def compose(layer: np.ndarray, colour: tuple[int, int, int], s: Settings,
+def compose(layers, colour: tuple[int, int, int], s: Settings,
             dpi: float, origin: tuple[int, int] = (0, 0), density: float = 1.0,
             base: np.ndarray | None = None, over: tuple | None = None) -> np.ndarray:
-    """Distress a page's ink layer (straight RGBA) and lay it on paper:
-    (h, w, 3) uint8 RGB.  `origin` places a crop on the page; `base` is a
-    paper stock to print on instead of the flat colour (the tooth blend);
-    `over` is (photo, mode, amount), a paper blended over the finished page."""
-    ink = apply(layer, s, dpi, origin, density) if s.enabled else layer
-    sheet = paper(layer.shape[:2], colour, s, dpi, origin, base).astype(np.float32)
-    a = ink[..., 3:4].astype(np.float32) / 255.0
-    pigment = ink[..., :3].astype(np.float32)
+    """Lay a page's ink on paper: (h, w, 3) uint8 RGB.
+
+    `layers` is one straight-RGBA array (everything at once), or a list of
+    Layer - the words, each text block, each image - bottom to top, the first
+    covering the whole canvas.  Each is distressed on its own (images only
+    when `s.images`), so words on a picture wear like words anywhere else,
+    and they are then stacked in order.  `origin` places the canvas on the
+    page; `base` is a paper stock to print on (the tooth blend); `over` is
+    (photo, mode, amount), a paper blended over the finished page."""
+    if isinstance(layers, np.ndarray):
+        layers = [Layer(layers, 0, 0, "text")]
+    h, w = layers[0].rgba.shape[:2]
+    sheet = paper((h, w), colour, s, dpi, origin, base).astype(np.float32)
+    tone = None
     if base is not None:
         # ink sits in the paper's tooth: the stock's light and shade carry
         # through it (multiply), most visibly in faded or coloured ink
-        tone = base.astype(np.float32) / np.maximum(np.array(colour, np.float32), 1.0)
-        pigment = pigment * np.clip(tone, 0.0, 1.3)
-    out = sheet * (1.0 - a) + pigment * a
-    page = np.clip(out + 0.5, 0, 255).astype(np.uint8)
+        tone = np.clip(base.astype(np.float32) / np.maximum(np.array(colour, np.float32), 1.0),
+                       0.0, 1.3)
+    for layer in layers:
+        rgba = layer.rgba
+        lh, lw = rgba.shape[:2]
+        if lh == 0 or lw == 0 or rgba[..., 3].max() == 0:
+            continue
+        if s.enabled and (layer.kind == "text" or s.images):
+            rgba = apply(rgba, s, dpi, (origin[0] + layer.y, origin[1] + layer.x), density)
+        a = rgba[..., 3:4].astype(np.float32) / 255.0
+        pigment = rgba[..., :3].astype(np.float32)
+        region = (slice(layer.y, layer.y + lh), slice(layer.x, layer.x + lw))
+        if tone is not None:
+            pigment = pigment * tone[region]
+        sheet[region] = sheet[region] * (1.0 - a) + pigment * a
+    page = np.clip(sheet + 0.5, 0, 255).astype(np.uint8)
     if over is not None:
         from . import papers
-        layer, mode, amount = over
-        page = papers.blend(page, layer, mode, amount)
+        layer_photo, mode, amount = over
+        page = papers.blend(page, layer_photo, mode, amount)
     return page

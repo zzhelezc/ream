@@ -859,6 +859,75 @@ def test_palette_opens_centred():
     w.close()
 
 
+def test_words_on_images_are_distressed_and_stacking():
+    w = fresh()
+    type_paragraphs(w, 4)
+    w.flip(0)
+    pump()
+    page = w.sheet.scene_page_rect()
+    grey = os.path.join(TMP, "grey.png")
+    image = QtGui.QImage(500, 300, QtGui.QImage.Format_RGB32)
+    image.fill(QtGui.QColor("#c8c8c8"))
+    image.save(grey)
+    # an opaque picture right under the first lines of words
+    w.add_files([grey], page.topLeft() + QtCore.QPointF(page.width() / 2, 110))
+    (thing,) = [t for t in w.things.values() if t.alive]
+    w.select([thing])
+    w.restack("back")
+    assert thing.zValue() < 0
+    dpi = 150
+    clean = export.raster_page(w.sheet, 0, dpi, distress.Settings(enabled=False), w.paper(), w.ink())
+    rough = export.raster_page(w.sheet, 0, dpi, distress.Settings(), w.paper(), w.ink())
+    clean, rough = (export.to_numpy(i)[..., :3].astype(int) for i in (clean, rough))
+    r = thing.parent_rect()
+    k = dpi / 72.0
+    y0, y1 = int(r.top() * k) + 6, int(r.bottom() * k) - 6
+    x0, x1 = int(r.left() * k) + 6, int(r.right() * k) - 6
+    inside_clean, inside_rough = clean[y0:y1, x0:x1], rough[y0:y1, x0:x1]
+    ink = inside_clean.mean(axis=2) < 80                     # the words on the picture
+    assert ink.sum() > 200
+    changed = (np.abs(inside_rough - inside_clean).max(axis=2) > 60)[ink].mean()
+    assert changed > 0.08, f"words on the picture should be distressed ({changed:.3f})"
+    # with images clean, the picture away from the words is untouched
+    no_images = distress.Settings(images=False)
+    plain = export.to_numpy(export.raster_page(w.sheet, 0, dpi, no_images, w.paper(),
+                                               w.ink()))[..., :3].astype(int)
+    picture = ~ink & (inside_clean.mean(axis=2) > 150)
+    near = cv2_dilate(ink)
+    calm = picture & ~near
+    assert np.abs(plain[y0:y1, x0:x1] - inside_clean)[calm].max() <= 2
+    assert np.abs(inside_rough - inside_clean)[calm].max() > 30   # distressed when on
+    # and the words on it are still distressed
+    assert (np.abs(plain[y0:y1, x0:x1] - inside_clean).max(axis=2) > 60)[ink].mean() > 0.08
+    # stacking: Cmd+] brings it over the words, Cmd+[ back, Shift for all the way
+    w.select([thing])
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_BracketRight, QtCore.Qt.ControlModifier)
+    assert thing.zValue() > 0
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_BracketLeft, QtCore.Qt.ControlModifier)
+    assert thing.zValue() < 0
+    second = os.path.join(TMP, "second.png")
+    make_png(second, "#36c")
+    w.add_files([second], thing.sceneBoundingRect().center())
+    other = [t for t in w.things.values() if t.alive and t is not thing][0]
+    assert other.zValue() > 0
+    w.select([thing])
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_BracketRight,
+                          QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier)
+    assert thing.zValue() > other.zValue() > 0
+    w.select([thing])
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_BracketLeft,
+                          QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier)
+    assert thing.zValue() < 0 < other.zValue()
+    w.undo()
+    assert thing.zValue() > other.zValue()
+    w.close()
+
+
+def cv2_dilate(mask: np.ndarray, px: int = 4) -> np.ndarray:
+    import cv2
+    return cv2.dilate(mask.astype(np.uint8), np.ones((2 * px + 1, 2 * px + 1), np.uint8)) > 0
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in globals().items() if name.startswith("test_")]
     failed = 0

@@ -149,8 +149,11 @@ text width if it is wider.
   `rotate 30` sets an angle, and **straighten** puts it level. Images export
   turned. `⌫` deletes, `⌘C` copies the image, `Esc` goes back to
   writing.
-- **Images behind the words:** **send behind text** puts a pinned image
-  behind the words, so they print over it. `Alt`+click reaches it there.
+- **Stacking order:** `⌘]` brings the selection forward a step, `⌘[` sends it
+  back a step, and `⇧⌘]` / `⇧⌘[` take it to the front or back. On the page,
+  the words are one step in that order, so an image can go behind them (the
+  words print over it) or over them. An image behind the words is reached
+  with `Alt`+click.
 - **Undo** (`⌘Z` / `⇧⌘Z`) is one history for words and images together.
 
 ## Command palette
@@ -188,12 +191,12 @@ the number.
 | --- | --- |
 | Panels | distress panel (`⌘D`), page panel (`⌘L`) |
 | Export | export pdf (`⌘E`), export pdf · clean (`⇧⌘E`), export png pages |
-| Distress | distress view (`⇧⌘D`), distress on/off, style · …, fade texture · …, reset distress |
+| Distress | distress view (`⇧⌘D`), distress on/off, distress images on/off, style · …, fade texture · …, reset distress |
 | Page and type | page size · a4 / letter / a5 / square, paper · white / cream / newsprint / bond, paper colour…, canvas colour…, font · … |
 | Pages | new page, next page (`⌘→`), previous page (`⌘←`), go to page |
 | Views | one page (`⌘1`), spread (`⌘2`), all pages (`⌘3`), fit page (`⌘0`) |
 | Look | theme · paper / white / night |
-| Selection (images and text blocks) | rotate 90° right / left, rotate, straighten, delete, bring to front, send behind text, unpin from page, fit to text width, natural size |
+| Selection (images and text blocks) | rotate 90° right / left, rotate, straighten, delete, bring forward (`⌘]`), send backward (`⌘[`), bring to front (`⇧⌘]`), send to back (`⇧⌘[`), unpin from page, fit to text width, natural size |
 | Profiles | save profile (`⌥⌘S`), save profile as…, new profile, profile · name (`⌥⌘1`–`9`), delete profile · name |
 | File | new document (`⌘N`), open… (`⇧⌘O`), save (`⌘S`), save as… (`⇧⌘S`), show drafts, word count, quit |
 
@@ -382,8 +385,17 @@ ream adds two controls of its own:
 | misfire | 0–100 | 0 | the type wobbles off its line, like a bad platen |
 | paper | 0–100 | 0 | the sheet itself picks up the fade texture and warms |
 
-**How it works.** Each page is rendered as an ink layer (the words and the
-pinned images) at the export dpi. The layer's alpha becomes a signed distance
+**Layers.** The words, each text block and each image are distressed
+separately, then stacked in their order. Words on top of a picture wear just
+like words anywhere else.
+
+- **images** (distress panel, or **distress images on/off** in the palette)
+  chooses whether pictures are distressed too (worn edges, specks, fade) or
+  left clean.
+- Words are always distressed, on top of a picture or not.
+
+**How it works.** Each page is rendered as layers (the words, each text block,
+each pinned image) at the export dpi. The layer's alpha becomes a signed distance
 field: positive inside the ink, negative outside. The edge texture moves the
 boundary in where it is light and out where it is dark, so edges go ragged
 rather than just thin. Bleed shifts the boundary, blur melts it, and it is cut

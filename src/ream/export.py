@@ -80,6 +80,83 @@ def ink_layer(sheet, index: int, dpi: float, ink: QtGui.QColor,
     return to_numpy(image)
 
 
+def _draw_thing(painter: QtGui.QPainter, thing, ink: QtGui.QColor):
+    painter.save()
+    placed, _ok = thing.itemTransform(thing.parentItem())
+    painter.setTransform(placed, True)
+    thing.render(painter, ink)
+    painter.restore()
+
+
+def ink_layers(sheet, index: int, dpi: float, ink: QtGui.QColor,
+               box: tuple[int, int, int, int] | None = None) -> list[distress.Layer]:
+    """Page `index` (or its `box`) as separate layers, bottom to top: things
+    behind the words, the words, things in front.  The words cover the whole
+    canvas; each image or text block is cropped to where it is, with a
+    little room for its distressed edge to spread."""
+    scale = dpi / 72.0
+    x0, y0, width, height = box or crop_box(sheet, dpi, None)
+    page = QtCore.QRectF(0.0, index * sheet.H, sheet.W, sheet.H)
+    pad = int(8 * dpi / 300.0) + 2
+
+    def render(cx: int, cy: int, cw: int, ch: int, draw) -> np.ndarray:
+        image = QtGui.QImage(cw, ch, QtGui.QImage.Format_ARGB32_Premultiplied)
+        image.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(image)
+        painter.setRenderHints(QtGui.QPainter.Antialiasing | QtGui.QPainter.SmoothPixmapTransform
+                               | QtGui.QPainter.TextAntialiasing)
+        painter.translate(-(x0 + cx), -(y0 + cy))
+        painter.scale(scale, scale)
+        painter.translate(0.0, -index * sheet.H)
+        painter.setClipRect(page)
+        draw(painter)
+        painter.end()
+        return to_numpy(image)
+
+    def words(painter):
+        context = QtGui.QAbstractTextDocumentLayout.PaintContext()
+        context.clip = page
+        context.cursorPosition = -1
+        context.palette.setColor(QtGui.QPalette.Text, ink)
+        sheet.doc.documentLayout().draw(painter, context)
+
+    def thing_layer(thing):
+        area = thing.parent_rect().intersected(page)
+        if area.isEmpty():
+            return None
+        left = int(area.left() * scale) - x0 - pad
+        top = int((area.top() - index * sheet.H) * scale) - y0 - pad
+        right = int(np.ceil(area.right() * scale)) - x0 + pad
+        bottom = int(np.ceil((area.bottom() - index * sheet.H) * scale)) - y0 + pad
+        left, top = max(0, left), max(0, top)
+        right, bottom = min(width, right), min(height, bottom)
+        if right <= left or bottom <= top:
+            return None
+        rgba = render(left, top, right - left, bottom - top,
+                      lambda painter, t=thing: _draw_thing(painter, t, ink))
+        kind = "image" if getattr(thing, "kind", "image") == "image" else "text"
+        return distress.Layer(rgba, top, left, kind)
+
+    things = sorted(sheet.pinned(), key=lambda t: t.zValue())
+    below = [thing_layer(t) for t in things if t.zValue() < 0]
+    above = [thing_layer(t) for t in things if t.zValue() >= 0]
+    text = distress.Layer(render(0, 0, width, height, words), 0, 0, "text")
+    # the words always come first in the list (they set the canvas size), so
+    # anything behind them goes on in a separate pass below
+    return [layer for layer in below if layer is not None], text, \
+        [layer for layer in above if layer is not None]
+
+
+def page_layers(sheet, index: int, dpi: float, ink: QtGui.QColor,
+                box: tuple[int, int, int, int] | None = None) -> list[distress.Layer]:
+    """ink_layers in stacking order, with a transparent full-canvas layer
+    first so the canvas size is known even when things lie behind the words."""
+    below, text, above = ink_layers(sheet, index, dpi, ink, box)
+    h, w = text.rgba.shape[:2]
+    canvas = distress.Layer(np.zeros((h, w, 4), np.uint8), 0, 0, "text")
+    return [canvas] + below + [text] + above
+
+
 def to_numpy(image: QtGui.QImage) -> np.ndarray:
     image = image.convertToFormat(QtGui.QImage.Format_RGBA8888)
     w, h = image.width(), image.height()
@@ -132,7 +209,7 @@ def raster_page(sheet, index: int, dpi: float, settings: distress.Settings,
                 paper: QtGui.QColor, ink: QtGui.QColor, density: float = 1.0,
                 paper_stock: Stock | None = None) -> QtGui.QImage:
     """A finished page as an RGB image: ink, distressed when it is on, on paper."""
-    layer = ink_layer(sheet, index, dpi, ink)
+    layer = page_layers(sheet, index, dpi, ink)
     base = stock(sheet, dpi, None, paper, paper_stock)
     return from_rgb(distress.compose(layer, rgb(paper), settings, dpi, density=density, base=base,
                                      over=over(sheet, dpi, None, paper_stock)))
