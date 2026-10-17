@@ -117,6 +117,8 @@ class NoteText(QtWidgets.QGraphicsTextItem):
     def keyPressEvent(self, event):
         super().keyPressEvent(event)
         self.note.fit()
+        if self.controller.write_mode:
+            self.controller._write_follow()
         self.controller.view.viewport().update()
 
     def inputMethodEvent(self, event):

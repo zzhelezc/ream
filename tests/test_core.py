@@ -928,6 +928,61 @@ def cv2_dilate(mask: np.ndarray, px: int = 4) -> np.ndarray:
     return cv2.dilate(mask.astype(np.uint8), np.ones((2 * px + 1, 2 * px + 1), np.uint8)) > 0
 
 
+def test_write_mode():
+    w = fresh()
+    w.prefs.pop("write_zoom", None)
+    type_paragraphs(w, 1)
+    w.fit_page()
+    pump(0.05)
+    before_zoom = w.view.zoom()
+    before_centre = w.view.mapToScene(w.view.viewport().rect().center())
+    w.focus_text()
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_F, QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier)
+    pump(0.05)
+    assert w.write_mode and abs(w.view.zoom() - 1.75) < 1e-6
+
+    def band() -> float:
+        seen = w.view.visible_scene_rect()
+        return (w._caret_scene().y() - seen.top()) / seen.height()
+
+    def centred() -> bool:
+        centre = w.view.mapToScene(w.view.viewport().rect().center())
+        return abs(centre.x() - w.sheet.scene_page_rect().center().x()) < 1.0
+
+    assert centred() and abs(band() - 0.42) < 0.02
+    # write a few pages: the line stays in the band, the view scrolls down,
+    # the page stays centred
+    start = w.view.mapToScene(w.view.viewport().rect().center()).y()
+    for n in range(40):
+        QtTest.QTest.keyClicks(w.view, f"{n:02d} words on the page and then some more of them")
+        QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Return)
+        pump(0.01)
+        pump(0.25)
+        assert 0.1 <= band() <= 0.7, (n, band())
+    assert w.page >= 1, "the writing ran onto another page"
+    assert centred()
+    # within a page the view moved down to follow
+    w.flip(0)
+    pump()
+    # Cmd+= adjusts the writing zoom and it is remembered
+    zoom = w.view.zoom()
+    w.zoom_step(1.25)
+    assert abs(w.view.zoom() - zoom * 1.25) < 1e-6 and abs(w.write_zoom() - zoom * 1.25) < 1e-3
+    w.dynamic("write 200")[0].run()
+    assert abs(w.view.zoom() - 2.0) < 1e-6 and w.prefs["write_zoom"] == 2.0
+    # Esc leaves and the old view comes back
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Escape)
+    assert not w.write_mode
+    assert abs(w.view.zoom() - before_zoom) < 1e-6
+    back = w.view.mapToScene(w.view.viewport().rect().center())
+    assert (back - before_centre).manhattanLength() < 2.0
+    # next time it opens at the zoom you set
+    w.toggle_write_mode()
+    assert abs(w.view.zoom() - 2.0) < 1e-6
+    w.toggle_write_mode()
+    w.close()
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in globals().items() if name.startswith("test_")]
     failed = 0

@@ -48,6 +48,8 @@ REVEAL_PX = 40          # room kept around the page when the view follows it
 GRID_GAP_X, GRID_GAP_Y = 0.06, 0.11     # all-pages view: gaps as a share of the page
 LAYOUTS = ("single", "spread", "all")
 PREVIEW_DPI = 150
+WRITE_ZOOM = 1.75        # write mode's zoom until you set your own
+WRITE_LOW, WRITE_HIGH, WRITE_LINE = 0.15, 0.62, 0.42   # write mode's band, and where the line returns to
 PREVIEW_MAX_DPI = 600
 STOCK_SCREEN_DPI = 200   # the paper stock as drawn on the canvas
 CANVAS_SWATCHES = ["#e8e7e3", "#ffffff", "#d9d6cc", "#b9b7b0", "#535353", "#2a2a2a", "#161616", "#c8d3cf"]
@@ -139,6 +141,12 @@ class Ream(QtWidgets.QMainWindow):
         self.distress_panel: Panel | None = None
         self.page_panel: Panel | None = None
         self.editing: Note | None = None            # the free text being written
+        self.write_mode = False
+        self._before_write: tuple | None = None
+        self._follow_anim = QtCore.QVariantAnimation(self)
+        self._follow_anim.setDuration(180)
+        self._follow_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        self._follow_anim.valueChanged.connect(self._follow_step)
         self.layout = self.prefs.get("layout", "single")    # single / spread / all
         if self.layout not in LAYOUTS:
             self.layout = "single"
@@ -495,6 +503,10 @@ class Ream(QtWidgets.QMainWindow):
                 if index == self.page:
                     label += " ·"
                 painter.drawText(QtCore.QPointF(box.left(), box.bottom() + 18), label)
+        if self.write_mode:
+            tag = f"write · {self.view.zoom() * 100:.0f}%"
+            area = QtCore.QRectF(self.view.viewport().rect()).adjusted(18, 0, -18, -16)
+            painter.drawText(area, QtCore.Qt.AlignRight | QtCore.Qt.AlignBottom, tag)
         if self.preview is not None:
             tag = f"distress · {self.distress.style}"
             width = QtGui.QFontMetrics(painter.font()).horizontalAdvance(tag)
@@ -1116,7 +1128,114 @@ class Ream(QtWidgets.QMainWindow):
         if page != self.page:
             self.flip(page)
         if follow:
-            self.keep_caret_in_view()
+            if self.write_mode:
+                self._write_follow()
+            else:
+                self.keep_caret_in_view()
+        self.view.viewport().update()
+
+    # -- write mode ----------------------------------------------------------
+    def write_zoom(self) -> float:
+        return float(self.prefs.get("write_zoom", WRITE_ZOOM))
+
+    def toggle_write_mode(self):
+        if self.write_mode:
+            self.leave_write_mode()
+        else:
+            self.enter_write_mode()
+
+    def enter_write_mode(self):
+        """Zoom to the writing zoom, centre the page, put the caret's line a
+        little above the middle; from then on the view follows the writing."""
+        if self.write_mode:
+            return
+        # the exact view, scroll positions and all, so leaving puts it back to the pixel
+        self._before_write = (QtGui.QTransform(self.view.transform()),
+                              self.view.horizontalScrollBar().value(),
+                              self.view.verticalScrollBar().value())
+        self.write_mode = True
+        self.view.set_zoom(self.write_zoom())
+        self._write_follow(force=True, animate=False)
+        if self.editing is None:
+            self.focus_text()
+        self.toast(f"write mode · {self.write_zoom() * 100:.0f}% · ⇧⌘F or Esc to leave")
+
+    def leave_write_mode(self):
+        if not self.write_mode:
+            return
+        self.write_mode = False
+        self._follow_anim.stop()
+        if self._before_write is not None:
+            transform, h, v = self._before_write
+            self.view.setTransform(transform)
+            self.view.horizontalScrollBar().setValue(h)
+            self.view.verticalScrollBar().setValue(v)
+            self.view_changed()
+        self.toast("write mode off")
+        self.view.viewport().update()
+
+    def set_write_zoom(self, zoom: float):
+        """The writing zoom, as a factor (1.75 is 175%); remembered."""
+        zoom = max(0.5, min(6.0, zoom))
+        self.prefs["write_zoom"] = round(zoom, 3)
+        self._write_prefs()
+        if self.write_mode:
+            self.view.set_zoom(zoom)
+            self._write_follow(force=True, animate=False)
+        self.toast(f"write zoom {zoom * 100:.0f}%")
+
+    def zoom_step(self, factor: float):
+        """⌘= / ⌘-: in write mode these set the writing zoom."""
+        if self.write_mode:
+            self.set_write_zoom(self.view.zoom() * factor)
+        else:
+            self.view.zoom_by(factor)
+
+    def _caret_scene(self) -> QtCore.QPointF:
+        """The middle of the caret's line, in scene coordinates."""
+        if self.editing is not None:
+            editor = self.editing.editor
+            cursor = editor.textCursor()
+            block = cursor.block()
+            layout = editor.document().documentLayout()
+            origin = layout.blockBoundingRect(block).topLeft()
+            lines = block.layout()
+            y = origin.y()
+            if lines is not None and lines.lineCount():
+                line = lines.lineForTextPosition(cursor.positionInBlock())
+                if line.isValid():
+                    y += line.y() + line.height() / 2
+            return editor.mapToScene(QtCore.QPointF(origin.x(), y))
+        top, bottom = self.sheet.caret_span()
+        page = self.sheet.scene_page_rect()
+        return QtCore.QPointF(page.center().x(),
+                              page.top() + (top + bottom) / 2 - self.page * self.sheet.H)
+
+    def _write_follow(self, force: bool = False, animate: bool = True):
+        """Keep the page centred across, and the line being written inside
+        the band: past it, glide so the line sits a little above the middle."""
+        seen = self.view.visible_scene_rect()
+        caret = self._caret_scene()
+        page = self.sheet.scene_page_rect()
+        centre = self.view.mapToScene(self.view.viewport().rect().center())
+        target = QtCore.QPointF(page.center().x(), centre.y())
+        where = (caret.y() - seen.top()) / max(1e-6, seen.height())
+        if force or where > WRITE_HIGH or where < WRITE_LOW:
+            target.setY(caret.y() + (0.5 - WRITE_LINE) * seen.height())
+        if (target - centre).manhattanLength() < 0.5:
+            return
+        self._follow_anim.stop()
+        if not animate:
+            self.view.centerOn(target)
+            self.view_changed()
+            return
+        self._follow_anim.setStartValue(QtCore.QPointF(centre))
+        self._follow_anim.setEndValue(target)
+        self._follow_anim.start()
+
+    def _follow_step(self, point):
+        self.view.centerOn(point)
+        self.view_changed()
         self.view.viewport().update()
 
     def keep_caret_in_view(self):
@@ -1241,6 +1360,8 @@ class Ream(QtWidgets.QMainWindow):
                 return True                 # no word to apply it to
             self.clear_selection()          # typing goes back to the words
         if key == QtCore.Qt.Key_Escape:
+            if self.write_mode:
+                self.leave_write_mode()
             return True
         self.focus_text()
         return False
@@ -1809,10 +1930,18 @@ class Ream(QtWidgets.QMainWindow):
         out, dpi, box = payload
         self._set_preview_image(export.from_rgb(out), dpi, box)
 
+    def _write_zoom_moved(self):
+        if self.write_mode and abs(self.view.zoom() - self.write_zoom()) > 1e-3 \
+                and self._follow_anim.state() != QtCore.QAbstractAnimation.Running:
+            self.prefs["write_zoom"] = round(self.view.zoom(), 3)
+            self._write_prefs()
+
     def view_changed(self):
         """Zoomed or panned: sharpen and re-crop the live view once it rests."""
         if getattr(self, "distress_view", False):
             self._view_timer.start()
+        if getattr(self, "write_mode", False):
+            self._write_zoom_moved()
 
     def hide_preview(self):
         self._preview_gen += 1
@@ -2130,6 +2259,10 @@ class Ream(QtWidgets.QMainWindow):
         panel.slider("amount", 0, 100, lambda: f().grain, self.set_grain, unit="%", default=60)
         panel.slider("scale", 25, 400, lambda: f().stock_scale, self.set_stock_scale, step=5,
                      unit="%", default=100)
+        panel.section("write mode")
+        panel.slider("zoom", 50, 400, lambda: self.write_zoom() * 100,
+                     lambda v: self.set_write_zoom(v / 100.0), step=5, unit="%",
+                     default=WRITE_ZOOM * 100)
         panel.section("canvas")
         panel.swatches("colour", CANVAS_SWATCHES, self.canvas_colour, self.set_canvas)
         panel.choice("edge", lambda: list(style.THEMES), lambda: self.theme, self._set_edge_theme)
@@ -2524,6 +2657,10 @@ class Ream(QtWidgets.QMainWindow):
         out += [C(f"theme · {name}", partial(self._set_theme, name),
                   dot if name == self.theme else "", "canvas colour") for name in style.THEMES]
         out += [
+            C("write mode off" if self.write_mode else "write mode", self.toggle_write_mode, "⇧⌘F",
+              "focus typewriter zoom centre scroll follow writing"),
+            C("write zoom", None, f"{self.write_zoom() * 100:.0f} %", "write mode zoom size",
+              fill="write "),
             C("fit page", self.fit_layout, "⌘0", "zoom view spread all"),
             C("actual size", self.actual_size, "", "zoom 100"),
             C("one page", partial(self.set_layout, "single"), "⌘1", "single view layout"),
@@ -2600,6 +2737,9 @@ class Ream(QtWidgets.QMainWindow):
             return []
         word, value = match.group(1).strip(), float(match.group(2))
         out = []
+        if "write".startswith(word) and len(word) >= 2:
+            out.append(Command(f"write zoom → {value:g}%", partial(self.set_write_zoom, value / 100.0),
+                               f"now {self.write_zoom() * 100:.0f}%", key="set:write"))
         names = list(distress.PARAMS) + list(FORMAT_PARAMS) + ["page"]
         if self.selection():
             names.append("rotate")
@@ -2656,8 +2796,9 @@ class Ream(QtWidgets.QMainWindow):
             ("Ctrl+2", partial(self.set_layout, "spread")),
             ("Ctrl+3", partial(self.set_layout, "all")),
             ("Ctrl+Return", self.new_page),
-            ("Ctrl+=", lambda: self.view.zoom_by(1.25)), ("Ctrl++", lambda: self.view.zoom_by(1.25)),
-            ("Ctrl+-", lambda: self.view.zoom_by(0.8)), ("Ctrl+Q", self.close),
+            ("Ctrl+=", partial(self.zoom_step, 1.25)), ("Ctrl++", partial(self.zoom_step, 1.25)),
+            ("Ctrl+-", partial(self.zoom_step, 0.8)), ("Ctrl+Q", self.close),
+            ("Ctrl+Shift+F", self.toggle_write_mode),
         ]
         for keys, slot in bindings:
             action = QtWidgets.QAction(self)
@@ -2673,6 +2814,8 @@ class Ream(QtWidgets.QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if getattr(self, "write_mode", False):
+            QtCore.QTimer.singleShot(0, lambda: self._write_follow(force=True, animate=False))
         for panel in (self.distress_panel, self.page_panel):
             if panel is not None and panel.isVisible():
                 panel.keep_inside()

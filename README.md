@@ -84,6 +84,28 @@ page's own words or anything else.
 Blocks always take the document's face, size, line height and paragraph
 spacing, and change with them.
 
+### Write mode
+
+`⇧⌘F` (or **write mode** in the palette) is for writing. It:
+
+- zooms to your writing zoom (175% to start with);
+- centres the page across the window;
+- puts the line you're on a little above the middle.
+
+As you write, the view follows the way a word processor's does: nothing moves
+while the line stays in the middle band of the window. When it drops below
+about 60%, the page glides up so the line is back just above the middle,
+across page turns too. The same goes for a ⌘-click text block being written.
+
+- **Writing zoom:** in write mode, `⌘=` / `⌘-` or a pinch set it, and it is
+  remembered for next time. Also **zoom** under *write mode* in the page panel
+  (`⌘L`), or `write 200` in the palette.
+- **Scrolling** around works as usual; the next line you type brings the view
+  back.
+- **Leaving:** `⇧⌘F` again or `Esc` leaves and puts back the view you had, to
+  the pixel. A small `write · 175%` sits in the bottom-right corner while
+  you're in it.
+
 ### Spread and all pages
 
 | Key | View |
@@ -172,6 +194,7 @@ closes it. Matching is forgiving, and the commands you used last come first.
 | `size 10` | text size, pt |
 | `line 140` | line height, % |
 | `para 6` | space after each paragraph, pt |
+| `write 200` | write mode's zoom, % |
 | `grain 40` | the paper stock's amount, % (tooth strength or blend opacity) |
 | `stock 200` | the paper stock's scale, % |
 | `ink 70`, `ink 130` | ink darkness, %: below 100 fades, above 100 strikes heavier |
@@ -194,7 +217,7 @@ the number.
 | Distress | distress view (`⇧⌘D`), distress on/off, distress images on/off, style · …, fade texture · …, reset distress |
 | Page and type | page size · a4 / letter / a5 / square, paper · white / cream / newsprint / bond, paper colour…, canvas colour…, font · … |
 | Pages | new page, next page (`⌘→`), previous page (`⌘←`), go to page |
-| Views | one page (`⌘1`), spread (`⌘2`), all pages (`⌘3`), fit page (`⌘0`) |
+| Views | write mode (`⇧⌘F`), write zoom, one page (`⌘1`), spread (`⌘2`), all pages (`⌘3`), fit page (`⌘0`) |
 | Look | theme · paper / white / night |
 | Selection (images and text blocks) | rotate 90° right / left, rotate, straighten, delete, bring forward (`⌘]`), send backward (`⌘[`), bring to front (`⇧⌘]`), send to back (`⇧⌘[`), unpin from page, fit to text width, natural size |
 | Profiles | save profile (`⌥⌘S`), save profile as…, new profile, profile · name (`⌥⌘1`–`9`), delete profile · name |
