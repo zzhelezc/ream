@@ -26,6 +26,7 @@ A plugin is a Python module with a `Plugin` class:
 | place_image(...) | put an image on the canvas (as if dropped there) |
 | place_text(...)  | start a text block with some words in it |
 | timer(ms, fn)    | a repeating QTimer, stopped at teardown |
+| use(tool)        | make a Tool (below) the canvas tool; None: back to writing |
 | visible_rect()   | the part of the canvas in sight, in scene coordinates |
 | settings         | this plugin's own dict, saved between runs |
 | toast(text)      | the grey line at the bottom of the window |
@@ -74,6 +75,37 @@ class Plugin:
 
     def teardown(self):
         pass
+
+
+class Tool:
+    """A canvas tool: while it is active (host.use(tool)), presses and drags
+    on the canvas come to it instead of selecting, keys come to it first,
+    and it draws over the canvas in screen space.  Esc leaves it.  Override
+    what you need; every handler gets scene coordinates."""
+
+    name = "tool"
+    cursor = QtCore.Qt.CrossCursor
+
+    def press(self, at: QtCore.QPointF, mods) -> bool:
+        return False                            # True: this drag is mine
+
+    def move(self, at: QtCore.QPointF, mods):
+        pass
+
+    def release(self, at: QtCore.QPointF, mods):
+        pass
+
+    def hover(self, at: QtCore.QPointF):
+        pass
+
+    def key(self, event: QtGui.QKeyEvent) -> bool:
+        return False                            # True: handled
+
+    def paint(self, painter: QtGui.QPainter, transform: QtGui.QTransform):
+        pass                                    # screen pixels: map scene points with transform
+
+    def leave(self):
+        pass                                    # another tool took over, or Esc
 
 
 class Frame(QtWidgets.QGraphicsItem):
@@ -247,6 +279,14 @@ class Host:
         frame.hide()
         self.frames.append(frame)
         return frame
+
+    def use(self, tool: "Tool | None"):
+        """Make `tool` the canvas tool (None: back to writing)."""
+        self.window.use_tool(tool)
+
+    @property
+    def active_tool(self):
+        return self.window.active_tool
 
     def timer(self, interval_ms: int, run: Callable[[], None]) -> QtCore.QTimer:
         timer = QtCore.QTimer(self.window)

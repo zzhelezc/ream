@@ -29,6 +29,11 @@ QSS = f"""
 #PanelLink {{ color: {style.INK}; background: transparent; }}
 #PanelLink:hover {{ color: #ffffff; background: {style.INK}; }}
 #PanelSection {{ color: #8c8b86; background: transparent; padding-top: 6px; }}
+#PanelScroll, #PanelBody {{ background: transparent; }}
+QScrollBar:vertical {{ width: 5px; background: transparent; margin: 0; }}
+QScrollBar::handle:vertical {{ background: {style.INK}; min-height: 24px; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
 QSlider {{ background: transparent; min-height: 16px; }}
 QSlider::groove:horizontal {{ height: 1px; background: {style.INK}; margin: 0 4px; }}
 QSlider::sub-page:horizontal {{ height: 3px; background: {style.INK}; margin: 0 0 0 4px; }}
@@ -114,13 +119,23 @@ class Panel(QtWidgets.QFrame):
         head.addWidget(close)
         self.column.addLayout(head)
         self.column.addWidget(self._rule())
-        self.grid = QtWidgets.QGridLayout()
+        # the rows live in a scroll area, so a tall panel still fits a short window
+        self.body = QtWidgets.QWidget()
+        self.body.setObjectName("PanelBody")
+        self.grid = QtWidgets.QGridLayout(self.body)
+        self.grid.setContentsMargins(0, 0, 9, 0)          # room for the scroll bar
         self.grid.setHorizontalSpacing(10)
         self.grid.setVerticalSpacing(5)
         self.grid.setColumnMinimumWidth(0, 62)
         self.grid.setColumnStretch(1, 1)
         self.grid.setColumnMinimumWidth(2, 44)
-        self.column.addLayout(self.grid)
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setObjectName("PanelScroll")
+        self.scroll.setWidget(self.body)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.column.addWidget(self.scroll)
         self.hide()
 
     # -- building ------------------------------------------------------------
@@ -280,6 +295,24 @@ class Panel(QtWidgets.QFrame):
         self.grid.addLayout(box, row, 1, 1, 2)
         self._refreshers.append(refresh)
 
+    def text(self, name: str, get: Callable[[], str], put: Callable[[str], None]):
+        """A line of text (a file-name pattern, say), set as you type."""
+        row = self._row()
+        field = QtWidgets.QLineEdit()
+        field.setFont(style.ui_font(12))
+        field.setStyleSheet(f"QLineEdit {{ border: none; border-bottom: 1px solid {style.INK};"
+                            f" background: transparent; color: {style.INK}; padding: 1px 0; }}")
+        field.textEdited.connect(put)
+
+        def refresh():
+            if not field.hasFocus():
+                field.setText(get())
+
+        self.grid.addWidget(self._name(name), row, 0)
+        self.grid.addWidget(field, row, 1, 1, 2)
+        self._refreshers.append(refresh)
+        return field
+
     def links(self, name: str, entries: list[tuple[str | Callable[[], str], Callable[[], None]]]):
         """A row of words that are buttons; a word may be a function, so it
         can change ("save" becomes "save *" when there is something to save)."""
@@ -320,9 +353,18 @@ class Panel(QtWidgets.QFrame):
         for refresh in self._refreshers:
             refresh()
 
+    def fit_height(self):
+        """As tall as the rows need, or as the window allows - then it scrolls."""
+        need = self.body.sizeHint().height() + 2
+        host = self.parentWidget().rect().height()
+        chrome = self.sizeHint().height() - self.scroll.sizeHint().height()
+        room = max(120, host - 24 - chrome)
+        self.scroll.setFixedHeight(min(need, room))
+        self.adjustSize()
+
     def open(self):
         self.refresh()
-        self.adjustSize()
+        self.fit_height()
         if not self.placed:
             host = self.parentWidget().rect()
             self.move(host.width() - self.width() - 20, 20)
@@ -332,6 +374,7 @@ class Panel(QtWidgets.QFrame):
         self.raise_()
 
     def keep_inside(self):
+        self.fit_height()
         host = self.parentWidget().rect()
         x = max(4, min(self.x(), host.width() - self.width() - 4))
         y = max(4, min(self.y(), host.height() - self.height() - 4))

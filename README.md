@@ -164,6 +164,7 @@ Dropping or pasting straight onto the page pins at once, scaled down to the
 text width if it is wider.
 
 - **Selecting and moving:** click to select, `Shift`+click adds, drag moves,
+  `Alt`+drag carries a copy,
   and the arrows nudge (`Shift` for 10 pt). The corner square resizes about
   the middle, keeping the proportions.
 - **Rotating:** drag the round knob above a selected image (`Shift` snaps to
@@ -219,7 +220,7 @@ the number.
 | Pages | new page, next page (`⌘→`), previous page (`⌘←`), go to page |
 | Views | write mode (`⇧⌘F`), write zoom, one page (`⌘1`), spread (`⌘2`), all pages (`⌘3`), fit page (`⌘0`) |
 | Look | theme · paper / white / night |
-| Selection (images and text blocks) | rotate 90° right / left, rotate, straighten, delete, bring forward (`⌘]`), send backward (`⌘[`), bring to front (`⇧⌘]`), send to back (`⇧⌘[`), unpin from page, fit to text width, natural size |
+| Selection (images and text blocks) | duplicate, mirror ↔ / ↕, arrange, merge, reset mask, rotate 90° right / left, rotate, straighten, delete, bring forward (`⌘]`), send backward (`⌘[`), bring to front (`⇧⌘]`), send to back (`⇧⌘[`), unpin from page, fit to text width, natural size |
 | Profiles | save profile (`⌥⌘S`), save profile as…, new profile, profile · name (`⌥⌘1`–`9`), delete profile · name |
 | File | new document (`⌘N`), open… (`⇧⌘O`), save (`⌘S`), save as… (`⇧⌘S`), show drafts, word count, quit |
 
@@ -370,7 +371,64 @@ class Plugin(Base):
 | `place_text(text)` | start a text block with some words in it |
 | `timer(ms, run)` | a repeating timer, stopped when ream closes |
 | `settings` / `save_settings()` | the plugin's own saved dict |
+| `use(tool)` | make a `ream.plugin.Tool` the canvas tool: it gets presses, drags and keys, and draws over the canvas, until `Esc` |
 | `toast`, `visible_rect`, `window`, `scene`, `view` | the rest |
+
+### stik
+
+The image side of [stik](../stik), as a plugin: cut stickers out of anything on
+the canvas or the page, clean their backgrounds, give them die-cut borders and
+export them. `⌥⌘K` (or **stik** in the palette) opens its panel.
+
+**Tools.** Pick a tool in the panel's first row (or **cut: lasso**, **wand**
+… in the palette). While a tool is on, presses on the canvas go to it, the
+letter keys switch tools as in stik, and `Esc` goes back to writing.
+
+| Key | Tool | Does |
+| --- | --- | --- |
+| L | lasso | draw round something; letting go cuts it out (**smooth** steadies the line) |
+| M | rect | drag a box; letting go cuts (`Shift`: square) |
+| O | ellipse | drag an ellipse; letting go cuts (`Shift`: circle) |
+| W | wand | click a colour to take it out; `Shift`+click brings it back |
+| E | eraser | rub pixels out; `Shift`+drag paints them back; `[` `]` size |
+
+**How cutting works:**
+
+- **It's physical, as in stik.** The cutout lands exactly over its hole,
+  nudged down and right so the cut shows, and the hole stays in the image.
+  **feather** softens the edge, and cutout plus hole always add back up to the
+  original.
+- **Copy instead:** `Alt` as you let go copies instead of cutting, or
+  **keeps · copy** in the panel makes copying the default.
+- **Which image:** a cut takes the selected image under the shape if there is
+  one, else the topmost image with something there.
+
+**Background.** Removes the background from the selected images with stik's
+methods: border flood, gradient flood, colour key, drop white / black, GrabCut,
+and rembg's AI model if installed (`uv tool install --reinstall '.[ai]'`).
+
+- **Refining:** tolerance, softness, grow, feather, despeckle, keep largest
+  only, fill holes.
+- **Live preview:** the fast methods follow the sliders (a quick preview while
+  dragging, full resolution a moment later). GrabCut and AI run on **apply**.
+
+**Sheet.** **auto-cut islands** turns every separate sticker on the selected
+sheet into its own cutout, soft edge included, and lays them out beside it.
+**min island** skips specks. **arrange** tidies any selection into rows.
+
+**Border.** A die-cut sticker edge (width, smoothness, colour) on the
+selected images. Its enclosed holes are filled, as a real die-cut is.
+**remove** takes it off.
+
+**Export.** **export selected…** writes the selected images as PNGs, exactly as
+they look (border, rotation and mirroring included). Options: **pattern**
+(tokens `{name}`, `{n}`, `{w}`, `{h}`, `{date}`, e.g. `sticker-{n:02}`),
+**scale**, **padding**, **trim**. Names that are taken get a number.
+
+**Nothing is destroyed.** Every image keeps its original pixels: cuts, the
+background removal, the wand and the eraser only edit its masks. **reset
+mask** (panel or palette) takes away the cleaning and leaves the cut shape as
+it was cut. It all undoes, and saves with the document.
 
 ### Scanner
 
@@ -553,6 +611,8 @@ Choosing a theme sets its canvas colour. Any colour from the page panel or
 | `src/ream/project.py` | reading images and PDFs, the `.ream` file |
 | `src/ream/plugin.py` | plugins: the API (`Plugin`, `Host`, `Frame`) and the loader |
 | `src/ream/plugins/scanner.py` | the scanner plugin |
+| `src/ream/plugins/stik.py` | the stik plugin: cut tools, wand, eraser, background, islands, border, export |
+| `src/ream/matting.py` | stik's pixel maths: background removal, wand, islands, die-cut borders |
 | `src/ream/profiles.py` | profiles: the store of named settings |
 | `src/ream/papers.py` | paper stock: the papers folder, the tooth map, laying it on a page |
 | `src/ream/style.py` | ink, paper, themes, page sizes, faces |

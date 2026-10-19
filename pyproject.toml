@@ -25,6 +25,10 @@ dependencies = [
     "PyQt5>=5.15",
 ]
 
+[project.optional-dependencies]
+# stik's AI background removal (rembg); everything else works without it
+ai = ["rembg>=2.0", "onnxruntime>=1.16", "pillow>=10"]
+
 [project.scripts]
 ream = "ream.app:main"
 

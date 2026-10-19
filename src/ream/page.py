@@ -22,15 +22,40 @@ from __future__ import annotations
 
 import itertools
 
+import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 PREVIEW_MAX = 2400          # px: the on-screen copy of a big image is no larger
 _uids = itertools.count(1)
 
 
+def qimage_to_bgra(image: QtGui.QImage) -> np.ndarray:
+    """(h, w, 4) uint8 BGRA, straight alpha - QImage ARGB32's own byte order."""
+    image = image.convertToFormat(QtGui.QImage.Format_ARGB32)
+    w, h = image.width(), image.height()
+    bits = image.constBits()
+    bits.setsize(image.byteCount())
+    rows = np.frombuffer(bits, np.uint8).reshape(h, image.bytesPerLine())
+    return rows[:, :w * 4].reshape(h, w, 4).copy()
+
+
+def bgra_to_qimage(bgra: np.ndarray) -> QtGui.QImage:
+    bgra = np.ascontiguousarray(bgra)
+    h, w = bgra.shape[:2]
+    return QtGui.QImage(bgra.data, w, h, 4 * w, QtGui.QImage.Format_ARGB32).copy()
+
+
 class Thing(QtWidgets.QGraphicsItem):
-    """An image or a PDF page.  Keeps its source bytes (for the project file)
-    and its full-resolution pixels (for export); draws a smaller copy."""
+    """An image or a PDF page.
+
+    Nothing is ever painted over its pixels.  It keeps the `original` and
+    two masks over it: `mask`, the cut shape (holes cut out of it, or the
+    shape of a cutout), and `matte`, what background removal, the wand and
+    the eraser took away - so "reset mask" always brings the cut back as it
+    was cut.  A sticker `border` (die-cut, from stik) and mirroring are
+    properties too.  `image` is the result: what is drawn, exported and
+    distressed.  Masks are numpy arrays, replaced (never edited in place),
+    so undo can keep references to old ones."""
 
     kind = "image"
 
@@ -38,24 +63,108 @@ class Thing(QtWidgets.QGraphicsItem):
                  pdf_page: int | None = None, name: str = "", uid: int | None = None):
         super().__init__()
         self._begin(uid)
-        self.image = image
         self.blob = blob
         self.ext = ext
         self.pdf_page = pdf_page
         self.name = name
         self.w, self.h = float(size.width()), float(size.height())
-        big = max(image.width(), image.height())
-        shown = image if big <= PREVIEW_MAX else image.scaled(
-            PREVIEW_MAX, PREVIEW_MAX, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
-        self.preview = QtGui.QPixmap.fromImage(shown)
+        self.original = image.convertToFormat(QtGui.QImage.Format_ARGB32)
+        self.image = self.original
+        self._bgra: np.ndarray | None = None
+        self._make_preview()
         self.setTransformOriginPoint(self.w / 2, self.h / 2)    # turns about its middle
 
     def _begin(self, uid: int | None):
         self.uid = uid if uid is not None else next(_uids)
         bump_uids(self.uid)
         self.alive = True
+        self.mask: np.ndarray | None = None       # the cut shape, uint8 (h, w); None: all of it
+        self.matte: np.ndarray | None = None      # what cleaning took away; None: nothing
+        self.border: tuple | None = None          # (width px, "#rrggbb", smooth px) die-cut
+        self.flip = (False, False)
+        self.pad_px = 0                           # how far the border reaches past the art
+        self.version = 0                          # bumped whenever the pixels change
         self.setFlag(QtWidgets.QGraphicsItem.ItemIsSelectable)
 
+    # -- pixels ----------------------------------------------------------------
+    def bgra(self) -> np.ndarray:
+        """The original pixels (BGRA), read once."""
+        if self._bgra is None:
+            self._bgra = qimage_to_bgra(self.original)
+        return self._bgra
+
+    def px_per_pt(self) -> float:
+        return self.original.width() / max(1e-6, self.w)
+
+    def alpha(self) -> np.ndarray:
+        """How much of each original pixel shows, after both masks: uint8."""
+        a = self.bgra()[..., 3].astype(np.uint16)
+        if self.mask is not None:
+            a = a * self.mask // 255
+        if self.matte is not None:
+            a = a * self.matte // 255
+        return a.astype(np.uint8)
+
+    def set_pixels(self, **changes):
+        """Change any of original / mask / matte / border, then rebuild."""
+        if "original" in changes:
+            self.original = changes.pop("original").convertToFormat(QtGui.QImage.Format_ARGB32)
+            self._bgra = None
+        for key, value in changes.items():
+            setattr(self, key, value)
+        self.recompose()
+
+    def recompose(self):
+        from . import matting
+        if self.mask is None and self.matte is None and self.border is None:
+            self.image, self.pad_px = self.original, 0
+        else:
+            pixels = self.bgra().copy()
+            pixels[..., 3] = self.alpha()
+            pad = 0
+            if self.border is not None:
+                width, colour, smooth = self.border
+                c = QtGui.QColor(colour)
+                grown = matting.add_outline(pixels, width, (c.red(), c.green(), c.blue()), smooth)
+                pad = (grown.shape[1] - pixels.shape[1]) // 2
+                pixels = grown
+            self.image, self.pad_px = bgra_to_qimage(pixels), pad
+        self.version += 1
+        self.prepareGeometryChange()
+        self._make_preview()
+        self.update()
+
+    def _make_preview(self):
+        image = self.image
+        big = max(image.width(), image.height())
+        shown = image if big <= PREVIEW_MAX else image.scaled(
+            PREVIEW_MAX, PREVIEW_MAX, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        self.preview = QtGui.QPixmap.fromImage(shown)
+
+    def pad_pt(self) -> float:
+        return self.pad_px / self.px_per_pt() if self.pad_px else 0.0
+
+    def to_pixels(self, item_point: QtCore.QPointF) -> tuple[float, float]:
+        """An item-coordinate point as a position on the original's pixels."""
+        return (item_point.x() * self.original.width() / max(1e-6, self.w),
+                item_point.y() * self.original.height() / max(1e-6, self.h))
+
+    def set_flip(self, flip_x: bool, flip_y: bool):
+        self.flip = (bool(flip_x), bool(flip_y))
+        self._apply_flip()
+
+    def _apply_flip(self):
+        fx, fy = self.flip
+        if not (fx or fy):
+            self.setTransform(QtGui.QTransform())
+            return
+        t = QtGui.QTransform()
+        t.translate(self.w / 2, self.h / 2)
+        t.scale(-1.0 if fx else 1.0, -1.0 if fy else 1.0)
+        t.translate(-self.w / 2, -self.h / 2)
+        self.setTransform(t)
+
+    # -- drawing -----------------------------------------------------------------
     def render(self, painter: QtGui.QPainter, ink: QtGui.QColor):
         """Draw at full quality in item coordinates (export)."""
         painter.drawImage(self.boundingRect(), self.image)
@@ -65,7 +174,8 @@ class Thing(QtWidgets.QGraphicsItem):
         return self.parentItem() is not None
 
     def boundingRect(self) -> QtCore.QRectF:
-        return QtCore.QRectF(0.0, 0.0, self.w, self.h)
+        p = self.pad_pt()
+        return QtCore.QRectF(-p, -p, self.w + 2 * p, self.h + 2 * p)
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
@@ -78,12 +188,14 @@ class Thing(QtWidgets.QGraphicsItem):
         self.setPos(self.pos() + QtCore.QPointF((self.w - w) / 2, (self.h - h) / 2))
         self.w, self.h = w, h
         self.setTransformOriginPoint(w / 2, h / 2)
+        self._apply_flip()
 
     def set_size(self, w: float, h: float):
         """New size with the top-left corner where it was (loading, undo)."""
         self.prepareGeometryChange()
         self.w, self.h = max(4.0, w), max(4.0, h)
         self.setTransformOriginPoint(self.w / 2, self.h / 2)
+        self._apply_flip()
 
     def outline(self) -> QtGui.QPolygonF:
         """The four corners in scene coordinates, turned with it."""
@@ -94,7 +206,13 @@ class Thing(QtWidgets.QGraphicsItem):
         return self.mapRectToParent(self.boundingRect())
 
     def natural_aspect(self) -> float:
-        return self.image.width() / max(1, self.image.height())
+        return self.original.width() / max(1, self.original.height())
+
+    def key(self) -> tuple:
+        """Everything about where and what it is - for caches, never for undo."""
+        return (self.uid, self.alive, self.pinned, round(self.pos().x(), 3),
+                round(self.pos().y(), 3), round(self.w, 3), round(self.h, 3), self.zValue(),
+                round(self.rotation(), 3), self.version, self.flip)
 
 
 class NoteText(QtWidgets.QGraphicsTextItem):
@@ -147,6 +265,7 @@ class Note(Thing):
         self._begin(uid)
         self.name = "text"
         self.blob, self.ext, self.pdf_page, self.image = b"", "", None, None
+        self.original = None
         self.w, self.h = 8.0, 8.0
         self.wrap = wrap
         self.editor = NoteText(controller, self)

@@ -117,3 +117,26 @@ def load(path: str) -> tuple[dict, dict[str, bytes]]:
         media = {name: archive.read(name) for name in archive.namelist()
                  if name.startswith("media/")}
     return state, media
+
+
+def png_bytes(plane) -> bytes:
+    """A (h, w) uint8 mask as PNG bytes."""
+    import cv2
+    ok, data = cv2.imencode(".png", np.ascontiguousarray(plane))
+    return bytes(data) if ok else b""
+
+
+def png_plane(data: bytes):
+    """PNG bytes back to a (h, w) uint8 mask, or None."""
+    import cv2
+    if not data:
+        return None
+    plane = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
+    return plane
+
+
+def png_bytes_rgba(bgra) -> bytes:
+    """(h, w, 4) BGRA pixels as PNG bytes."""
+    import cv2
+    ok, data = cv2.imencode(".png", np.ascontiguousarray(bgra))
+    return bytes(data) if ok else b""

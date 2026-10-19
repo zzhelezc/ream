@@ -1107,6 +1107,158 @@ def test_scanner_scans_smears_and_drags_out():
     w.close()
 
 
+def stik_of(w):
+    return [p for p, _h in w.plugins if p.name == "stik"][0]
+
+
+def sticker_png(path: str) -> str:
+    """Two red discs on a white sheet: something to cut and clean."""
+    image = QtGui.QImage(400, 240, QtGui.QImage.Format_RGB32)
+    image.fill(QtGui.QColor("#ffffff"))
+    p = QtGui.QPainter(image)
+    p.setRenderHint(QtGui.QPainter.Antialiasing)
+    p.setPen(QtCore.Qt.NoPen)
+    p.setBrush(QtGui.QColor("#d22a1e"))
+    p.drawEllipse(30, 40, 140, 140)
+    p.setBrush(QtGui.QColor("#1e44d2"))
+    p.drawEllipse(230, 50, 130, 130)
+    p.end()
+    image.save(path)
+    return path
+
+
+def canvas_sheet(w):
+    page = w.sheet.scene_page_rect()
+    w.add_files([sticker_png(os.path.join(TMP, "sheet.png"))],
+                QtCore.QPointF(page.right() + 400, page.top() + 200))
+    (sheet,) = [t for t in w.things.values() if t.alive]
+    sheet.resize(400, 240)          # 1 px = 1 pt, to keep the arithmetic plain
+    w.view.frame(sheet.sceneBoundingRect().adjusted(-60, -60, 260, 260))
+    pump(0.05)
+    return sheet
+
+
+def test_stik_cut_clean_and_undo():
+    w = fresh()
+    st = stik_of(w)
+    sheet = canvas_sheet(w)
+    origin = sheet.scenePos()
+    # a rectangle cut round the red disc
+    st.use("rect")
+    assert w.active_tool is st.tools["rect"]
+    a = view_point(w, origin + QtCore.QPointF(20, 30))
+    b = view_point(w, origin + QtCore.QPointF(185, 195))
+    drag(w, a, b)
+    alive = [t for t in w.things.values() if t.alive]
+    assert len(alive) == 2
+    piece = [t for t in alive if t is not sheet][0]
+    assert piece.name.startswith("sheet_") and piece.isSelected()
+    assert sheet.alpha()[100, 100] == 0, "the hole is real"
+    assert sheet.alpha()[100, 300] == 255, "the rest of the sheet is untouched"
+    assert 160 <= piece.original.width() <= 170
+    # cutout plus hole add back up to the original
+    assert piece.alpha().max() == 255
+    # undo brings the sheet back whole and the piece goes
+    w.undo()
+    assert not piece.alive and sheet.alpha()[100, 100] == 255
+    w.redo()
+    assert piece.alive and sheet.alpha()[100, 100] == 0
+    # background removal on the cutout: the white goes, the disc stays
+    w.use_tool(None)
+    w.select([piece])
+    st.s.update({"method": "flood", "tolerance": 18.0})
+    st.remove_background(full=True)
+    a = piece.alpha()
+    assert a[3, 3] == 0 and a[a.shape[0] // 2, a.shape[1] // 2] == 255
+    assert piece.matte is not None and piece.mask is not None
+    w.reset_masks()
+    assert piece.matte is None and piece.alpha()[3, 3] == 255
+    w.undo()
+    assert piece.matte is not None
+    # the wand takes the white out of the sheet
+    w.select([sheet])
+    st.wand(sheet.mapToScene(QtCore.QPointF(5, 5)))
+    assert sheet.alpha()[5, 5] == 0 and sheet.alpha()[110, 300] == 255
+    st.wand(sheet.mapToScene(QtCore.QPointF(5, 5)), restore=True)
+    assert sheet.alpha()[5, 5] == 255
+    # the eraser rubs a stroke out of the blue disc, and shift paints it back
+    st.s["eraser"], st.s["hardness"] = 20.0, 100.0
+    st.use("eraser")
+    drag(w, view_point(w, origin + QtCore.QPointF(260, 115)),
+         view_point(w, origin + QtCore.QPointF(330, 115)))
+    assert sheet.alpha()[115, 295] == 0 and sheet.alpha()[60, 295] == 255
+    w.undo()
+    assert sheet.alpha()[115, 295] == 255
+    w.use_tool(None)
+    w.close()
+
+
+def test_stik_islands_border_mirror_merge_export_and_save():
+    w = fresh()
+    st = stik_of(w)
+    sheet = canvas_sheet(w)
+    w.select([sheet])
+    st.s.update({"method": "flood", "tolerance": 18.0, "min_island": 400.0})
+    st.islands()
+    stickers = [t for t in w.things.values() if t.alive and t is not sheet]
+    assert len(stickers) == 2, len(stickers)
+    for t in stickers:
+        a = t.alpha()
+        assert a[0, 0] == 0 and a[a.shape[0] // 2, a.shape[1] // 2] == 255
+    assert sheet.alpha()[110, 100] == 0 and sheet.alpha()[110, 295] == 0
+    # a die-cut border grows each sticker by its width
+    w.select(stickers)
+    before = [t.sceneBoundingRect().width() for t in stickers]
+    st.s.update({"border": 8.0, "border_smooth": 2.0, "border_colour": "#ffffff"})
+    st.apply_border()
+    for t, b in zip(stickers, before):
+        assert t.border is not None and t.sceneBoundingRect().width() > b + 14
+    # mirror, duplicate (Alt+drag), merge
+    w.select([stickers[0]])
+    w.mirror_selection(True)
+    assert stickers[0].flip == (True, False)
+    start = view_point(w, stickers[0].sceneBoundingRect().center())
+    viewport = w.view.viewport()
+    QtTest.QTest.mousePress(viewport, QtCore.Qt.LeftButton, QtCore.Qt.AltModifier, start)
+    for k in range(1, 6):
+        QtWidgets.QApplication.sendEvent(viewport, QtGui.QMouseEvent(
+            QtCore.QEvent.MouseMove, QtCore.QPointF(start + QtCore.QPoint(30 * k, 0)),
+            QtCore.Qt.LeftButton, QtCore.Qt.LeftButton, QtCore.Qt.AltModifier))
+    QtTest.QTest.mouseRelease(viewport, QtCore.Qt.LeftButton, QtCore.Qt.AltModifier,
+                              start + QtCore.QPoint(150, 0))
+    alive = [t for t in w.things.values() if t.alive]
+    assert len(alive) == 4, "Alt+drag leaves the original and carries a copy"
+    copy = [t for t in alive if t not in stickers and t is not sheet][0]
+    assert copy.flip == (True, False) and copy.border == stickers[0].border
+    w.select(stickers)
+    w.merge_selection()
+    merged = [t for t in w.things.values() if t.alive and t.name == "merged"]
+    assert len(merged) == 1 and not any(t.alive for t in stickers)
+    w.undo()
+    assert all(t.alive for t in stickers) and not merged[0].alive
+    # export pieces: one PNG each, named by the pattern, trimmed
+    out = os.path.join(TMP, "pieces")
+    os.makedirs(out, exist_ok=True)
+    st.s.update({"pattern": "sticker-{n:02}", "scale": 100.0, "padding": 0.0, "trim": True})
+    written = st.write(stickers, out)
+    assert [os.path.basename(p) for p in written] == ["sticker-01.png", "sticker-02.png"]
+    first = QtGui.QImage(written[0])
+    assert first.hasAlphaChannel() and first.width() < 200
+    # cut shapes, mattes, borders and mirroring are saved and come back
+    path = os.path.join(TMP, "stik.ream")
+    w.save_as(path)
+    w.close()
+    w2 = Ream([path])
+    by_name = {t.name: t for t in w2.things.values() if t.alive}
+    for t in stickers + [copy, sheet]:
+        back = by_name[t.name] if list(by_name).count(t.name) == 1 else None
+        if back is None:
+            continue
+        assert np.array_equal(back.alpha(), t.alpha()), t.name
+        assert back.border == t.border and back.flip == t.flip
+    w2.close()
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in globals().items() if name.startswith("test_")]
     failed = 0

@@ -141,6 +141,7 @@ class Ream(QtWidgets.QMainWindow):
         self.distress_panel: Panel | None = None
         self.page_panel: Panel | None = None
         self.editing: Note | None = None            # the free text being written
+        self.active_tool = None                     # a plugin's canvas tool, until Esc
         self.write_mode = False
         self._before_write: tuple | None = None
         self._follow_anim = QtCore.QVariantAnimation(self)
@@ -533,6 +534,10 @@ class Ream(QtWidgets.QMainWindow):
             painter.drawEllipse(knob, 4.0, 4.0)
             painter.drawRect(self._handle_rect(corners[2]))
         self._paint_live_caret(painter)
+        if self.active_tool is not None:
+            painter.save()
+            self.active_tool.paint(painter, transform)
+            painter.restore()
         meta = style.qc(self.th()["meta"])
         for frame in self.plugin_frames():
             if frame.isVisible():
@@ -691,6 +696,21 @@ class Ream(QtWidgets.QMainWindow):
                 return thing, "scale"
         return None
 
+    def use_tool(self, tool):
+        """Make a plugin's canvas tool active (None: back to writing)."""
+        if self.active_tool is not None and self.active_tool is not tool:
+            self.active_tool.leave()
+        self.active_tool = tool
+        if tool is not None:
+            if self.editing is not None:
+                self.finish_editing()
+            self.sheet.text.clearFocus()
+            self.toast(f"{tool.name} · Esc to stop")
+        else:
+            self.focus_text()
+        self.update_cursor()
+        self.view.viewport().update()
+
     def plugin_frames(self) -> list:
         return [frame for _p, host in getattr(self, "plugins", []) for frame in host.frames]
 
@@ -704,7 +724,8 @@ class Ream(QtWidgets.QMainWindow):
                 return frame, part
         return None
 
-    def place_qimage(self, image: QtGui.QImage, rect: QtCore.QRectF, name: str) -> Thing:
+    def place_qimage(self, image: QtGui.QImage, rect: QtCore.QRectF, name: str,
+                     push: bool = True) -> Thing:
         """A picture made by a plugin, as an image on the canvas at `rect`
         (pinned if its middle is on a shown page).  One undo step."""
         data = QtCore.QByteArray()
@@ -719,8 +740,9 @@ class Ream(QtWidgets.QMainWindow):
         thing.setZValue(self.top_z() + 1.0)
         if self.live_on(rect.center()):
             self.pin(thing)
-        self.push("things", before)
-        self.changed()
+        if push:
+            self.push("things", before)
+            self.changed()
         return thing
 
     def pin(self, thing: Thing):
@@ -751,6 +773,13 @@ class Ream(QtWidgets.QMainWindow):
         pos = event.localPos()
         at = self.view.mapToScene(pos.toPoint())
         mods = event.modifiers()
+        if self.active_tool is not None:
+            if self.editing is not None:
+                self.finish_editing()
+            if self.active_tool.press(at, mods):
+                self.drag = {"mode": "tool"}
+                self.view.viewport().update()
+                return True
         if self.editing is not None:
             if self._inside(self.editing, at):
                 return False                # the note's editor places the caret
@@ -798,7 +827,8 @@ class Ream(QtWidgets.QMainWindow):
                 self.select([thing])
             self.sheet.text.clearFocus()
             self.drag = {"mode": "press", "lead": thing, "start": at, "press": pos,
-                         "before": self.snapshot()}
+                         "before": self.snapshot(),
+                         "copy": bool(mods & QtCore.Qt.AltModifier)}
             self.view.viewport().update()
             return True
         self.clear_selection()
@@ -821,6 +851,10 @@ class Ream(QtWidgets.QMainWindow):
         if drag is None:
             self._hover_cursor(pos, at)
             return True
+        if drag["mode"] == "tool":
+            self.active_tool.move(at, event.modifiers())
+            self.view.viewport().update()
+            return True
         if drag["mode"] in ("frame-move", "frame-resize"):
             frame, delta = drag["frame"], at - drag["start"]
             if drag["mode"] == "frame-move":
@@ -835,6 +869,12 @@ class Ream(QtWidgets.QMainWindow):
                 return True
             drag["mode"] = "move"
             drag["things"] = self.selection() or [drag["lead"]]
+            if drag.get("copy"):
+                # Alt+drag carries copies and leaves the originals where they were
+                copies = [self.duplicate(t, QtCore.QPointF(0, 0)) for t in drag["things"]]
+                lead = drag["things"].index(drag["lead"]) if drag["lead"] in drag["things"] else 0
+                drag["things"], drag["lead"] = copies, copies[lead]
+                self.select(copies)
             for n, thing in enumerate(drag["things"]):
                 self.unpin(thing)
                 thing.setZValue(100000.0 + n)   # above everything while carried
@@ -865,6 +905,12 @@ class Ream(QtWidgets.QMainWindow):
     def release(self, event: QtGui.QMouseEvent):
         drag, self.drag = self.drag, None
         if drag is None:
+            return
+        if drag["mode"] == "tool":
+            if self.active_tool is not None:
+                at = self.view.mapToScene(event.pos())
+                self.active_tool.release(at, event.modifiers())
+            self.view.viewport().update()
             return
         if drag["mode"] in ("frame-move", "frame-resize"):
             drag["frame"].changed()
@@ -904,6 +950,11 @@ class Ream(QtWidgets.QMainWindow):
     def _hover_cursor(self, pos: QtCore.QPointF, at: QtCore.QPointF):
         viewport = self.view.viewport()
         framed = self.frame_at(pos)
+        if self.active_tool is not None and not self.view.space_down:
+            self.active_tool.hover(at)
+            viewport.setCursor(self.active_tool.cursor)
+            self.view.viewport().update()
+            return
         if self.view.space_down:
             viewport.setCursor(QtCore.Qt.OpenHandCursor)
         elif framed is not None and framed[1] != "inside":
@@ -1072,7 +1123,7 @@ class Ream(QtWidgets.QMainWindow):
             draw_stock(painter, rect, layer, self.blend_mode(), self.fmt.grain / 100.0)
 
     def _ghost_key(self, index: int) -> tuple:
-        return (index, self.doc.revision(), tuple(sorted(self.snapshot().items())),
+        return (index, self.doc.revision(), self.things_key(),
                 tuple(asdict(self.fmt).items()), tuple(self.distress.to_dict().items()),
                 tuple(t.text() for t in self.things.values() if isinstance(t, Note) and t.alive))
 
@@ -1361,6 +1412,13 @@ class Ream(QtWidgets.QMainWindow):
                    QtCore.Qt.Key_Meta, QtCore.Qt.Key_CapsLock, QtCore.Qt.Key_AltGr):
             return True                     # a modifier alone is not typing: keep the selection
         self._stale()
+        if self.active_tool is not None and self.editing is None:
+            if self.active_tool.key(event):
+                self.view.viewport().update()
+                return True
+            if key == QtCore.Qt.Key_Escape:
+                self.use_tool(None)
+                return True
         if (mods & QtCore.Qt.ControlModifier and not mods & QtCore.Qt.ShiftModifier
                 and key in (QtCore.Qt.Key_Left, QtCore.Qt.Key_Right)):
             self.turn_page(1 if key == QtCore.Qt.Key_Right else -1)
@@ -1446,12 +1504,17 @@ class Ream(QtWidgets.QMainWindow):
     # -- history -------------------------------------------------------------
     def snapshot(self) -> dict:
         return {uid: (t.alive, t.pinned, t.pos().x(), t.pos().y(), t.w, t.h, t.zValue(),
-                      t.rotation()) for uid, t in self.things.items()}
+                      t.rotation(), (t.original, t.mask, t.matte, t.border, t.flip))
+                for uid, t in self.things.items()}
+
+    def things_key(self) -> tuple:
+        """Where and what every thing is, for caches (snapshot() holds arrays)."""
+        return tuple(sorted(t.key() for t in self.things.values()))
 
     def restore(self, snap: dict):
         for uid, thing in self.things.items():
-            alive, pinned, x, y, w, h, z, turn = snap.get(
-                uid, (False, False, 0, 0, thing.w, thing.h, 0, 0))
+            alive, pinned, x, y, w, h, z, turn, pixels = snap.get(
+                uid, (False, False, 0, 0, thing.w, thing.h, 0, 0, None))
             if not alive:
                 if thing.scene() is not None:
                     thing.setSelected(False)
@@ -1471,6 +1534,16 @@ class Ream(QtWidgets.QMainWindow):
             thing.setPos(x, y)
             thing.setZValue(z)
             thing.setRotation(turn)
+            if pixels is not None and thing.kind == "image":
+                original, mask, matte, border, flip = pixels
+                if (original is not thing.original or mask is not thing.mask
+                        or matte is not thing.matte or border != thing.border):
+                    if original is not thing.original:
+                        thing.set_pixels(original=original, mask=mask, matte=matte, border=border)
+                    else:
+                        thing.set_pixels(mask=mask, matte=matte, border=border)
+                if flip != thing.flip:
+                    thing.set_flip(*flip)
         if self.editing is not None and not self.editing.alive:
             self.editing = None
             self.focus_text()
@@ -1887,6 +1960,195 @@ class Ream(QtWidgets.QMainWindow):
         self.scene.removeItem(note)
         self.changed()
 
+    # -- image operations (from stik) --------------------------------------------
+    def images(self, things=None) -> list[Thing]:
+        """The selected (or given) things that are images - not text blocks."""
+        return [t for t in (things if things is not None else self.selection())
+                if t.alive and t.kind == "image"]
+
+    def _adopt(self, thing: Thing, like: Thing, z: float | None = None):
+        """Register a new thing beside `like`: same parent, rotation, flip."""
+        self.things[thing.uid] = thing
+        if like.pinned:
+            thing.setParentItem(self.sheet.strip)
+        else:
+            self.scene.addItem(thing)
+        thing.setRotation(like.rotation())
+        thing.set_flip(*like.flip)
+        thing.setZValue(z if z is not None else like.zValue() + 0.5)
+
+    def _place_over(self, piece: Thing, like: Thing, item_point: QtCore.QPointF):
+        """Put `piece`'s top-left corner exactly on `item_point` of `like`
+        (rotation and mirroring included)."""
+        target = like.mapToParent(item_point) if like.pinned else like.mapToScene(item_point)
+        here = piece.mapToParent(QtCore.QPointF(0, 0)) if piece.pinned else \
+            piece.mapToScene(QtCore.QPointF(0, 0))
+        piece.setPos(piece.pos() + (target - here))
+
+    def duplicate(self, thing: Thing, offset: QtCore.QPointF = QtCore.QPointF(16, 16)) -> Thing:
+        if thing.kind != "image":
+            copy = Note(self, thing.text(), thing.wrap)
+            copy.style(self.doc_font(), self.block_format(), self.ink())
+        else:
+            copy = Thing(thing.original, QtCore.QSizeF(thing.w, thing.h), thing.blob, thing.ext,
+                         thing.pdf_page, thing.name)
+            copy.set_pixels(mask=thing.mask, matte=thing.matte, border=thing.border)
+        self._adopt(copy, thing, z=thing.zValue() + 0.5)
+        copy.setPos(thing.pos() + offset)
+        return copy
+
+    def duplicate_selection(self):
+        chosen = self.selection()
+        if not chosen:
+            return
+        before = self.snapshot()
+        copies = [self.duplicate(t) for t in chosen]
+        self.push("things", before)
+        self.select(copies)
+        self.changed()
+
+    def mirror_selection(self, horizontal: bool = True):
+        def act(thing):
+            fx, fy = thing.flip
+            thing.set_flip(not fx if horizontal else fx, fy if horizontal else not fy)
+        self._each_selected(act)
+
+    def reset_masks(self):
+        """Bring back what background removal, the wand and the eraser took;
+        the cut shape stays as it was cut."""
+        self._each_selected(lambda t: t.kind == "image" and t.set_pixels(matte=None))
+        self.toast("mask reset · as cut")
+
+    def set_border(self, things: list[Thing], width_pt: float, colour: str, smooth_pt: float):
+        """A die-cut sticker border round each image (width 0 takes it off)."""
+        before = self.snapshot()
+        for thing in self.images(things):
+            k = thing.px_per_pt()
+            border = (width_pt * k, colour, smooth_pt * k) if width_pt > 0 else None
+            thing.set_pixels(border=border)
+        self.push("things", before)
+        self.changed()
+
+    def arrange_selection(self, gap: float = 16.0, row_width: float | None = None):
+        """Lay the selection out in rows, by name, from its top-left corner."""
+        chosen = sorted(self.selection(), key=lambda t: (t.name, t.uid))
+        if not chosen:
+            return
+        before = self.snapshot()
+        rect = QtCore.QRectF()
+        for t in chosen:
+            rect = rect.united(t.sceneBoundingRect())
+        row_width = row_width or max(rect.width(), 600.0)
+        x, y, row = rect.left(), rect.top(), 0.0
+        for t in chosen:
+            box = t.sceneBoundingRect()
+            if x > rect.left() and x + box.width() > rect.left() + row_width:
+                x, y, row = rect.left(), y + row + gap, 0.0
+            t.moveBy(x - box.left(), y - box.top())
+            x += box.width() + gap
+            row = max(row, box.height())
+        self.push("things", before)
+        self.changed()
+        self.view.viewport().update()
+
+    def merge_selection(self):
+        """Flatten the selected images into one, where the topmost was, at
+        the finest resolution any of them is shown at."""
+        chosen = self.images()
+        if len(chosen) < 2:
+            self.toast("merge · select two or more images")
+            return
+        group = [t for t in chosen if t.pinned == chosen[0].pinned]
+        group.sort(key=lambda t: t.zValue())
+        rect = QtCore.QRectF()
+        for t in group:
+            rect = rect.united(t.parent_rect() if t.pinned else t.sceneBoundingRect())
+        k = min(8.0, max(t.px_per_pt() for t in group))
+        size = QtCore.QSize(max(1, int(np.ceil(rect.width() * k))),
+                            max(1, int(np.ceil(rect.height() * k))))
+        flat = QtGui.QImage(size, QtGui.QImage.Format_ARGB32_Premultiplied)
+        flat.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(flat)
+        painter.setRenderHints(QtGui.QPainter.Antialiasing | QtGui.QPainter.SmoothPixmapTransform)
+        painter.scale(k, k)
+        painter.translate(-rect.topLeft())
+        for t in group:
+            painter.save()
+            placed = t.itemTransform(t.parentItem())[0] if t.pinned else t.sceneTransform()
+            painter.setTransform(placed, True)
+            t.render(painter, self.ink())
+            painter.restore()
+        painter.end()
+        before = self.snapshot()
+        top = group[-1]
+        image = flat.convertToFormat(QtGui.QImage.Format_ARGB32)
+        data = QtCore.QByteArray()
+        buffer = QtCore.QBuffer(data)
+        buffer.open(QtCore.QIODevice.WriteOnly)
+        image.save(buffer, "PNG")
+        merged = Thing(image, rect.size(), bytes(data), ".png", None, "merged")
+        self._adopt(merged, top, z=top.zValue())
+        merged.setRotation(0.0)
+        merged.set_flip(False, False)
+        merged.setPos(rect.topLeft())
+        for t in group:
+            t.setSelected(False)
+            t.alive = False
+            self.scene.removeItem(t)
+        self.push("things", before)
+        self.select([merged])
+        self.changed()
+        self.toast(f"merged {len(group)} images")
+
+    def cut(self, thing: Thing, polygon: QtGui.QPolygonF, copy: bool = False,
+            feather_pt: float = 0.0, lift: bool = True) -> Thing | None:
+        """Cut the scene-space `polygon` out of `thing`: a new image (the
+        cutout) over its own hole, which stays in `thing` unless `copy`.
+        The caller makes it one undo step."""
+        import cv2
+        h, w = thing.original.height(), thing.original.width()
+        points = [thing.to_pixels(thing.mapFromScene(p)) for p in polygon]
+        if len(points) < 3:
+            return None
+        sel = np.zeros((h, w), np.uint8)
+        cv2.fillPoly(sel, [np.round(np.array(points) * 8).astype(np.int32)], 255,
+                     lineType=cv2.LINE_AA, shift=3)
+        if feather_pt > 0:
+            sel = cv2.GaussianBlur(sel, (0, 0), max(0.3, feather_pt * thing.px_per_pt()))
+        return self.cut_selection(thing, sel, copy=copy, lift=lift)
+
+    def cut_selection(self, thing: Thing, sel: np.ndarray, copy: bool = False,
+                      lift: bool = True) -> Thing | None:
+        """Cut by a selection over `thing`'s original pixels ((h, w) uint8,
+        255 = all of it): the cutout keeps exactly that much of each pixel,
+        and the hole gives exactly that much up - together they add back up
+        to the original."""
+        h, w = thing.original.height(), thing.original.width()
+        take = (sel.astype(np.uint16) * thing.alpha() // 255).astype(np.uint8)
+        ys, xs = np.nonzero(take > 4)
+        if len(ys) == 0:
+            return None
+        y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+        crop = thing.bgra()[y0:y1, x0:x1]
+        shape = (sel[y0:y1, x0:x1].astype(np.uint16) * (
+            thing.mask[y0:y1, x0:x1] if thing.mask is not None else 255) // 255).astype(np.uint8)
+        matte = thing.matte[y0:y1, x0:x1].copy() if thing.matte is not None else None
+        from .page import bgra_to_qimage
+        image = bgra_to_qimage(crop)
+        n = 1 + sum(1 for t in self.things.values() if t.name.startswith(thing.name + "_"))
+        piece = Thing(image, QtCore.QSizeF((x1 - x0) * thing.w / w, (y1 - y0) * thing.h / h),
+                      project.png_bytes_rgba(crop), ".png", None, f"{thing.name or 'image'}_{n:02d}")
+        piece.set_pixels(mask=shape, matte=matte, border=thing.border)
+        self._adopt(piece, thing, z=thing.zValue() + 0.5)
+        self._place_over(piece, thing, QtCore.QPointF(x0 * thing.w / w, y0 * thing.h / h))
+        if lift:
+            piece.moveBy(4.0, 4.0)
+        if not copy:
+            hole = (255 - sel).astype(np.uint16)
+            base = thing.mask if thing.mask is not None else np.full((h, w), 255, np.uint8)
+            thing.set_pixels(mask=(base.astype(np.uint16) * hole // 255).astype(np.uint8))
+        return piece
+
     def rotate_selected(self, degrees: float):
         self._each_selected(lambda t: t.setRotation((t.rotation() + degrees) % 360.0))
 
@@ -1922,7 +2184,7 @@ class Ream(QtWidgets.QMainWindow):
         """The current page's ink layer (or the `box` of it), rendered once
         per state of the page."""
         key = (self.page, dpi, box, self.doc.revision(), self.doc.toPlainText().__hash__(),
-               tuple(sorted(self.snapshot().items())), tuple(asdict(self.fmt).items()),
+               self.things_key(), tuple(asdict(self.fmt).items()),
                tuple(t.text() for t in self.things.values() if isinstance(t, Note) and t.alive))
         if self._ink_cache is None or self._ink_cache[0] != key:
             self._ink_cache = (key, export.page_layers(self.sheet, self.page, dpi, self.ink(), box))
@@ -2456,11 +2718,22 @@ class Ream(QtWidgets.QMainWindow):
                 continue
             name = project.media_name(thing.blob, thing.ext)
             media[name] = thing.blob
-            things.append({"uid": thing.uid, "media": name, "pdf_page": thing.pdf_page,
-                           "name": thing.name, "pinned": thing.pinned,
-                           "x": thing.pos().x(), "y": thing.pos().y(),
-                           "w": thing.w, "h": thing.h, "z": thing.zValue(),
-                           "r": thing.rotation()})
+            entry = {"uid": thing.uid, "media": name, "pdf_page": thing.pdf_page,
+                     "name": thing.name, "pinned": thing.pinned,
+                     "x": thing.pos().x(), "y": thing.pos().y(),
+                     "w": thing.w, "h": thing.h, "z": thing.zValue(),
+                     "r": thing.rotation()}
+            for field in ("mask", "matte"):                  # the masks, as greyscale PNGs
+                plane = getattr(thing, field)
+                if plane is not None:
+                    data = project.png_bytes(plane)
+                    entry[field] = project.media_name(data, ".png")
+                    media[entry[field]] = data
+            if thing.border is not None:
+                entry["border"] = list(thing.border)
+            if any(thing.flip):
+                entry["flip"] = list(thing.flip)
+            things.append(entry)
         centre = self.view.mapToScene(self.view.viewport().rect().center())
         return {
             "app": f"ream {__version__}",
@@ -2535,6 +2808,13 @@ class Ream(QtWidgets.QMainWindow):
                 thing.setPos(entry["x"], entry["y"])
                 thing.setRotation(entry.get("r", 0.0))
                 thing.setZValue(entry.get("z", 1.0))
+                planes = {f: project.png_plane(media.get(entry[f], b""))
+                          for f in ("mask", "matte") if entry.get(f)}
+                border = tuple(entry["border"]) if entry.get("border") else None
+                if planes or border:
+                    thing.set_pixels(**planes, border=border)
+                if entry.get("flip"):
+                    thing.set_flip(*entry["flip"])
             self.page = max(0, min(int(state.get("page", 0)), self.sheet.pages()))
             self.sheet.set_offset(self.page * self.sheet.H)
             self._update_grid()
@@ -2757,6 +3037,12 @@ class Ream(QtWidgets.QMainWindow):
             ]
             out += [
                 C("delete selected", self.delete_selection, "⌫", "remove image"),
+                C("duplicate", self.duplicate_selection, "⌥ drag", "copy clone"),
+                C("mirror ↔", partial(self.mirror_selection, True), "", "flip horizontal"),
+                C("mirror ↕", partial(self.mirror_selection, False), "", "flip vertical"),
+                C("arrange", self.arrange_selection, "", "lay out rows grid tidy"),
+                C("merge", self.merge_selection, "", "flatten combine images"),
+                C("reset mask", self.reset_masks, "", "restore background removal undo"),
                 C("bring forward", partial(self.restack, "forward"), "⌘]", "order raise up"),
                 C("send backward", partial(self.restack, "backward"), "⌘[",
                   "order lower down behind words"),
