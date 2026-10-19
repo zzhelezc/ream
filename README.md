@@ -458,6 +458,140 @@ class Plugin(Base):
 | `use(tool)` | make a `ream.plugin.Tool` the canvas tool: it gets presses, drags and keys, and draws over the canvas, until `Esc` |
 | `toast`, `visible_rect`, `window`, `scene`, `view` | the rest |
 
+### Impose
+
+Imposition, as a plugin: the pages laid out on printer sheets for binding,
+with everything needed to print them, by yourself on a one-sided printer or
+as a bundle for someone else. `⌥⌘I` (or **impose** in the palette) opens the
+panel and the imposition preview.
+
+| Style | For |
+| --- | --- |
+| **saddle stitch** | booklets and zines: all sheets nested, folded together, stapled through the fold |
+| **perfect bound** | each sheet folded on its own, the folded sheets stacked and glued at the spine |
+| **sewn signatures** | thicker books: sheets nested in groups (1–8 sheets each), folded, sewn |
+| **cut & stack** | printed 2-up, cut in half, right pile under left: the leaves come out in order |
+| **mini zine · 8 pages** | the classic one-sheet zine: one side, one cut, folded |
+
+**How the pages are placed:**
+
+- **Gutters at the spine:** in folded styles, pages sit against the fold.
+- **Upside-down cells:** the mini zine's top row is printed upside down.
+- **Blank pages,** where a style needs a multiple of 4 or 8, go before the back
+  cover so it stays on the outside. **blanks · at end** puts them last
+  instead.
+
+**The imposition preview:**
+
+- each sheet's front and back side by side, pages in place;
+- big page numbers on them (with front cover and back cover marked);
+- fold marks at the edges and dashed cut lines;
+- `←` `→` between sheets, `N` for the numbers, `G` for the how-to-print guide,
+  `Esc` back to writing.
+
+**Panel options:**
+
+- style, sheet (A4, Letter, A3, Tabloid), pages **fit** or **100%**, sheets per
+  signature, blanks before the back cover or at the end;
+- **printing:** **single-sided · turn over the long edge** (the default, like a
+  book's page), **single-sided · turn over the short edge** (like a calendar),
+  **duplex · flip on short / long
+  edge**;
+- **backs** in order or **reversed** (for printers that stack face up), and
+  marks on or off.
+
+**Printing on a one-sided printer.** The guide draws it in four panels, as
+you see it standing in front of the printer: paper standing upright in the
+tray at the back, going in short edge first, the printed sheets coming out to
+you at the front short edge first. A blue ● marks one edge of the stack and
+follows it through every step.
+
+Because the paper goes through short edge first, the landscape booklet sheets
+go through sideways. Turning the paper over its long edge therefore turns the
+sheet top to bottom, and ream prints the backs turned to suit, so both turns
+come out right.
+
+1. print `1-fronts.pdf`: the paper goes in at the back and comes out to you;
+2. take the stack out of the front tray just as it is (● is the edge nearest
+   you);
+3. turn the whole stack over its long edge, like a book's page (the ● stays
+   nearest you), or over its short edge like a calendar if you chose that (the
+   ● goes to the far side);
+4. stand it in the back tray, blank side facing you, the edge nearest you
+   going in first, then print `2-backs.pdf`.
+
+**test sheet…** writes a two-sided test page, so you can check how your
+printer feeds before you use real paper. Both sides should read upright, back
+to back. If B comes out upside down, choose the other edge to turn over.
+
+**Printing straight to the printer.** Pick a **printer** in the panel
+(**default** is the system's default printer), then **print** (or
+**impose: print** in the palette). A card walks you through the job:
+
+1. ream sends the fronts and follows the job through the printer's queue
+   until it says **printed ✓**;
+2. the card shows the turn for the edge you chose, and waits;
+3. when the stack stands in the back tray, `↵` (**print the backs**) sends
+   the backs;
+4. done, with how to fold and bind.
+
+On a duplex setting it is one job with both sides, flipped on the edge you
+chose. A mini zine is one-sided, so only the fronts are sent.
+
+**While it prints, ream is yours.** `Esc` (or **minimise**, or the card's
+−) folds the card into a small **printing** panel at the bottom right. You
+can write, leave the imposition view, do anything. The panel keeps the step
+and the printer's progress up to date, and a note appears when a side has
+printed. The panel's words do the rest:
+
+| Word | Does |
+| --- | --- |
+| **next** / **print the backs** / **done** | the next step, straight from the panel |
+| **open** | the full card again, with its drawings (also **impose: printing** in the palette) |
+| **stop** / × | ends the walk-through; jobs already sent carry on in the printer's queue |
+
+Leaving the imposition view folds the card away by itself. On the card, `↵`
+goes on and **stop** ends it.
+
+The pages are sent upright, as the paper
+goes through the printer, with each landscape sheet turned a quarter onto
+them, so the two pages fill the sheet whatever the printer's driver does.
+(The bundle's PDFs stay landscape. Preview's print dialog turns them.)
+Printing goes through the system's own
+printing (CUPS `lp`), so the printer has to be set up in System Settings ›
+Printers & Scanners.
+
+**Cheap trial runs.** Two print jobs use next to no ink and print fast, at
+the printer's draft quality in black only:
+
+| Panel | Palette | Prints |
+| --- | --- | --- |
+| **test** | **impose: print test sheet** | one sheet: an outlined A on the front, B on the back, and a top arrow. It checks the turn |
+| **draft** | **impose: print draft** | the whole job, fronts then backs, with every page as a hairline outline, its number and a top arrow. Fold it to check the order before printing for real |
+
+Draft mode is asked for twice: once in the standard way (IPP
+`print-quality=3`, `print-color-mode=monochrome`) and once in the driver's
+own terms, read from its PPD file: its **Draft** quality, grayscale or black
+ink, and its lowest resolution. That matters because Epson's drivers ignore
+the standard names. For the ET-2810, ream sends Draft, Grayscale on, 180 dpi
+and the driver's Advanced mode, which it needs before it accepts a quality
+setting.
+
+**export bundle…** writes a folder you can hand to anyone:
+
+| File | What it is |
+| --- | --- |
+| `1-fronts.pdf` | the fronts of every sheet, in order |
+| `2-backs.pdf` | the backs, turned and ordered for the chosen way of turning |
+| `duplex.pdf` | fronts and backs interleaved, for a duplex printer |
+| `guide.pdf` | how to print (with drawings), a sheet-by-sheet page map, how to fold and bind |
+| `test-front.pdf`, `test-back.pdf` | the printer test |
+| `README.txt` | the steps in words |
+
+A mini zine is one-sided, so its bundle is just the fronts, the guide and the
+README. Clean pages are placed as vector, so text stays text. Distressed pages
+are placed exactly as they export.
+
 ### stik
 
 The image side of [stik](../stik), as a plugin: cut stickers out of anything on
@@ -697,6 +831,9 @@ Choosing a theme sets its canvas colour. Any colour from the page panel or
 | `src/ream/project.py` | reading images and PDFs, the `.ream` file |
 | `src/ream/plugin.py` | plugins: the API (`Plugin`, `Host`, `Frame`) and the loader |
 | `src/ream/plugins/scanner.py` | the scanner plugin |
+| `src/ream/imposition.py` | imposition: which page goes where on which side of which sheet |
+| `src/ream/plugins/impose.py` | the impose plugin: panel, preview, guide drawings, bundle, print card |
+| `src/ream/printing.py` | sending PDFs to a printer (CUPS `lp` / `lpstat`) |
 | `src/ream/plugins/stik.py` | the stik plugin: cut tools, wand, eraser, background, islands, border, export |
 | `src/ream/matting.py` | stik's pixel maths: background removal, wand, islands, die-cut borders |
 | `src/ream/profiles.py` | profiles: the store of named settings |

@@ -1511,6 +1511,347 @@ def test_preview_mode():
     w.close()
 
 
+def test_imposition_orders():
+    from ream import imposition
+    for style in imposition.STYLES:
+        for n in (1, 2, 5, 8, 13, 24, 31):
+            for per in (1, 3):
+                layout = imposition.impose(n, style, per_signature=per, keep_back=False)
+                order = imposition.reading_order(layout)
+                assert order == list(range(n)) + [None] * (layout.padded - n), (style, n, per)
+                # by default the blanks go before the back cover, which stays outside
+                kept = imposition.reading_order(imposition.impose(n, style, per_signature=per))
+                assert sorted(p for p in kept if p is not None) == list(range(n))
+                if n >= 2:
+                    assert kept[-1] == n - 1, (style, n, kept)
+    six = imposition.impose(6, "saddle").sheets[0]
+    assert [c.page for c in six.front] == [5, 0], "the back cover wraps the front cover"
+    saddle = imposition.impose(8, "saddle")
+    assert [[c.page for c in saddle.sheets[0].front], [c.page for c in saddle.sheets[0].back]] == \
+        [[7, 0], [1, 6]]
+    zine = imposition.impose(8, "zine8").sheets[0].front
+    assert [c.page for c in zine if c.row == 0] == [4, 3, 2, 1] and all(c.turn == 180 for c in zine[:4])
+    assert [c.page for c in zine if c.row == 1] == [5, 6, 7, 0]
+    assert imposition.back_turn("single-long") == 180 and imposition.back_turn("single-short") == 0
+    assert imposition.back_turn("single-top") == 180, "earlier names still work"
+
+
+def impose_of(w):
+    return [p for p, _h in w.plugins if p.name == "impose"][0]
+
+
+def test_impose_preview_and_bundle():
+    import pypdfium2
+    w = fresh()
+    w.distress.enabled = False
+    type_paragraphs(w, 28)                     # several pages
+    pages = w.sheet.pages()
+    heads = page_heads(w)
+    imp = impose_of(w)
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_I, QtCore.Qt.ControlModifier | QtCore.Qt.AltModifier)
+    pump(0.1)
+    assert imp.view.isVisible() and imp.panel.isVisible()
+    for key in imposition_styles():
+        imp.s["style"] = key
+        imp.view.guide = False
+        imp.view.grab()
+        imp.view.guide = True
+        imp.view.grab()
+    imp.view.guide = False
+    QtTest.QTest.keyClick(imp.view, QtCore.Qt.Key_Right)
+    assert imp.view.sheet_index == 1
+    # a saddle-stitched booklet, single-sided printer, turned over the long edge
+    imp.s.update({"style": "saddle", "sheet": "a4", "fit": True, "printing": "single-long",
+                  "reverse": False, "marks": True})
+    folder = imp.export_bundle(TMP)
+    names = sorted(os.listdir(folder))
+    assert names == ["1-fronts.pdf", "2-backs.pdf", "README.txt", "duplex.pdf", "guide.pdf",
+                     "test-back.pdf", "test-front.pdf"], names
+    layout = imp.layout()
+    fronts = pypdfium2.PdfDocument(os.path.join(folder, "1-fronts.pdf"))
+    assert len(fronts) == len(layout.sheets) == layout.padded // 4
+    width, height = fronts[0].get_size()
+    assert abs(width - 841.9) < 1 and abs(height - 595.3) < 1, "A4 landscape sheets"
+    assert len(pypdfium2.PdfDocument(os.path.join(folder, "duplex.pdf"))) == 2 * len(layout.sheets)
+    # sheet 1's front: the last page on the left, page 1 on the right
+    text = fronts[0].get_textpage()
+    right = text.get_text_bounded(left=width / 2, bottom=0, right=width, top=height)
+    assert heads[0][:8] in right.replace("\r", "").replace("\n", " "), (heads[0], right[:80])
+    readme = open(os.path.join(folder, "README.txt")).read()
+    assert "turn the whole stack over its long edge" in readme and "staple" in readme
+    assert len(pypdfium2.PdfDocument(os.path.join(folder, "guide.pdf"))) >= 2
+    # long-edge backs are the short-edge backs turned 180° (the paper goes
+    # through short edge first, so these landscape sheets go sideways)
+    imp.s["printing"] = "single-short"
+    short = imp.export_bundle(TMP)
+    long_page = pypdfium2.PdfDocument(os.path.join(folder, "2-backs.pdf"))[0].render(scale=0.5).to_numpy()
+    short_page = pypdfium2.PdfDocument(os.path.join(short, "2-backs.pdf"))[0].render(scale=0.5).to_numpy()
+    turned = np.abs(long_page.astype(int) - np.rot90(short_page, 2).astype(int)).mean()
+    plain = np.abs(long_page.astype(int) - short_page.astype(int)).mean()
+    assert turned < 6 and plain > 3 * turned, (turned, plain)   # (antialiasing differs a little)
+    # the backs reversed for printers that stack face up
+    imp.s["reverse"] = True
+    folder2 = imp.export_bundle(TMP)
+    backs = pypdfium2.PdfDocument(os.path.join(folder2, "2-backs.pdf"))
+    first_back = backs[0].get_textpage().get_text_range()
+    last_sheet = layout.sheets[-1].back
+    assert heads[last_sheet[0].page][:8] in first_back.replace("\r", "").replace("\n", " ") \
+        or heads[last_sheet[1].page][:8] in first_back.replace("\r", "").replace("\n", " ")
+    # a mini zine: one side, no backs or test sheet
+    imp.s.update({"style": "zine8", "reverse": False})
+    folder3 = imp.export_bundle(TMP)
+    assert sorted(os.listdir(folder3)) == ["1-fronts.pdf", "README.txt", "guide.pdf"]
+    assert len(pypdfium2.PdfDocument(os.path.join(folder3, "1-fronts.pdf"))) == \
+        imp.layout().padded // 8
+    QtTest.QTest.keyClick(imp.view, QtCore.Qt.Key_Escape)
+    assert not imp.view.isVisible()
+    w.close()
+
+
+class FakePrinter:
+    """Stands in for `lp` / `lpstat`: records what would have been printed;
+    a job stays queued until `finish()`."""
+
+    def __init__(self):
+        self.jobs: list[list[str]] = []
+        self.queued: list[str] = []
+
+    def __call__(self, command, **kwargs):
+        import subprocess
+        out = ""
+        if command[0] == "lp":
+            self.jobs.append(command)
+            job = f"EPSON-{len(self.jobs)}"
+            self.queued.append(job)
+            out = f"request id is {job} (1 file(s))\n"
+        elif command[:2] == ["lpstat", "-a"]:
+            out = "EPSON accepting requests since now\nOther accepting requests since now\n"
+        elif command[:2] == ["lpstat", "-d"]:
+            out = "system default destination: EPSON\n"
+        elif command[:2] == ["lpstat", "-o"]:
+            out = "".join(f"{job} zz 1024 now\n" for job in self.queued)
+        return subprocess.CompletedProcess(command, 0, out, "")
+
+    def finish(self):
+        self.queued.clear()
+
+
+def test_impose_prints_fronts_then_backs():
+    from ream import printing
+    fake = FakePrinter()
+    real_run, real_available = printing.RUN, printing.available
+    printing.RUN, printing.available = fake, (lambda: True)
+    try:
+        assert printing.printers() == ["EPSON", "Other"] and printing.default() == "EPSON"
+        w = fresh()
+        w.distress.enabled = False
+        type_paragraphs(w, 20)
+        imp = impose_of(w)
+        imp.s.update({"style": "saddle", "sheet": "a4", "printing": "single-long",
+                      "reverse": False, "printer": ""})
+        imp.print_now()
+        pump(0.1)
+        flow = imp.flow
+        assert flow is not None and flow.isVisible() and imp.view.isVisible()
+        # step 1: only the fronts have gone, on the default printer, A4, one-sided
+        assert len(fake.jobs) == 1
+        lp = fake.jobs[0]
+        assert lp[:3] == ["lp", "-d", "EPSON"] and "media=A4" in lp and "sides=one-sided" in lp
+        assert lp[-1].endswith("1-fronts.pdf") and os.path.exists(lp[-1])
+        # sent upright, as the A4 goes through the printer, the landscape
+        # sheet turned a quarter onto it (the bundle's sheets stay landscape)
+        import numpy as np
+        import pypdfium2
+        sent = pypdfium2.PdfDocument(lp[-1])
+        width, height = sent[0].get_size()
+        assert abs(width - 595.3) < 1 and abs(height - 841.9) < 1, (width, height)
+        land = pypdfium2.PdfDocument(os.path.join(imp.export_bundle(TMP), "1-fronts.pdf"))
+        assert land[0].get_size()[0] > land[0].get_size()[1]
+        for k in range(len(sent)):
+            upright = sent[k].render(scale=0.4).to_numpy().astype(int)
+            turned = np.rot90(land[k].render(scale=0.4).to_numpy(), -1).astype(int)
+            h, w_ = min(upright.shape[0], turned.shape[0]), min(upright.shape[1], turned.shape[1])
+            same = np.abs(upright[:h, :w_] - turned[:h, :w_]).mean()
+            other = np.abs(upright[:h, :w_] - np.rot90(turned, 2)[:h, :w_]).mean()
+            assert same < 8 and other > 1.5 * same, (k, same, other)
+        assert "printing" in flow.status.text()
+        fake.finish()
+        flow._check()
+        assert flow.printed and "printed" in flow.status.text()
+        flow.grab()
+        # step 2: the turn - nothing more is sent until you say so
+        QtTest.QTest.keyClick(flow, QtCore.Qt.Key_Return)
+        assert flow.step()[0] == "turn" and len(fake.jobs) == 1
+        assert "long edge" in flow.title.text()
+        flow.grab()
+        # step 3: the backs
+        QtTest.QTest.keyClick(flow, QtCore.Qt.Key_Return)
+        assert len(fake.jobs) == 2 and fake.jobs[1][-1].endswith("2-backs.pdf")
+        sheets = len(imp.layout().sheets)
+        assert len(pypdfium2.PdfDocument(fake.jobs[1][-1])) == sheets
+        QtTest.QTest.keyClick(flow, QtCore.Qt.Key_Return)
+        assert flow.step()[0] == "done"
+        flow.grab()
+        QtTest.QTest.keyClick(flow, QtCore.Qt.Key_Return)
+        pump(0.05)
+        assert imp.flow is None
+        # a duplex printer: one job, both sides, flipped on the chosen edge
+        imp.s.update({"printing": "duplex-short", "printer": "Other"})
+        imp.print_now()
+        assert len(fake.jobs) == 3
+        lp = fake.jobs[2]
+        assert lp[:3] == ["lp", "-d", "Other"] and "sides=two-sided-short-edge" in lp
+        assert lp[-1].endswith("duplex.pdf")
+        assert len(pypdfium2.PdfDocument(lp[-1])) == 2 * sheets
+        imp.flow.close_card()
+        pump(0.05)
+        assert imp.flow is None
+        # printing takes a while: fold the card into the "printing" panel,
+        # go back to writing, and take the next steps from the panel
+        from ream.panel import _Link
+        imp.s.update({"printing": "single-long", "printer": ""})
+        w.show()
+        imp.print_now()
+        flow, panel = imp.flow, imp.print_panel
+        assert flow.isVisible() and not panel.isVisible()
+        QtTest.QTest.keyClick(flow, QtCore.Qt.Key_Escape)       # Esc folds it, not stops it
+        pump(0.05)
+        assert imp.flow is flow and flow.minimised and not flow.isVisible() and panel.isVisible()
+        assert "step 1 of 4" in panel.caption.text()
+        imp.close()                                              # back to writing
+        pump(0.05)
+        assert not imp.view.isVisible() and panel.isVisible() and imp.flow is flow
+
+        def panel_text():
+            return " ".join(label.text() for label in panel.findChildren(QtWidgets.QLabel))
+
+        def click(word):
+            link = [l for l in panel.findChildren(_Link) if l.text() == word][0]
+            QtTest.QTest.mouseClick(link, QtCore.Qt.LeftButton)
+            pump(0.02)
+
+        assert "printing the fronts" in panel_text() and "printing…" in panel_text()
+        fake.finish()
+        flow._check()                                            # the queue is still followed
+        assert "printed ✓" in panel_text()
+        jobs = len(fake.jobs)
+        click("next")
+        assert flow.step()[0] == "turn" and flow.minimised and len(fake.jobs) == jobs
+        assert "turn the stack" in panel_text()
+        click("print the backs")
+        assert len(fake.jobs) == jobs + 1 and fake.jobs[-1][-1].endswith("2-backs.pdf")
+        assert flow.minimised and "printing the backs" in panel_text()
+        click("open")                                            # the card again
+        assert flow.isVisible() and not flow.minimised and not panel.isVisible()
+        flow.minimise()
+        click("stop")
+        pump(0.05)
+        assert imp.flow is None and not panel.isVisible()
+        # the palette command brings the card back
+        imp.print_now()
+        imp.flow.minimise()
+        imp.printing_status()
+        assert imp.flow.isVisible()
+        imp.flow.close_card()
+        # a mini zine: one side only, so just the fronts
+        imp.s.update({"style": "zine8", "printing": "single-long", "printer": ""})
+        before = len(fake.jobs)
+        imp.print_now()
+        assert len(fake.jobs) == before + 1 and fake.jobs[-1][-1].endswith("1-fronts.pdf")
+        assert [step[0] for step in imp.flow.steps] == ["send", "done"]
+        imp.flow.close_card()
+        # the test sheet: its front, the turn, its back
+        imp.s.update({"style": "saddle"})
+        imp.print_now(test=True)
+        assert fake.jobs[before + 1][-1].endswith("test-front.pdf")
+        QtTest.QTest.keyClick(imp.flow, QtCore.Qt.Key_Return)
+        QtTest.QTest.keyClick(imp.flow, QtCore.Qt.Key_Return)
+        assert fake.jobs[before + 2][-1].endswith("test-back.pdf") and len(fake.jobs) == before + 3
+        imp.flow.close_card()
+        # a draft: the whole job as outlines and numbers, at the printer's
+        # draft quality, black only - in standard words and the driver's own
+        ppd_dir = os.path.join(TMP, "ppd")
+        os.makedirs(ppd_dir, exist_ok=True)
+        with open(os.path.join(ppd_dir, "EPSON.ppd"), "w") as f:
+            f.write("""*OpenUI *EPIJ_Ink_/Grayscale: PickOne
+*DefaultEPIJ_Ink_: 1
+*EPIJ_Ink_ 1/Off: ""
+*EPIJ_Ink_ 0/On: ""
+*CloseUI: *EPIJ_Ink_
+*OpenUI *EPIJ_Mode/Mode: PickOne
+*EPIJ_Mode 0/Automatic: ""
+*EPIJ_Mode 3/Advanced: ""
+*CloseUI: *EPIJ_Mode
+*OpenUI *EPIJ_Qual/Print Quality: PickOne
+*DefaultEPIJ_Qual: 303
+*EPIJ_Qual 308/Draft: ""
+*EPIJ_Qual 303/Normal: ""
+*EPIJ_Qual 307/Best Quality: ""
+*CloseUI: *EPIJ_Qual
+*OpenUI *ColorModel/ColorModel: PickOne
+*ColorModel RGB/Color: ""
+*ColorModel Mono/Grayscale: ""
+*CloseUI: *ColorModel
+*OpenUI *Resolution/Resolution: PickOne
+*Resolution 360x360dpi/360 dpi: ""
+*Resolution 180x180dpi/180 dpi: ""
+*CloseUI: *Resolution
+""")
+        real_ppd, printing.PPD_DIR = printing.PPD_DIR, ppd_dir
+        try:
+            options = printing.draft_options("EPSON")
+            for wanted in ("print-quality=3", "print-color-mode=monochrome", "EPIJ_Qual=308",
+                           "EPIJ_Ink_=0", "EPIJ_Mode=3", "ColorModel=Mono", "Resolution=180x180dpi"):
+                assert wanted in options, (wanted, options)
+            assert printing.draft_options("nowhere") == ["-o", "print-quality=3", "-o",
+                                                         "print-color-mode=monochrome"]
+
+            def ink(path):                     # at about a draft print's 180 dpi
+                doc = pypdfium2.PdfDocument(path)
+                return np.mean([255 - doc[k].render(scale=2.5, grayscale=True).to_numpy().mean()
+                                for k in range(len(doc))])
+
+            imp.s.update({"style": "saddle", "printing": "single-long", "printer": ""})
+            done = len(fake.jobs)
+            imp.print_now()
+            full = fake.jobs[done][-1]
+            assert "EPIJ_Qual=308" not in fake.jobs[done], "a real print is not a draft"
+            imp.flow.close_card()
+            imp.print_now(draft=True)
+            assert "draft" in imp.flow.caption.text()
+            lp = fake.jobs[done + 1]
+            assert "EPIJ_Qual=308" in lp and "print-quality=3" in lp and lp[-1].endswith("1-fronts.pdf")
+            assert len(pypdfium2.PdfDocument(lp[-1])) == sheets
+            assert ink(lp[-1]) < 0.4 * ink(full), (ink(lp[-1]), ink(full))
+            QtTest.QTest.keyClick(imp.flow, QtCore.Qt.Key_Return)
+            QtTest.QTest.keyClick(imp.flow, QtCore.Qt.Key_Return)
+            assert "EPIJ_Qual=308" in fake.jobs[done + 2] and fake.jobs[done + 2][-1].endswith("2-backs.pdf")
+            imp.flow.close_card()
+            # the test sheet goes as a draft too, and is mostly paper
+            imp.print_now(test=True)
+            lp = fake.jobs[done + 3]
+            assert "EPIJ_Qual=308" in lp and ink(lp[-1]) < 1.0, ink(lp[-1])
+            imp.flow.close_card()
+        finally:
+            printing.PPD_DIR = real_ppd
+        # a printer that refuses: said on the card, nothing breaks
+        fake_fail = lambda command, **kw: __import__("subprocess").CompletedProcess(   # noqa: E731
+            command, 1, "", "lp: The printer or class does not exist.") \
+            if command[0] == "lp" else fake(command, **kw)
+        printing.RUN = fake_fail
+        imp.print_now()
+        assert "does not exist" in imp.flow.status.text()
+        imp.flow.close_card()
+        w.close()
+    finally:
+        printing.RUN, printing.available = real_run, real_available
+
+
+def imposition_styles():
+    from ream import imposition
+    return list(imposition.STYLES)
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in globals().items() if name.startswith("test_")]
     failed = 0
