@@ -215,6 +215,53 @@ def raster_page(sheet, index: int, dpi: float, settings: distress.Settings,
                                      over=over(sheet, dpi, None, paper_stock)))
 
 
+def clean_base(sheet, dpi: float, paper: QtGui.QColor, paper_stock: Stock | None):
+    """The paper under a clean (vector) page: the stock, or a blended paper
+    folded into the paper colour (PDF via Qt has no blend modes, so it can't
+    go over the words); None for flat paper."""
+    base = stock(sheet, dpi, None, paper, paper_stock)
+    blended = over(sheet, dpi, None, paper_stock)
+    if blended is not None:
+        flat = np.empty(blended[0].shape, np.uint8)
+        flat[...] = rgb(paper)
+        base = papers.blend(flat, *blended)
+    return base
+
+
+def draw_clean_page(painter: QtGui.QPainter, target: QtCore.QRectF, sheet, index: int,
+                    paper: QtGui.QColor, ink: QtGui.QColor, base):
+    """A clean page into `target`: its paper, then the words and things."""
+    if base is not None:
+        painter.drawImage(target, from_rgb(base))
+    painter.save()
+    painter.translate(target.topLeft())
+    painter.scale(target.width() / sheet.W, target.height() / sheet.H)
+    if base is None:
+        painter.fillRect(QtCore.QRectF(0, 0, sheet.W, sheet.H), paper)
+    draw_page(painter, sheet, index, ink)
+    painter.restore()
+
+
+def final_page(sheet, index: int, dpi: float, settings: distress.Settings, paper: QtGui.QColor,
+               ink: QtGui.QColor, density: float = 1.0,
+               paper_stock: Stock | None = None) -> QtGui.QImage:
+    """Page `index` exactly as the PDF export puts it on paper, as an image:
+    distressed when distress is on, else clean - the same code either way."""
+    if settings.enabled:
+        return raster_page(sheet, index, dpi, settings, paper, ink, density, paper_stock)
+    scale = dpi / 72.0
+    image = QtGui.QImage(int(round(sheet.W * scale)), int(round(sheet.H * scale)),
+                         QtGui.QImage.Format_RGB32)
+    image.fill(paper)
+    painter = QtGui.QPainter(image)
+    painter.setRenderHints(QtGui.QPainter.Antialiasing | QtGui.QPainter.SmoothPixmapTransform
+                           | QtGui.QPainter.TextAntialiasing)
+    draw_clean_page(painter, QtCore.QRectF(0, 0, image.width(), image.height()), sheet, index,
+                    paper, ink, clean_base(sheet, min(dpi, 300.0), paper, paper_stock))
+    painter.end()
+    return image
+
+
 def write_pdf(path: str, sheet, pages: list[int], *, dpi: float, settings: distress.Settings,
               paper: QtGui.QColor, ink: QtGui.QColor, title: str = "", density: float = 1.0,
               paper_stock: Stock | None = None,
@@ -229,6 +276,7 @@ def write_pdf(path: str, sheet, pages: list[int], *, dpi: float, settings: distr
     writer.setResolution(int(dpi) if raster else 1200)
     painter = QtGui.QPainter(writer)
     target = QtCore.QRectF(0, 0, writer.width(), writer.height())
+    base = None if raster else clean_base(sheet, min(dpi, 300.0), paper, paper_stock)
     for n, index in enumerate(pages):
         if progress:
             progress(n, len(pages))
@@ -238,22 +286,8 @@ def write_pdf(path: str, sheet, pages: list[int], *, dpi: float, settings: distr
             painter.drawImage(target, raster_page(sheet, index, dpi, settings, paper, ink, density,
                                                   paper_stock))
         else:
-            # vector words stay words: a blended paper goes into the sheet
-            # under them (PDF via Qt has no blend modes); dark ink barely differs
-            base = stock(sheet, min(dpi, 300.0), None, paper, paper_stock)
-            blended = over(sheet, min(dpi, 300.0), None, paper_stock)
-            if blended is not None:
-                flat = np.empty(blended[0].shape, np.uint8)
-                flat[...] = rgb(paper)
-                base = papers.blend(flat, *blended)
-            if base is not None:
-                painter.drawImage(target, from_rgb(base))   # the stock under vector words
-            painter.save()
-            painter.scale(writer.width() / sheet.W, writer.height() / sheet.H)
-            if base is None:
-                painter.fillRect(QtCore.QRectF(0, 0, sheet.W, sheet.H), paper)
-            draw_page(painter, sheet, index, ink)
-            painter.restore()
+            # vector words stay words, on top of the paper
+            draw_clean_page(painter, target, sheet, index, paper, ink, base)
     painter.end()
 
 

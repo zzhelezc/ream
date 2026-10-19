@@ -1441,6 +1441,76 @@ def test_spreads_covers_and_pages_panel():
     w.close()
 
 
+def test_preview_mode():
+    import pypdfium2
+    w = fresh()
+    type_paragraphs(w, 20)
+    w.flip(1)
+    pump()
+    w.add_files([make_png(os.path.join(TMP, "pv.png"), "#2050d0")], w.sheet.scene_page_rect().center())
+    w.clear_selection()
+    w.flip(0)
+    pump()
+    w.distress.enabled = True
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_P, QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier)
+    pump(0.1)
+    pv = w.previewing
+    assert w.in_preview() and pv.geometry() == w.rect()
+    assert pv.units == [(i,) for i in range(w.sheet.pages())] and pv.at == 0
+    # the finished page arrives, distressed, and matches the PDF export's page
+    deadline = time.monotonic() + 15
+    while pv.finished(0, pv.dpi()) is None and time.monotonic() < deadline:
+        pump(0.1)
+    shown = pv.finished(0, pv.dpi())
+    assert shown is not None and shown.width() == round(w.sheet.W * pv.dpi() / 72)
+    exported = export.final_page(w.sheet, 0, pv.dpi(), w.distress, w.paper(), w.ink(),
+                                 w.density(), w.paper_stock())
+    a = export.to_numpy(shown)[..., :3].astype(int)
+    b = export.to_numpy(exported)[..., :3].astype(int)
+    assert np.abs(a - b).mean() < 1.0, "the preview is the export"
+    w.grab()
+    # next page with the arrow key: the picture is on it
+    QtTest.QTest.keyClick(pv, QtCore.Qt.Key_Right)
+    assert pv.current_page() == 1
+    deadline = time.monotonic() + 15
+    while pv.finished(1, pv.dpi()) is None and time.monotonic() < deadline:
+        pump(0.1)
+    page2 = export.to_numpy(pv.finished(1, pv.dpi()))[..., :3].astype(int)
+    blue = (page2[..., 2] > 150) & (page2[..., 0] < 90)
+    assert blue.sum() > 100, "the pinned picture is in the preview"
+    # spreads, background, end, and back out on the page last seen
+    QtTest.QTest.keyClick(pv, QtCore.Qt.Key_S)
+    assert pv.spread and pv.units[0] == (0,) and 1 in pv.units[pv.at]
+    # a cover stands in the middle, at the same scale as the spreads
+    pv.go(0)
+    (_page, cover), = pv.rects()
+    assert abs(cover.center().x() - pv.width() / 2) < 1.0
+    pv.go(1)
+    left, right = pv.rects()
+    assert abs(left[1].width() - cover.width()) < 0.5 and abs(left[1].right() - right[1].left()) < 0.5
+    # the background is the canvas colour unless asked otherwise
+    assert pv.background == "canvas" and pv.backdrop().name() == QtGui.QColor(w.canvas_colour()).name()
+    QtTest.QTest.keyClick(pv, QtCore.Qt.Key_W)
+    assert pv.background == "white"
+    QtTest.QTest.keyClick(pv, QtCore.Qt.Key_C)
+    assert pv.background == "canvas"
+    QtTest.QTest.keyClick(pv, QtCore.Qt.Key_End)
+    last = pv.current_page()
+    QtTest.QTest.keyClick(pv, QtCore.Qt.Key_Escape)
+    pump()
+    assert not w.in_preview() and w.page == last
+    # clean exports preview clean: the same as the clean PDF's page
+    w.distress.enabled = False
+    w.enter_preview()
+    pump(0.1)
+    clean = w.previewing.finished(w.previewing.current_page(), w.previewing.dpi())
+    assert clean is not None
+    pdf = w.export_pdf(clean=True, path=os.path.join(TMP, "pv.pdf"))
+    assert len(pypdfium2.PdfDocument(pdf)) == w.sheet.pages()
+    w.leave_preview()
+    w.close()
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in globals().items() if name.startswith("test_")]
     failed = 0

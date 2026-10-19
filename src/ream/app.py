@@ -41,6 +41,7 @@ from .canvas import CanvasView
 from .page import GhostPage, Note, NoteText, Sheet, Thing, draw_stock
 from .palette import Command, CommandPalette
 from .pages import PageStrip
+from .preview import Preview
 from .panel import Panel
 
 HANDLE_PX = 7
@@ -149,6 +150,8 @@ class Ream(QtWidgets.QMainWindow):
         self.editing: Note | None = None            # the free text being written
         self.active_tool = None                     # a plugin's canvas tool, until Esc
         self.write_mode = False
+        self.previewing: Preview | None = None
+        self._was_fullscreen = False
         self._before_write: tuple | None = None
         self._speller: spelling.Speller | None = None
         self._follow_anim = QtCore.QVariantAnimation(self)
@@ -1514,6 +1517,43 @@ class Ream(QtWidgets.QMainWindow):
                 self._write_follow()
             else:
                 self.keep_caret_in_view()
+        self.view.viewport().update()
+
+    # -- preview ---------------------------------------------------------------
+    def in_preview(self) -> bool:
+        return self.previewing is not None and self.previewing.isVisible()
+
+    def toggle_preview_mode(self):
+        if self.in_preview():
+            self.leave_preview()
+        else:
+            self.enter_preview()
+
+    def enter_preview(self):
+        """Full screen, the finished pages only (InDesign's presentation mode)."""
+        if self.in_preview():
+            return
+        if self.editing is not None:
+            self.finish_editing()
+        if self.active_tool is not None:
+            self.use_tool(None)
+        if self.previewing is None:
+            self.previewing = Preview(self)
+        self._was_fullscreen = self.isFullScreen()
+        if not self._was_fullscreen:
+            self.showFullScreen()
+        page = min(self.page, self.sheet.pages() - 1)
+        self.previewing.start(page, spread=self.layout != "single")
+
+    def leave_preview(self):
+        if not self.in_preview():
+            return
+        page = self.previewing.current_page()
+        self.previewing.hide()
+        if not self._was_fullscreen:
+            self.showNormal()
+        self.go_to_page(page)
+        self.focus_text()
         self.view.viewport().update()
 
     # -- write mode ----------------------------------------------------------
@@ -3496,6 +3536,8 @@ class Ream(QtWidgets.QMainWindow):
         out += [C(f"theme · {name}", partial(self._set_theme, name),
                   dot if name == self.theme else "", "canvas colour") for name in style.THEMES]
         out += [
+            C("preview", self.toggle_preview_mode, "⇧⌘P",
+              "presentation final pages full screen finished export look"),
             C("write mode off" if self.write_mode else "write mode", self.toggle_write_mode, "⇧⌘F",
               "focus typewriter zoom centre scroll follow writing"),
             C("write zoom", None, f"{self.write_zoom() * 100:.0f} %", "write mode zoom size",
@@ -3683,6 +3725,7 @@ class Ream(QtWidgets.QMainWindow):
             ("Ctrl+=", partial(self.zoom_step, 1.25)), ("Ctrl++", partial(self.zoom_step, 1.25)),
             ("Ctrl+-", partial(self.zoom_step, 0.8)), ("Ctrl+Q", self.close),
             ("Ctrl+Shift+F", self.toggle_write_mode),
+            ("Ctrl+Shift+P", self.toggle_preview_mode),
             ("Ctrl+Alt+P", self.toggle_pages_panel),
             ("Ctrl+;", self.toggle_spelling),
         ]
@@ -3700,6 +3743,8 @@ class Ream(QtWidgets.QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if self.in_preview():
+            self.previewing.setGeometry(self.rect())
         if getattr(self, "write_mode", False):
             QtCore.QTimer.singleShot(0, lambda: self._write_follow(force=True, animate=False))
         for panel in (self.distress_panel, self.page_panel):

@@ -109,6 +109,35 @@ words then stay on that page, like separate text frames in InDesign.
 - Images and text blocks pinned to a page go with it.
 - Each move, add or delete is one undo step.
 
+### Preview
+
+`⇧⌘P` (or **preview** in the palette) is InDesign's presentation mode: the
+screen goes full, and only the finished pages show, one after another.
+
+- **Exactly as exported:** distressed or clean as the export will be, with
+  the paper stock, its blend and the ink, drawn by the same code the PDF export
+  uses.
+- **Resolution:** your screen's, never under 150 dpi, so distress looks as it
+  will at 300.
+- **Nothing else:** no canvas, panels, edges or selection, and the pointer
+  hides when it rests.
+- **Spreads:** a page that stands alone (a cover, a back cover) is centred,
+  at the same scale as the spreads, so nothing jumps as you go through.
+
+| Keys | Does |
+| --- | --- |
+| → ↓ Space PgDn, click the right half, scroll | next |
+| ← ↑ ⇧Space PgUp, click the left half | previous |
+| Home / End | first / last |
+| S | single pages / spreads (it starts with spreads unless you're in the one-page view) |
+| B / W / G / C | black / white / grey / your canvas colour behind the pages (the canvas is the default) |
+| Esc, ⇧⌘P | back to writing, on the page you were last looking at |
+
+A distressed page takes a moment: the clean page shows at once, and the
+finished one replaces it ("finishing" shows at the bottom while it works).
+The pages either side are prepared in the background, so turning feels
+immediate.
+
 ### Write mode
 
 `⇧⌘F` (or **write mode** in the palette) is for writing. It:
@@ -273,7 +302,7 @@ the number.
 | Distress | distress view (`⇧⌘D`), distress on/off, distress images on/off, style · …, fade texture · …, reset distress |
 | Page and type | page size · a4 / letter / a5 / square, paper · white / cream / newsprint / bond, paper colour…, canvas colour…, font · … |
 | Pages | pages panel (`⌥⌘P`), add page, delete page, move page, cover on/off, back cover on/off, new page, next page (`⌘→`), previous page (`⌘←`), go to page |
-| Views | write mode (`⇧⌘F`), write zoom, spelling on/off (`⌘;`), spelling language · …, edit dictionary, one page (`⌘1`), spread (`⌘2`), all pages (`⌘3`), fit page (`⌘0`) |
+| Views | preview (`⇧⌘P`), write mode (`⇧⌘F`), write zoom, spelling on/off (`⌘;`), spelling language · …, edit dictionary, one page (`⌘1`), spread (`⌘2`), all pages (`⌘3`), fit page (`⌘0`) |
 | Look | theme · paper / white / night |
 | Selection (images and text blocks) | duplicate, mirror ↔ / ↕, arrange, merge, reset mask, rotate 90° right / left, rotate, straighten, delete, bring forward (`⌘]`), send backward (`⌘[`), bring to front (`⇧⌘]`), send to back (`⇧⌘[`), unpin from page, fit to text width, natural size |
 | Profiles | save profile (`⌥⌘S`), save profile as…, new profile, profile · name (`⌥⌘1`–`9`), delete profile · name |
@@ -658,6 +687,7 @@ Choosing a theme sets its canvas colour. Any colour from the page panel or
 | --- | --- |
 | `src/ream/app.py` | the window: input, page turning, pinning, undo, palette commands, saving, export |
 | `src/ream/page.py` | the sheet, the strip of pages behind it, the text editor, images |
+| `src/ream/preview.py` | preview: the finished pages full screen, one after another |
 | `src/ream/pages.py` | the pages panel's strip: thumbnails in spreads, drag to reorder |
 | `src/ream/canvas.py` | the infinite canvas: navigation, input routing, overlay drawing |
 | `src/ream/palette.py` | the Tab command palette |
