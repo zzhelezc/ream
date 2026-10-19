@@ -313,6 +313,13 @@ class Panel(QtWidgets.QFrame):
         self._refreshers.append(refresh)
         return field
 
+    def widget(self, widget: QtWidgets.QWidget, refresh: Callable[[], None] | None = None):
+        """Any widget, the panel's full width (a page strip, say)."""
+        self.grid.addWidget(widget, self._row(), 0, 1, 3)
+        if refresh:
+            self._refreshers.append(refresh)
+        return widget
+
     def links(self, name: str, entries: list[tuple[str | Callable[[], str], Callable[[], None]]]):
         """A row of words that are buttons; a word may be a function, so it
         can change ("save" becomes "save *" when there is something to save)."""

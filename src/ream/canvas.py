@@ -231,6 +231,8 @@ class CanvasView(QtWidgets.QGraphicsView):
 
     def focusOutEvent(self, event):
         self.space_down = False
+        if getattr(self, "closing", False):
+            return                      # the window is going: its scene may already be gone
         super().focusOutEvent(event)
 
     def dragEnterEvent(self, event):

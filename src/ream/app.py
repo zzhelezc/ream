@@ -40,12 +40,13 @@ from . import __version__, distress, export, papers, plugin, profiles, project, 
 from .canvas import CanvasView
 from .page import GhostPage, Note, NoteText, Sheet, Thing, draw_stock
 from .palette import Command, CommandPalette
+from .pages import PageStrip
 from .panel import Panel
 
 HANDLE_PX = 7
 KNOB_PX = 22            # how far the rotation knob stands off the top edge
 REVEAL_PX = 40          # room kept around the page when the view follows it
-GRID_GAP_X, GRID_GAP_Y = 0.06, 0.11     # all-pages view: gaps as a share of the page
+GRID_GAP_Y = 0.09         # all-pages view: room between spreads (for the numbers), of a page
 LAYOUTS = ("single", "spread", "all")
 PREVIEW_DPI = 150
 WRITE_ZOOM = 1.75        # write mode's zoom until you set your own
@@ -76,6 +77,8 @@ class Format:
     grain: float = 60.0         # % the stock's amount: tooth strength, or blend opacity
     blend: str = "tooth"        # tooth, multiply, overlay, soft light, screen, normal
     stock_scale: float = 100.0  # % the paper's size: 100 covers the page
+    cover: bool = True          # spreads: the first page alone on the right
+    back_cover: bool = False    # spreads: the last page alone on the left
     ink: float = 100.0          # %: 100 is solid black, lower fades toward the paper,
                                 # higher strikes heavier and packs the ink denser
     dpi: float = 300.0          # export
@@ -133,6 +136,7 @@ class Ream(QtWidgets.QMainWindow):
         self._ready = False                         # nothing is saved before a load
         self._undoing = False
         self._joining = False                       # a slider drag is one undo step
+        self._group: list | None = None             # collecting a grouped edit
         self._pending_key: str | None = None
         self._preview_gen = 0
         self._ink_cache: tuple | None = None
@@ -140,6 +144,8 @@ class Ream(QtWidgets.QMainWindow):
         self.preview_ready.connect(self._preview_arrived)
         self.distress_panel: Panel | None = None
         self.page_panel: Panel | None = None
+        self.pages_panel: Panel | None = None
+        self.page_strip: PageStrip | None = None
         self.editing: Note | None = None            # the free text being written
         self.active_tool = None                     # a plugin's canvas tool, until Esc
         self.write_mode = False
@@ -505,11 +511,21 @@ class Ream(QtWidgets.QMainWindow):
                 label = f"{self.page + 1:02d} / blank"
             painter.drawText(QtCore.QPointF(rect.left(), rect.bottom() + 20), label)
         else:
+            # under each page when the rows leave room, else beside the spread
+            # (left page's number on the left, right page's on the right)
+            room = self.sheet.H * GRID_GAP_Y * self.view.zoom() >= 18 or self.layout == "spread"
+            metrics = QtGui.QFontMetrics(painter.font())
             for index, box in shown:
                 label = f"{index + 1:02d}" if index < self.sheet.pages() else "blank"
                 if index == self.page:
-                    label += " ·"
-                painter.drawText(QtCore.QPointF(box.left(), box.bottom() + 18), label)
+                    label = ("· " + label) if not room and self.slot(index).x() < 0 else label + " ·"
+                if room:
+                    painter.drawText(QtCore.QPointF(box.left(), box.bottom() + 18), label)
+                elif self.slot(index).x() < 0:
+                    painter.drawText(QtCore.QPointF(box.left() - 8 - metrics.horizontalAdvance(label),
+                                                    box.bottom() - 2), label)
+                else:
+                    painter.drawText(QtCore.QPointF(box.right() + 8, box.bottom() - 2), label)
         if self.write_mode:
             tag = f"write · {self.view.zoom() * 100:.0f}%"
             if self.spelling_on():
@@ -984,21 +1000,241 @@ class Ream(QtWidgets.QMainWindow):
         pos = QtCore.QPointF(self.view.mapFromGlobal(QtGui.QCursor.pos()))
         self._hover_cursor(pos, self.view.mapToScene(pos.toPoint()))
 
+    # -- pages as things: fixing, moving, adding, removing -----------------------
+    def _break_format(self) -> QtGui.QTextBlockFormat:
+        fmt = self.block_format()
+        fmt.setPageBreakPolicy(QtGui.QTextFormat.PageBreak_AlwaysBefore)
+        return fmt
+
+    def _first_position_on(self, index: int) -> int | None:
+        """The first character laid out on page `index`, or None."""
+        layout = self.doc.documentLayout()
+        top_of_page = index * self.sheet.H
+        block = self.doc.begin()
+        while block.isValid():
+            top = layout.blockBoundingRect(block).top()
+            lines = block.layout()
+            if lines.lineCount() == 0 and top >= top_of_page - 0.5:
+                return block.position()
+            for i in range(lines.lineCount()):
+                line = lines.lineAt(i)
+                if top + line.y() + line.height() / 2 >= top_of_page:
+                    return block.position() + line.textStart()
+            block = block.next()
+        return None
+
+    def _page_of(self, thing) -> int:
+        return max(0, int(thing.parent_rect().center().y() // self.sheet.H))
+
+    def fix_pages(self):
+        """Give every page its own words: a paragraph running over a page's
+        foot is split there and the next page starts with a page break, and
+        pages with only things on them get an empty paragraph.  From then on
+        a page's words stay on it - so pages can be moved like things."""
+        boundaries = []
+        for index in range(1, self.sheet.text_pages()):
+            pos = self._first_position_on(index)
+            if pos is not None:
+                boundaries.append(pos)
+        extra = self.sheet.pages() - self.sheet.text_pages()
+        cursor = QtGui.QTextCursor(self.doc)
+        cursor.beginEditBlock()
+        for pos in reversed(boundaries):
+            block = self.doc.findBlock(pos)
+            breaks = block.blockFormat().pageBreakPolicy() & QtGui.QTextFormat.PageBreak_AlwaysBefore
+            if pos == block.position():
+                if not breaks:
+                    cursor.setPosition(pos)
+                    fmt = QtGui.QTextBlockFormat()
+                    fmt.setPageBreakPolicy(QtGui.QTextFormat.PageBreak_AlwaysBefore)
+                    cursor.mergeBlockFormat(fmt)
+            else:
+                cursor.setPosition(pos)
+                cursor.insertBlock(self._break_format())
+        cursor.movePosition(QtGui.QTextCursor.End)
+        for _ in range(max(0, extra)):
+            cursor.insertBlock(self._break_format())
+        cursor.endEditBlock()
+
+    def page_ranges(self) -> list[tuple[int, int]]:
+        """(start, end) character positions of each page's words, once fixed:
+        a page starts at a paragraph with a page break."""
+        starts = [0]
+        block = self.doc.begin().next()
+        while block.isValid():
+            if block.blockFormat().pageBreakPolicy() & QtGui.QTextFormat.PageBreak_AlwaysBefore:
+                starts.append(block.position())
+            block = block.next()
+        end = self.doc.characterCount() - 1
+        return [(a, (starts[i + 1] - 1) if i + 1 < len(starts) else end)
+                for i, a in enumerate(starts)]
+
+    def _rebuild_pages(self, order: list[int | None]):
+        """Lay the pages' words out again in `order` (None: a new empty page),
+        joined to the fixing as one undo step."""
+        ranges = self.page_ranges()
+        fragments = []
+        for index in order:
+            if index is None:
+                fragments.append(None)
+                continue
+            a, b = ranges[index]
+            cursor = QtGui.QTextCursor(self.doc)
+            cursor.setPosition(a)
+            cursor.setPosition(b, QtGui.QTextCursor.KeepAnchor)
+            fragments.append(cursor.selection())
+        cursor = QtGui.QTextCursor(self.doc)
+        cursor.joinPreviousEditBlock()
+        cursor.select(QtGui.QTextCursor.Document)
+        cursor.removeSelectedText()
+        cursor.setBlockFormat(self.block_format())
+        for n, fragment in enumerate(fragments):
+            if n:
+                cursor.insertBlock(self._break_format())
+            if fragment is not None and not fragment.isEmpty():
+                cursor.insertFragment(fragment)
+        first = QtGui.QTextCursor(self.doc)                # page one never starts with a break
+        fmt = first.blockFormat()
+        fmt.setPageBreakPolicy(QtGui.QTextFormat.PageBreak_Auto)
+        first.setBlockFormat(fmt)
+        cursor.endEditBlock()
+
+    def _move_things(self, mapping: dict[int, int | None]):
+        """Pinned things follow their pages (None: the page is gone)."""
+        for thing in list(self.sheet.pinned()):
+            old = self._page_of(thing)
+            new = mapping.get(old, old)
+            if new is None:
+                thing.setSelected(False)
+                thing.alive = False
+                self.scene.removeItem(thing)
+            elif new != old:
+                thing.moveBy(0.0, (new - old) * self.sheet.H)
+
+    def _page_edit(self, build):
+        """Fix the pages, then `build(n)` -> (order, mapping, page to show)."""
+        if self.editing is not None:
+            self.finish_editing()
+        before = self.snapshot()
+        with self.grouped():
+            self.fix_pages()
+            n = len(self.page_ranges())
+            order, mapping, show = build(n)
+            self._rebuild_pages(order)
+            self._move_things(mapping)
+            self.push("things", before)
+        self.page = max(0, min(show, self.sheet.pages() - 1))
+        self._update_grid()
+        self._place_sheet() if self.layout != "single" else self.sheet.set_offset(self.page * self.sheet.H)
+        self._caret_to_page(self.page) if self.page < self.sheet.text_pages() else None
+        self.changed()
+        self._refresh_pages_panel()
+
+    def move_page(self, source: int, target: int):
+        """Move page `source` so it lands at position `target` (0-based)."""
+        if source == target:
+            return
+
+        def build(n):
+            order = list(range(n))
+            if not (0 <= source < n):
+                return order, {}, self.page
+            moved = order.pop(source)
+            spot = max(0, min(target, len(order)))
+            order.insert(spot, moved)
+            return order, {old: new for new, old in enumerate(order)}, spot
+        self._page_edit(build)
+        self.toast(f"page {source + 1} → {target + 1}")
+
+    def add_page(self, after: int | None = None):
+        """A new empty page after page `after` (default: the current one)."""
+        after = self.page if after is None else after
+
+        def build(n):
+            spot = max(0, min(after + 1, n))
+            order = list(range(n))
+            order.insert(spot, None)
+            mapping = {old: (old + 1 if old >= spot else old) for old in range(n)}
+            return order, mapping, spot
+        self._page_edit(build)
+        self.toast(f"new page {min(after + 2, self.sheet.pages())}")
+
+    def delete_page(self, index: int | None = None):
+        """Remove a page: its words and what is pinned to it."""
+        index = self.page if index is None else index
+
+        def build(n):
+            if n <= 1:
+                return [None], {0: None}, 0
+            order = [i for i in range(n) if i != index]
+            mapping = {old: (None if old == index else old - (1 if old > index else 0))
+                       for old in range(n)}
+            return order, mapping, min(index, n - 2)
+        self._page_edit(build)
+        self.toast(f"deleted page {index + 1}")
+
+    def set_covers(self, cover: bool | None = None, back: bool | None = None):
+        if cover is not None:
+            self.fmt.cover = bool(cover)
+        if back is not None:
+            self.fmt.back_cover = bool(back)
+        self._update_grid()
+        self._place_sheet()
+        if self.layout != "single":
+            self.fit_layout()
+        self.changed()
+        self._refresh_pages_panel()
+
+    def go_to_page(self, index: int):
+        if self.layout == "single":
+            self.flip(index, reveal="top")
+        else:
+            self.make_live(index)
+            self.view.ensureVisible(self.sheet.scene_page_rect(), 40, 40)
+        if index < self.sheet.text_pages():
+            self._caret_to_page(index)
+
     # -- layouts: one page, a spread, all pages --------------------------------
+    def spreads(self, count: int | None = None) -> list[tuple[int | None, int | None]]:
+        """The pages as (left, right) spreads, as in InDesign's facing pages:
+        with `cover` the first page stands alone on the right; with
+        `back_cover` the last stands alone on the left.  None: no page there."""
+        n = count if count is not None else max(self.sheet.pages(), self.page + 1)
+        cover, back = self.fmt.cover, self.fmt.back_cover and n > 1
+        out: list[tuple[int | None, int | None]] = []
+        i = 0
+        if cover and n:
+            out.append((None, 0))
+            i = 1
+        while i < n:
+            if back and i == n - 1:
+                out.append((i, None))
+                break
+            if i + 1 < n and not (back and i + 1 == n - 1):
+                out.append((i, i + 1))
+                i += 2
+            else:
+                out.append((i, None))
+                i += 1
+        return out
+
+    def spread_index(self, page: int, spreads=None) -> int:
+        spreads = spreads if spreads is not None else self.spreads()
+        for k, pair in enumerate(spreads):
+            if page in pair:
+                return k
+        return len(spreads) - 1
+
     def spread_of(self, index: int) -> tuple[int, int | None]:
-        """(left, right) of the spread holding `index`, as in a book: the
-        first page alone on the right, then 2|3, 4|5 ... (zero-based: 0, then
-        1|2, 3|4).  -1 on the left means no page there."""
-        if index == 0:
-            return -1, 0
-        left = index if index % 2 == 1 else index - 1
-        return left, left + 1
+        """(left, right) of the spread holding `index`; -1: no page there."""
+        spreads = self.spreads(max(self.sheet.pages(), index + 1))
+        left, right = spreads[self.spread_index(index, spreads)]
+        return (-1 if left is None else left), right
 
     def visible_pages(self) -> list[int]:
         if self.layout == "spread":
             left, right = self.spread_of(self.page)
-            last = self.sheet.pages()               # the blank page after the words
-            return [i for i in (left, right) if 0 <= i <= last]
+            return [i for i in (left, right) if i is not None and i >= 0]
         if self.layout == "all":
             return list(range(max(self.sheet.pages(), self.page + 1)))
         return [self.page]
@@ -1007,11 +1243,14 @@ class Ream(QtWidgets.QMainWindow):
         """Where page `index` sits on the canvas in the current layout."""
         w, h = self.sheet.W, self.sheet.H
         if self.layout == "spread":
-            return QtCore.QPointF(0.0 if index % 2 == 0 else -w, 0.0)   # spine at x = 0
+            left, _right = self.spread_of(index)
+            return QtCore.QPointF(-w if index == left else 0.0, 0.0)     # spine at x = 0
         if self.layout == "all":
-            cols = max(1, self._grid_cols)
-            gap_x, gap_y = w * GRID_GAP_X, h * GRID_GAP_Y   # room for the page numbers
-            return QtCore.QPointF((index % cols) * (w + gap_x), (index // cols) * (h + gap_y))
+            # as in the pages panel: one spread a row, every spine on one line
+            spreads = self.spreads(max(self.sheet.pages(), self.page + 1))
+            k = self.spread_index(index, spreads)
+            left, _right = spreads[k]
+            return QtCore.QPointF(-w if index == left else 0.0, k * h * (1.0 + GRID_GAP_Y))
         return QtCore.QPointF(0.0, 0.0)
 
     def layout_rect(self) -> QtCore.QRectF:
@@ -1071,10 +1310,10 @@ class Ream(QtWidgets.QMainWindow):
         self.focus_text()
 
     def _update_grid(self):
-        """Columns for the all-pages view, so the grid roughly fills the window."""
-        n = max(self.sheet.pages(), 1)
+        """Spreads per row for the all-pages view, so the grid roughly fills the window."""
+        n = max(len(self.spreads()), 1)
         size = self.view.viewport().size()
-        aspect = (size.width() / max(1, size.height())) * (self.sheet.H / self.sheet.W)
+        aspect = (size.width() / max(1, size.height())) * (self.sheet.H / (2 * self.sheet.W))
         self._grid_cols = max(1, min(n, round(math.sqrt(n * aspect)) or 1))
 
     def ghost_at(self, at: QtCore.QPointF) -> GhostPage | None:
@@ -1095,6 +1334,8 @@ class Ream(QtWidgets.QMainWindow):
         if index == self.page:
             return
         self.page = index
+        if self.page_strip is not None:
+            self.page_strip.update()
         self._drop_overlay()
         self._place_sheet()
         if self.live():
@@ -1172,8 +1413,14 @@ class Ream(QtWidgets.QMainWindow):
         moved to its first line so writing carries on there.  Past the last
         page waits a blank one; click it to start writing on it."""
         if self.layout == "spread":
-            left, _right = self.spread_of(self.page)
-            target = (left + 2 if left > 0 else 1) if delta > 0 else (left - 2 if left > 1 else 0)
+            spreads = self.spreads(max(self.sheet.pages(), self.page + 1))
+            k = self.spread_index(self.page, spreads) + (1 if delta > 0 else -1)
+            if k < 0:
+                return
+            if k >= len(spreads):
+                target = self.sheet.pages()             # the blank page after the words
+            else:
+                target = next(i for i in spreads[k] if i is not None)
         else:
             target = self.page + delta
         target = max(0, min(target, self.sheet.pages()))
@@ -1238,6 +1485,8 @@ class Ream(QtWidgets.QMainWindow):
         self._flip = {"from": self.sheet.offset, "to": target * self.sheet.H,
                       "pan": pan, "panned": 0.0}
         self.anim.start()
+        if self.page_strip is not None:
+            self.page_strip.update()
         self.view.viewport().update()
         if self.live():
             QtCore.QTimer.singleShot(self.anim.duration() + 20, self._refresh_live_preview)
@@ -1721,9 +1970,49 @@ class Ream(QtWidgets.QMainWindow):
         if kind == "text" and self._pending_key:
             data, self._pending_key = self._pending_key, None
             self._joining = True            # Qt may announce one block twice
+        if self._group is not None:
+            # inside a grouped edit: the words' edits are joined into one Qt
+            # undo step, so they count once
+            if kind == "text" and any(k == "text" for k, _d in self._group):
+                return
+            self._group.append((kind, data))
+            return
         self.history.append((kind, data))
         del self.history[:-400]
         self.future.clear()
+
+    @contextmanager
+    def grouped(self):
+        """One undo step for an edit that changes the words and the things
+        (moving, adding, removing pages)."""
+        self._group = []
+        try:
+            yield
+        finally:
+            entries, self._group = self._group, None
+            if entries:
+                self.history.append(("group", entries))
+                del self.history[:-400]
+                self.future.clear()
+
+    def _step(self, kind: str, data, back: bool):
+        """Undo (back) or redo one entry; returns the entry that reverses it."""
+        if kind == "group":
+            order = reversed(data) if back else data
+            done = [self._step(k, d, back) for k, d in order]
+            return ("group", list(reversed(done)))
+        if kind == "text":
+            self.doc.undo() if back else self.doc.redo()
+            return ("text", None)
+        if kind == "note":
+            note = self.things.get(data)
+            if note is not None and note.alive:
+                doc = note.editor.document()
+                doc.undo() if back else doc.redo()
+            return ("note", data)
+        now = self.snapshot()
+        self.restore(data)
+        return ("things", now)
 
     def undo(self):
         if not self.history:
@@ -1732,20 +2021,10 @@ class Ream(QtWidgets.QMainWindow):
         kind, data = self.history.pop()
         self._undoing = True
         try:
-            if kind == "text":
-                self.doc.undo()
-                self.future.append(("text", None))
-            elif kind == "note":
-                note = self.things.get(data)
-                if note is not None and note.alive:
-                    note.editor.document().undo()
-                self.future.append(("note", data))
-            else:
-                self.future.append(("things", self.snapshot()))
-                self.restore(data)
+            self.future.append(self._step(kind, data, back=True))
         finally:
             self._undoing = False
-        if kind == "text":
+        if kind in ("text", "group"):
             self.caret_moved()
         self.changed()
 
@@ -1755,20 +2034,10 @@ class Ream(QtWidgets.QMainWindow):
         kind, data = self.future.pop()
         self._undoing = True
         try:
-            if kind == "text":
-                self.doc.redo()
-                self.history.append(("text", None))
-            elif kind == "note":
-                note = self.things.get(data)
-                if note is not None and note.alive:
-                    note.editor.document().redo()
-                self.history.append(("note", data))
-            else:
-                self.history.append(("things", self.snapshot()))
-                self.restore(data)
+            self.history.append(self._step(kind, data, back=False))
         finally:
             self._undoing = False
-        if kind == "text":
+        if kind in ("text", "group"):
             self.caret_moved()
         self.changed()
 
@@ -2686,6 +2955,7 @@ class Ream(QtWidgets.QMainWindow):
                          ("new", self.new_profile), ("delete", self.delete_profile)])
 
     def _refresh_panels(self):
+        self._refresh_pages_panel()
         for panel in (self.distress_panel, self.page_panel):
             if panel is not None and panel.isVisible():
                 panel.refresh()
@@ -2812,6 +3082,39 @@ class Ream(QtWidgets.QMainWindow):
             self.distress_panel.close_panel()
         else:
             self.open_distress_panel()
+
+    def build_pages_panel(self) -> Panel:
+        panel = Panel(self, "pages", on_tab=self.open_palette)
+        panel.links("", [("+ page", self.add_page), ("delete page", self.delete_page)])
+        panel.toggle("cover", lambda: self.fmt.cover, lambda v: self.set_covers(cover=v))
+        panel.toggle("back cover", lambda: self.fmt.back_cover, lambda v: self.set_covers(back=v))
+        self.page_strip = PageStrip(self)
+        panel.widget(self.page_strip, self.page_strip.refresh)
+        panel.buttons([("one page", partial(self.set_layout, "single")),
+                       ("spread", partial(self.set_layout, "spread")),
+                       ("all", partial(self.set_layout, "all"))])
+        return panel
+
+    def toggle_pages_panel(self):
+        if self.pages_panel is None:
+            self.pages_panel = self.build_pages_panel()
+        if self.pages_panel.isVisible():
+            self.pages_panel.close_panel()
+            return
+        others = [p for p in (self.page_panel, self.distress_panel) if p is not None]
+        fresh = not self.pages_panel.placed
+        self.pages_panel.open()
+        if fresh:                                   # the left side, like InDesign's pages
+            self.pages_panel.move(20, 20)
+            for other in others:
+                if other.isVisible() and self.pages_panel.geometry().intersects(other.geometry()):
+                    self.pages_panel.move(other.x() - self.pages_panel.width() - 12, other.y())
+            self.pages_panel.keep_inside()
+
+    def _refresh_pages_panel(self):
+        if self.pages_panel is not None and self.pages_panel.isVisible():
+            self.pages_panel.refresh()
+            self.pages_panel.fit_height()
 
     def toggle_page_panel(self):
         if self.page_panel is not None and self.page_panel.isVisible():
@@ -3073,7 +3376,8 @@ class Ream(QtWidgets.QMainWindow):
             return
         self.save_timer.start()
         if (self.distress_panel and self.distress_panel.isVisible()) or \
-                (self.page_panel and self.page_panel.isVisible()):
+                (self.page_panel and self.page_panel.isVisible()) or \
+                (self.pages_panel and self.pages_panel.isVisible()):
             self._panel_timer.start()
         self._refresh_ghosts()
         if self.live():
@@ -3142,6 +3446,17 @@ class Ream(QtWidgets.QMainWindow):
         out += [
             C("add image or pdf", self.browse_files, "⌘O", "import place insert"),
             C("new page", self.new_page, "⌘↵", "page break"),
+            C("pages panel", self.toggle_pages_panel, "⌥⌘P",
+              "pages thumbnails reorder spreads indesign"),
+            C("add page", self.add_page, "", "insert blank page after this one"),
+            C("delete page", self.delete_page, "", "remove this page"),
+            C("move page", None, f"{self.page + 1}", "reorder to position", fill="move page "),
+            C("cover off" if self.fmt.cover else "cover on",
+              partial(self.set_covers, cover=not self.fmt.cover), "on" if self.fmt.cover else "off",
+              "first page alone spreads"),
+            C("back cover off" if self.fmt.back_cover else "back cover on",
+              partial(self.set_covers, back=not self.fmt.back_cover),
+              "on" if self.fmt.back_cover else "off", "last page alone spreads"),
             C("next page", partial(self.turn_page, 1), "⌘→", "turn"),
             C("previous page", partial(self.turn_page, -1), "⌘←", "turn back"),
             C("go to page", None, f"{self.page + 1}", "jump", fill="page "),
@@ -3259,6 +3574,11 @@ class Ream(QtWidgets.QMainWindow):
         return out
 
     def dynamic(self, text: str) -> list[Command]:
+        moving = re.match(r"^\s*move page\s+(\d+)\s*$", text, re.IGNORECASE)
+        if moving:
+            to = int(moving.group(1))
+            return [Command(f"move page {self.page + 1} → {to}",
+                            partial(self.move_page, self.page, max(0, to - 1)), "", key="move-page")]
         named = re.match(r"^\s*save profile\s+(\S.*?)\s*$", text, re.IGNORECASE)
         if named:
             name = named.group(1)
@@ -3363,6 +3683,7 @@ class Ream(QtWidgets.QMainWindow):
             ("Ctrl+=", partial(self.zoom_step, 1.25)), ("Ctrl++", partial(self.zoom_step, 1.25)),
             ("Ctrl+-", partial(self.zoom_step, 0.8)), ("Ctrl+Q", self.close),
             ("Ctrl+Shift+F", self.toggle_write_mode),
+            ("Ctrl+Alt+P", self.toggle_pages_panel),
             ("Ctrl+;", self.toggle_spelling),
         ]
         for keys, slot in bindings:
@@ -3386,6 +3707,7 @@ class Ream(QtWidgets.QMainWindow):
                 panel.keep_inside()
 
     def closeEvent(self, event):
+        self.view.closing = True
         for which, host in getattr(self, "plugins", []):
             if getattr(which, "active", False):
                 try:
@@ -3409,6 +3731,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version", version=f"ream {__version__}")
     args = parser.parse_args(argv)
 
+    # leave Qt's objects to the OS at exit: tearing them down from Python can
+    # deliver events to half-destroyed widgets (an occasional crash on quit)
+    from PyQt5 import sip
+    sip.setdestroyonexit(False)
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
     app = QtWidgets.QApplication(sys.argv[:1])
@@ -3416,7 +3742,9 @@ def main(argv: list[str] | None = None) -> int:
     window = Ream([os.path.abspath(p) for p in args.paths], theme=args.theme)
     window.show()
     window.raise_()
-    return app.exec_()
+    code = app.exec_()
+    window.view.closing = True
+    return code
 
 
 if __name__ == "__main__":

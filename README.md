@@ -84,6 +84,31 @@ page's own words or anything else.
 Blocks always take the document's face, size, line height and paragraph
 spacing, and change with them.
 
+### Pages panel
+
+`⌥⌘P` (or **pages panel** in the palette) opens InDesign's Pages panel, more
+or less: every page as a thumbnail, in spreads, the current one outlined.
+
+- **Going to a page:** click its thumbnail (double-click also fits it to the
+  window).
+- **Reordering:** drag a thumbnail. A bar shows where it will land.
+- **+ page** adds an empty page after the current one; **delete page** removes
+  it, with whatever is pinned to it.
+- **cover** and **back cover** set how pages pair into spreads (below).
+- **one page / spread / all** switch the view.
+
+The palette has the same, plus `move page 3` to send the current page to
+position 3.
+
+**Pages become fixed when you rearrange them.** Normally the words flow: a
+paragraph running past a page's foot carries on at the head of the next. The
+first time you move, add or delete a page, every page boundary becomes a
+fixed page break, splitting a paragraph there if it has to, and each page's
+words then stay on that page, like separate text frames in InDesign.
+
+- Images and text blocks pinned to a page go with it.
+- Each move, add or delete is one undo step.
+
 ### Write mode
 
 `⇧⌘F` (or **write mode** in the palette) is for writing. It:
@@ -141,10 +166,16 @@ remembered.
 Pressing the key of the view you are in goes back to one page. Each view frames
 itself when you switch, and `⌘0` re-frames it.
 
-- **Spread.** Pages pair the way a book's do: the first page alone on the
-  right, then 2 | 3, 4 | 5 and so on. `⌘←` and `⌘→` turn a whole spread.
-- **All pages.** Every page is numbered underneath; the live one is marked
-  with a dot.
+- **Spread.** Pages pair the way a book's do. `⌘←` and `⌘→` turn a whole
+  spread.
+- **All pages.** Laid out like the pages panel: one spread a row, facing
+  pages touching, every spine on one line down the middle. Each page is
+  numbered underneath, or beside its spread when zoomed out too far for that.
+  The live page is marked with a dot.
+- **Covers.** With **cover** on (the default), the first page stands alone on
+  the right, then 2 | 3, 4 | 5 … With it off: 1 | 2, 3 | 4 … With **back
+  cover** on, the last page stands alone on the left. Both are in the pages
+  panel and the palette, and are saved with the document (and in profiles).
 - **You keep writing in every view.** The page holding the caret is the live
   one. Click any other page and it becomes live, with the caret where you
   clicked. Typing past the foot of a page carries on into the next one,
@@ -241,7 +272,7 @@ the number.
 | Export | export pdf (`⌘E`), export pdf · clean (`⇧⌘E`), export png pages |
 | Distress | distress view (`⇧⌘D`), distress on/off, distress images on/off, style · …, fade texture · …, reset distress |
 | Page and type | page size · a4 / letter / a5 / square, paper · white / cream / newsprint / bond, paper colour…, canvas colour…, font · … |
-| Pages | new page, next page (`⌘→`), previous page (`⌘←`), go to page |
+| Pages | pages panel (`⌥⌘P`), add page, delete page, move page, cover on/off, back cover on/off, new page, next page (`⌘→`), previous page (`⌘←`), go to page |
 | Views | write mode (`⇧⌘F`), write zoom, spelling on/off (`⌘;`), spelling language · …, edit dictionary, one page (`⌘1`), spread (`⌘2`), all pages (`⌘3`), fit page (`⌘0`) |
 | Look | theme · paper / white / night |
 | Selection (images and text blocks) | duplicate, mirror ↔ / ↕, arrange, merge, reset mask, rotate 90° right / left, rotate, straighten, delete, bring forward (`⌘]`), send backward (`⌘[`), bring to front (`⇧⌘]`), send to back (`⇧⌘[`), unpin from page, fit to text width, natural size |
@@ -627,6 +658,7 @@ Choosing a theme sets its canvas colour. Any colour from the page panel or
 | --- | --- |
 | `src/ream/app.py` | the window: input, page turning, pinning, undo, palette commands, saving, export |
 | `src/ream/page.py` | the sheet, the strip of pages behind it, the text editor, images |
+| `src/ream/pages.py` | the pages panel's strip: thumbnails in spreads, drag to reorder |
 | `src/ream/canvas.py` | the infinite canvas: navigation, input routing, overlay drawing |
 | `src/ream/palette.py` | the Tab command palette |
 | `src/ream/panel.py` | the slider panels |

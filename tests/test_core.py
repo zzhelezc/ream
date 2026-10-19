@@ -24,6 +24,9 @@ from ream import distress, export, project  # noqa: E402
 from ream.app import Ream  # noqa: E402
 from ream.page import Note  # noqa: E402
 
+from PyQt5 import sip  # noqa: E402
+
+sip.setdestroyonexit(False)
 app = QtWidgets.QApplication([])
 PARA = ("The refusal to labour is a weapon; a page is where it is written down. "
         "Each line is fed through the platen and struck in one pass. ") * 3
@@ -658,7 +661,9 @@ def test_spread_and_all_pages():
     assert w.layout == "all" and len(w.ghosts) == w.sheet.pages() - 1
     xs = {round(g.pos().x()) for g in w.ghosts.values()} | {round(w.sheet.pos().x())}
     ys = {round(g.pos().y()) for g in w.ghosts.values()} | {round(w.sheet.pos().y())}
-    assert len(xs) > 1 and len(ys) > 1, (xs, ys)          # a grid, not a row
+    W = round(w.sheet.W)
+    assert xs <= {-W, 0}, xs                              # left or right of one spine
+    assert len(ys) == len(w.spreads()), (ys, w.spreads())  # one spread a row
     seen = w.view.visible_scene_rect()
     assert seen.contains(w.layout_rect()), "the whole grid is framed"
     QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_3, QtCore.Qt.ControlModifier)
@@ -1327,6 +1332,113 @@ def test_spelling_in_write_mode():
 def spelling_known_fresh(word: str) -> bool:
     from ream import spelling
     return spelling.Speller("en-gb").known(word)
+
+
+def page_heads(w) -> list[str]:
+    """The first few words of each page."""
+    heads = []
+    for index in range(w.sheet.text_pages()):
+        pos = w._first_position_on(index)
+        if pos is None:
+            heads.append("")
+            continue
+        block = w.doc.findBlock(pos)
+        heads.append(block.text()[pos - block.position():][:12])
+    return heads
+
+
+def test_pages_move_add_delete():
+    w = fresh()
+    type_paragraphs(w, 30)
+    w.flip(0)
+    pump()
+    pages = w.sheet.pages()
+    assert pages >= 4
+    heads = page_heads(w)
+    words = sorted(w.doc.toPlainText().split())
+    # an image pinned to page 2
+    w.flip(1)
+    pump()
+    w.add_files([make_png(os.path.join(TMP, "p2.png"))], w.sheet.scene_page_rect().center())
+    (picture,) = [t for t in w.things.values() if t.alive]
+    assert w._page_of(picture) == 1
+    # move page 2 to the end
+    w.move_page(1, pages - 1)
+    after = page_heads(w)
+    assert w.sheet.pages() == pages
+    assert after[pages - 1] == heads[1], (after, heads)
+    assert after[1] == heads[2]
+    assert w._page_of(picture) == pages - 1, "pinned things go with their page"
+    assert sorted(w.doc.toPlainText().split()) == words, "no word lost"
+    # one undo puts the words and the picture back
+    w.undo()
+    assert page_heads(w)[1] == heads[1] and w._page_of(picture) == 1
+    w.redo()
+    assert page_heads(w)[pages - 1] == heads[1] and w._page_of(picture) == pages - 1
+    w.undo()
+    # a new page after the first: everything after moves down one
+    w.add_page(0)
+    assert w.sheet.pages() == pages + 1
+    assert page_heads(w)[2] == heads[1] and w._page_of(picture) == 2
+    assert w.page == 1
+    w.undo()
+    assert w.sheet.pages() == pages and w._page_of(picture) == 1
+    # deleting page 2 takes its words and its picture
+    w.delete_page(1)
+    assert w.sheet.pages() == pages - 1 and not picture.alive
+    assert page_heads(w)[1] == heads[2]
+    w.undo()
+    assert picture.alive and page_heads(w)[1] == heads[1]
+    w.close()
+
+
+def test_spreads_covers_and_pages_panel():
+    w = fresh()
+    w.fmt.cover, w.fmt.back_cover = True, False
+    assert w.spreads(6) == [(None, 0), (1, 2), (3, 4), (5, None)]
+    assert w.spreads(5) == [(None, 0), (1, 2), (3, 4)]
+    w.fmt.back_cover = True
+    assert w.spreads(5) == [(None, 0), (1, 2), (3, None), (4, None)]
+    assert w.spreads(6) == [(None, 0), (1, 2), (3, 4), (5, None)]
+    w.fmt.cover = False
+    assert w.spreads(5) == [(0, 1), (2, 3), (4, None)]
+    w.fmt.back_cover = False
+    assert w.spreads(4) == [(0, 1), (2, 3)]
+    w.set_covers(cover=True, back=False)
+    type_paragraphs(w, 30)
+    w.set_layout("all")
+    pump(0.1)
+    W = w.sheet.W
+    assert abs(w.slot(0).x()) < 0.01, "the cover stands on the right of the spine"
+    assert abs(w.slot(1).x() + W) < 0.01 and abs(w.slot(2).x()) < 0.01, "facing pages touch"
+    assert w.slot(1).y() == w.slot(2).y() > w.slot(0).y(), "one spread a row, like the panel"
+    assert w.slot(3).y() > w.slot(1).y()
+    w.set_layout("single")
+    # the pages panel: a thumbnail per page; dragging page 1 after page 3 moves it
+    w.toggle_pages_panel()
+    pump(0.1)
+    strip = w.page_strip
+    assert w.pages_panel.isVisible() and len(strip.rects()) == w.sheet.pages()
+    heads = page_heads(w)
+    rects = strip.rects()
+    start = rects[0].center()
+    end = QtCore.QPoint(rects[2].right() - 2, rects[2].center().y())
+    QtTest.QTest.mousePress(strip, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, start)
+    for k in range(1, 9):
+        p = start + (end - start) * (k / 8.0)
+        QtWidgets.QApplication.sendEvent(strip, QtGui.QMouseEvent(
+            QtCore.QEvent.MouseMove, QtCore.QPointF(p), QtCore.Qt.LeftButton,
+            QtCore.Qt.LeftButton, QtCore.Qt.NoModifier))
+    QtTest.QTest.mouseRelease(strip, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, end)
+    pump(0.1)
+    assert page_heads(w)[2] == heads[0] and page_heads(w)[0] == heads[1]
+    # clicking a thumbnail goes to that page
+    QtTest.QTest.mouseClick(strip, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+                            strip.rects()[3].center())
+    pump()
+    assert w.page == 3
+    w.grab()
+    w.close()
 
 
 def main() -> int:
