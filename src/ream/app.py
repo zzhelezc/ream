@@ -36,7 +36,7 @@ from pathlib import Path
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from . import __version__, distress, export, papers, plugin, profiles, project, style
+from . import __version__, distress, export, papers, plugin, profiles, project, spelling, style
 from .canvas import CanvasView
 from .page import GhostPage, Note, NoteText, Sheet, Thing, draw_stock
 from .palette import Command, CommandPalette
@@ -144,6 +144,7 @@ class Ream(QtWidgets.QMainWindow):
         self.active_tool = None                     # a plugin's canvas tool, until Esc
         self.write_mode = False
         self._before_write: tuple | None = None
+        self._speller: spelling.Speller | None = None
         self._follow_anim = QtCore.QVariantAnimation(self)
         self._follow_anim.setDuration(180)
         self._follow_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
@@ -511,6 +512,9 @@ class Ream(QtWidgets.QMainWindow):
                 painter.drawText(QtCore.QPointF(box.left(), box.bottom() + 18), label)
         if self.write_mode:
             tag = f"write · {self.view.zoom() * 100:.0f}%"
+            if self.spelling_on():
+                count = len({(m[1], m[3]) for m in self.spelling_marks()})
+                tag += f" · spelling {count}" if count else " · spelling ✓"
             area = QtCore.QRectF(self.view.viewport().rect()).adjusted(18, 0, -18, -16)
             painter.drawText(area, QtCore.Qt.AlignRight | QtCore.Qt.AlignBottom, tag)
         if self.preview is not None:
@@ -534,6 +538,7 @@ class Ream(QtWidgets.QMainWindow):
             painter.drawEllipse(knob, 4.0, 4.0)
             painter.drawRect(self._handle_rect(corners[2]))
         self._paint_live_caret(painter)
+        self._paint_spelling(painter)
         if self.active_tool is not None:
             painter.save()
             self.active_tool.paint(painter, transform)
@@ -1286,7 +1291,8 @@ class Ream(QtWidgets.QMainWindow):
         self._write_follow(force=True, animate=False)
         if self.editing is None:
             self.focus_text()
-        self.toast(f"write mode · {self.write_zoom() * 100:.0f}% · ⇧⌘F or Esc to leave")
+        spell = f" · spelling: {self.spelling_summary()}" if self.spelling_on() else ""
+        self.toast(f"write mode · {self.write_zoom() * 100:.0f}%{spell} · ⇧⌘F or Esc to leave")
 
     def leave_write_mode(self):
         if not self.write_mode:
@@ -1365,6 +1371,166 @@ class Ream(QtWidgets.QMainWindow):
         self.view.centerOn(point)
         self.view_changed()
         self.view.viewport().update()
+
+    # -- spelling --------------------------------------------------------------
+    def spelling_on(self) -> bool:
+        return bool(self.prefs.get("spelling", True))
+
+    def speller(self) -> spelling.Speller:
+        language = self.prefs.get("spelling_language", "en-gb")
+        if self._speller is None or self._speller.language != language:
+            self._speller = spelling.Speller(language)
+        return self._speller
+
+    def toggle_spelling(self):
+        on = not self.spelling_on()
+        self.prefs["spelling"] = on
+        self._write_prefs()
+        if not on:
+            self.toast("spelling off")
+        elif not self.write_mode:
+            self.toast("spelling on · it shows in write mode (⇧⌘F)")
+        else:
+            self.toast(f"spelling on · {self.spelling_summary()}")
+        self.view.viewport().update()
+
+    def spelling_summary(self) -> str:
+        """What the checker found on screen, in words: so a clean page says so."""
+        count = len({(m[1], m[3]) for m in self.spelling_marks()})
+        if count == 0:
+            return "nothing to correct on screen"
+        return f"{count} word{'s' if count != 1 else ''} to check · right-click one"
+
+    def set_spelling_language(self, language: str):
+        self.prefs["spelling_language"] = language
+        self._write_prefs()
+        self._speller = None
+        self.toast(f"spelling · {spelling.LANGUAGES.get(language, language)}")
+        self.view.viewport().update()
+
+    def _spell_editors(self) -> list:
+        """The text that can be spell-checked, with the page rect it is
+        clipped to (None: not clipped): the page's words, and the text blocks."""
+        page = self.sheet.scene_page_rect()
+        out = [(self.sheet.text, page)]
+        for thing in self.things.values():
+            if isinstance(thing, Note) and thing.alive:
+                out.append((thing.editor, page if thing.pinned else None))
+        return out
+
+    def spelling_marks(self) -> list[tuple]:
+        """(editor, start, end, word, [view-space underline segments], clip)
+        for each word on screen the dictionary lacks - except the one being
+        typed.  Only in write mode, with spelling on."""
+        if not (self.write_mode and self.spelling_on()):
+            return []
+        if abs(self.sheet.offset - self.page * self.sheet.H) > 0.5:
+            return []                                   # pages sliding
+        speller = self.speller()
+        transform = self.view.viewportTransform()
+        seen = self.view.visible_scene_rect()
+        focus = self.scene.focusItem()
+        marks = []
+        for editor, clip in self._spell_editors():
+            area = seen.intersected(clip) if clip is not None else seen
+            if area.isEmpty():
+                continue
+            local = editor.mapFromScene(area).boundingRect()
+            doc = editor.document()
+            layout = doc.documentLayout()
+            first = layout.hitTest(local.topLeft(), QtCore.Qt.FuzzyHit)
+            last = layout.hitTest(local.bottomRight(), QtCore.Qt.FuzzyHit)
+            block = doc.findBlock(max(0, first))
+            end_block = doc.findBlock(max(0, last))
+            caret = editor.textCursor().position() if focus is editor else -1
+            while block.isValid():
+                origin = layout.blockBoundingRect(block).topLeft()
+                lines = block.layout()
+                for start, end, word in speller.misspelled(block.text()):
+                    if block.position() + start <= caret <= block.position() + end:
+                        continue                        # still being typed
+                    segments = []
+                    for i in range(lines.lineCount()):
+                        line = lines.lineAt(i)
+                        a = max(start, line.textStart())
+                        b = min(end, line.textStart() + line.textLength())
+                        if b <= a:
+                            continue
+                        x0 = origin.x() + line.cursorToX(a)[0]
+                        x1 = origin.x() + line.cursorToX(b)[0]
+                        y = origin.y() + line.y() + line.ascent() + 1.6
+                        segments.append((transform.map(editor.mapToScene(QtCore.QPointF(x0, y))),
+                                         transform.map(editor.mapToScene(QtCore.QPointF(x1, y)))))
+                    if segments:
+                        marks.append((editor, block.position() + start, block.position() + end,
+                                      word, segments, clip))
+                if block == end_block:
+                    break
+                block = block.next()
+        return marks
+
+    def _paint_spelling(self, painter: QtGui.QPainter):
+        marks = self.spelling_marks()
+        if not marks:
+            return
+        transform = self.view.viewportTransform()
+        painter.save()
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#d0362b"), 1.1))
+        painter.setBrush(QtCore.Qt.NoBrush)
+        for _editor, _start, _end, _word, segments, clip in marks:
+            painter.setClipping(clip is not None)
+            if clip is not None:
+                painter.setClipRect(transform.mapRect(clip))
+            for p0, p1 in segments:
+                length = max(1.0, QtCore.QLineF(p0, p1).length())
+                path = QtGui.QPainterPath(p0)
+                n = max(2, int(length / 2.2))
+                for k in range(1, n + 1):                # a little zigzag: the squiggle
+                    t = k / n
+                    path.lineTo(QtCore.QPointF(p0.x() + (p1.x() - p0.x()) * t,
+                                               p0.y() + (p1.y() - p0.y()) * t + (1.3 if k % 2 else -1.3)))
+                painter.drawPath(path)
+        painter.restore()
+
+    def _misspelling_at(self, view_pos: QtCore.QPointF):
+        reach = 18 * max(1.0, self.view.zoom())
+        for mark in self.spelling_marks():
+            for p0, p1 in mark[4]:
+                box = QtCore.QRectF(p0.x(), p0.y() - reach, p1.x() - p0.x(), reach + 4).normalized()
+                if box.adjusted(-2, -2, 2, 2).contains(view_pos):
+                    return mark
+        return None
+
+    def replace_word(self, editor, start: int, end: int, text: str):
+        cursor = QtGui.QTextCursor(editor.document())
+        cursor.setPosition(start)
+        cursor.setPosition(end, QtGui.QTextCursor.KeepAnchor)
+        cursor.insertText(text)
+        editor.setTextCursor(cursor)
+        if editor is self.sheet.text:
+            self.focus_text()
+        self.view.viewport().update()
+
+    def context_menu(self, global_pos: QtCore.QPoint, view_pos: QtCore.QPointF):
+        """Right-click: the palette - with spelling suggestions first when the
+        click is on a flagged word."""
+        mark = self._misspelling_at(view_pos)
+        if mark is None:
+            self.open_palette(global_pos)
+            return
+        editor, start, end, word, _segments, _clip = mark
+        speller = self.speller()
+        first = [Command(f"→ {s}", partial(self.replace_word, editor, start, end, s), word,
+                         key=f"spell:{s}") for s in speller.suggestions(word)]
+        first.append(Command(f"add “{word}” to dictionary",
+                             lambda: (speller.add(word), self.view.viewport().update(),
+                                      self.toast(f"“{word}” added to your dictionary")),
+                             "", key="spell:add"))
+        first.append(Command(f"ignore “{word}”",
+                             lambda: (speller.ignore(word), self.view.viewport().update()),
+                             "this session", key="spell:ignore"))
+        self.open_palette(global_pos, first=first)
 
     def keep_caret_in_view(self):
         top, bottom = self.sheet.caret_span()
@@ -2927,14 +3093,15 @@ class Ream(QtWidgets.QMainWindow):
             self.toast(f"could not save: {exc}")
 
     # -- palette -------------------------------------------------------------
-    def open_palette(self, global_pos: QtCore.QPoint | None = None, text: str = ""):
+    def open_palette(self, global_pos: QtCore.QPoint | None = None, text: str = "",
+                     first: list | None = None):
         """The palette always opens in the middle of the window.  Things it
         adds (images, paste) still land where the pointer was."""
         pointer = self.view.mapFromGlobal(global_pos or QtGui.QCursor.pos())
         self.palette_at = (self.view.mapToScene(pointer)
                            if self.view.viewport().rect().contains(pointer) else None)
         centre = self.view.mapToGlobal(self.view.viewport().rect().center())
-        self.palette.popup(centre, text, centred=True)
+        self.palette.popup(centre, text, centred=True, first=first)
 
     def caption(self) -> str:
         words = len(self.doc.toPlainText().split())
@@ -3018,6 +3185,13 @@ class Ream(QtWidgets.QMainWindow):
               "focus typewriter zoom centre scroll follow writing"),
             C("write zoom", None, f"{self.write_zoom() * 100:.0f} %", "write mode zoom size",
               fill="write "),
+            C("spelling off" if self.spelling_on() else "spelling on", self.toggle_spelling, "⌘;",
+              "spell check spellcheck write mode dictionary"),
+            *[C(f"spelling language · {label}", partial(self.set_spelling_language, code),
+                "●" if code == self.prefs.get("spelling_language", "en-gb") else "",
+                "spell check dictionary")
+              for code, label in spelling.LANGUAGES.items()],
+            C("edit dictionary", self._edit_dictionary, "", "spelling personal words"),
             C("fit page", self.fit_layout, "⌘0", "zoom view spread all"),
             C("actual size", self.actual_size, "", "zoom 100"),
             C("one page", partial(self.set_layout, "single"), "⌘1", "single view layout"),
@@ -3136,6 +3310,13 @@ class Ream(QtWidgets.QMainWindow):
             self.toast(f"plugin · {which.name} failed: {exc}")
         self.view.viewport().update()
 
+    def _edit_dictionary(self):
+        path = spelling.home() / "dictionary.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+        self._speller = None                         # read it again next time
+
     def _show_plugins_folder(self):
         folder = plugin.user_folder()
         folder.mkdir(parents=True, exist_ok=True)
@@ -3182,6 +3363,7 @@ class Ream(QtWidgets.QMainWindow):
             ("Ctrl+=", partial(self.zoom_step, 1.25)), ("Ctrl++", partial(self.zoom_step, 1.25)),
             ("Ctrl+-", partial(self.zoom_step, 0.8)), ("Ctrl+Q", self.close),
             ("Ctrl+Shift+F", self.toggle_write_mode),
+            ("Ctrl+;", self.toggle_spelling),
         ]
         for keys, slot in bindings:
             action = QtWidgets.QAction(self)

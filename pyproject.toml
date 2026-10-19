@@ -19,10 +19,11 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.24",
-    "opencv-python-headless>=4.8",   # distance fields, blurs, resampling for distress
-    "pypdfium2>=4.20",               # rendering PDF pages dropped on the canvas
-    "psd-tools>=1.9",                # reading the Distressor's texture patterns
+    "opencv-python-headless>=4.8", # distance fields, blurs, resampling for distress
+    "pypdfium2>=4.20", # rendering PDF pages dropped on the canvas
+    "psd-tools>=1.9", # reading the Distressor's texture patterns
     "PyQt5>=5.15",
+    "pyspellchecker>=0.9.1",
 ]
 
 [project.optional-dependencies]

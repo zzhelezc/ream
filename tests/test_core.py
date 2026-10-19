@@ -1259,6 +1259,76 @@ def test_stik_islands_border_mirror_merge_export_and_save():
     w2.close()
 
 
+def test_spelling_in_write_mode():
+    try:
+        os.remove(os.path.join(os.environ["REAM_HOME"], "dictionary.txt"))
+    except OSError:
+        pass
+    w = fresh()
+    w.prefs["spelling"] = True
+    w.prefs["spelling_language"] = "en-gb"
+    cursor = w.sheet.text.textCursor()
+    cursor.insertText("The colour of teh page is writting itself. Zhulien was here.\n")
+    w.sheet.text.setTextCursor(cursor)
+    assert w.spelling_marks() == [], "only in write mode"
+    w.enter_write_mode()
+    pump(0.3)
+    words = sorted(m[3] for m in w.spelling_marks())
+    assert words == ["Zhulien", "teh", "writting"], words
+    assert w.spelling_summary().startswith("3 words to check")
+    w.grab()                                            # draws the squiggles
+    # the word being typed is left alone until it is finished
+    QtTest.QTest.keyClicks(w.view, "mispeled")
+    assert "mispeled" not in [m[3] for m in w.spelling_marks()]
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Space)
+    assert "mispeled" in [m[3] for m in w.spelling_marks()]
+    # right-click on a flagged word: suggestions first; one replaces the word
+    mark = [m for m in w.spelling_marks() if m[3] == "writting"][0]
+    p0, p1 = mark[4][0]
+    spot = QtCore.QPointF((p0.x() + p1.x()) / 2, p0.y() - 4)
+    w.context_menu(w.view.viewport().mapToGlobal(spot.toPoint()), spot)
+    pump(0.05)
+    assert w.palette.isVisible() and w.palette.shown[0].title == "→ writing"
+    w.palette.hide()
+    w.palette.shown[0].run()
+    assert "is writing itself" in w.doc.toPlainText()
+    w.undo()
+    assert "writting" in w.doc.toPlainText()
+    # add to the dictionary: gone now, and for good
+    w.speller().add("Zhulien")
+    assert "Zhulien" not in [m[3] for m in w.spelling_marks()]
+    assert "Zhulien" in open(os.path.join(os.environ["REAM_HOME"], "dictionary.txt")).read()
+    assert spelling_known_fresh("Zhulien")
+    # text blocks are checked too
+    page = w.sheet.scene_page_rect()
+    note = w.new_note(QtCore.QPointF(page.left() + 120, page.top() + 300))
+    note.editor.textCursor().insertText("an exampel")
+    w.finish_editing()
+    w.focus_text()
+    assert "exampel" in [m[3] for m in w.spelling_marks()]
+    # Cmd+; turns it off (and on)
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Semicolon, QtCore.Qt.ControlModifier)
+    assert not w.spelling_on() and w.spelling_marks() == []
+    w.toggle_spelling()
+    assert w.spelling_on()
+    w.leave_write_mode()
+    assert w.spelling_marks() == []
+    w.close()
+    # a page with nothing wrong says so, rather than showing nothing
+    clean = fresh()
+    clean.prefs["spelling"] = True
+    clean.sheet.text.textCursor().insertText("Every word here is spelled right.")
+    clean.enter_write_mode()
+    pump(0.2)
+    assert clean.spelling_marks() == [] and clean.spelling_summary() == "nothing to correct on screen"
+    clean.close()
+
+
+def spelling_known_fresh(word: str) -> bool:
+    from ream import spelling
+    return spelling.Speller("en-gb").known(word)
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in globals().items() if name.startswith("test_")]
     failed = 0

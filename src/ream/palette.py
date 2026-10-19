@@ -182,8 +182,12 @@ class CommandPalette(QtWidgets.QFrame):
         self.setFixedWidth(WIDTH)
 
     # -- showing -----------------------------------------------------------
-    def popup(self, global_pos: QtCore.QPoint, text: str = "", centred: bool = False):
-        self.commands = self.provider()
+    def popup(self, global_pos: QtCore.QPoint, text: str = "", centred: bool = False,
+              first: list[Command] | None = None):
+        """`first`: commands for this opening only, listed ahead of everything
+        (spelling suggestions for the word that was right-clicked, say)."""
+        self.first = list(first or [])
+        self.commands = self.first + self.provider()
         self.caption.setText(self.caption_text() if self.caption_text else "")
         self.query.blockSignals(True)
         self.query.setText(text)
@@ -221,7 +225,10 @@ class CommandPalette(QtWidgets.QFrame):
             recent = sorted((c for c in self.commands if c.key in order),
                             key=lambda c: order[c.key])
             rest = [c for c in self.commands if c.key not in order]
-            self.shown = recent + rest
+            firsts = [c for c in self.commands if c in getattr(self, "first", [])]
+            recent = [c for c in recent if c not in firsts]
+            rest = [c for c in rest if c not in firsts]
+            self.shown = firsts + recent + rest
         self.list.clear()
         for command in self.shown:
             item = QtWidgets.QListWidgetItem(command.title)

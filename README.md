@@ -106,6 +106,30 @@ across page turns too. The same goes for a ⌘-click text block being written.
   the pixel. A small `write · 175%` sits in the bottom-right corner while
   you're in it.
 
+### Spelling
+
+In write mode, words the dictionary doesn't know get a red squiggle. `⌘;` (or
+**spelling on/off** in the palette) turns it off and on, and the setting is
+remembered.
+
+- **Seeing it work:** the corner tag shows the state, `write · 175% ·
+  spelling ✓` when nothing on screen needs correcting and `· spelling 3` when
+  three words do. Turning spelling on, or entering write mode, says the same.
+- **Fixing a word:** right-click it. The palette opens with suggestions first
+  (**→ chief**), then **add "word" to dictionary** and **ignore "word"** (for
+  this session). A correction undoes like any edit.
+- **Never flagged:** the word you're still typing, single letters, words with
+  digits, ALL CAPS, and words with a capital inside (iPhone, McNamara).
+- **Text blocks** are checked too.
+- **The squiggles are drawn over the page, not stored in it,** so they never
+  reach a PDF or the distress render, and they show over the live distress
+  view.
+- **Languages:** **spelling language · …** in the palette: English (UK, the
+  default, which takes both British and American spellings), English (US),
+  Deutsch, Français, Español, Italiano, Português, Nederlands, Русский.
+- **Your dictionary** is `dictionary.txt` in ream's home folder, one word per
+  line (**edit dictionary** opens it).
+
 ### Spread and all pages
 
 | Key | View |
@@ -218,7 +242,7 @@ the number.
 | Distress | distress view (`⇧⌘D`), distress on/off, distress images on/off, style · …, fade texture · …, reset distress |
 | Page and type | page size · a4 / letter / a5 / square, paper · white / cream / newsprint / bond, paper colour…, canvas colour…, font · … |
 | Pages | new page, next page (`⌘→`), previous page (`⌘←`), go to page |
-| Views | write mode (`⇧⌘F`), write zoom, one page (`⌘1`), spread (`⌘2`), all pages (`⌘3`), fit page (`⌘0`) |
+| Views | write mode (`⇧⌘F`), write zoom, spelling on/off (`⌘;`), spelling language · …, edit dictionary, one page (`⌘1`), spread (`⌘2`), all pages (`⌘3`), fit page (`⌘0`) |
 | Look | theme · paper / white / night |
 | Selection (images and text blocks) | duplicate, mirror ↔ / ↕, arrange, merge, reset mask, rotate 90° right / left, rotate, straighten, delete, bring forward (`⌘]`), send backward (`⌘[`), bring to front (`⇧⌘]`), send to back (`⇧⌘[`), unpin from page, fit to text width, natural size |
 | Profiles | save profile (`⌥⌘S`), save profile as…, new profile, profile · name (`⌥⌘1`–`9`), delete profile · name |
@@ -615,4 +639,5 @@ Choosing a theme sets its canvas colour. Any colour from the page panel or
 | `src/ream/matting.py` | stik's pixel maths: background removal, wand, islands, die-cut borders |
 | `src/ream/profiles.py` | profiles: the store of named settings |
 | `src/ream/papers.py` | paper stock: the papers folder, the tooth map, laying it on a page |
+| `src/ream/spelling.py` | spelling: the dictionaries, UK spellings, your own words |
 | `src/ream/style.py` | ink, paper, themes, page sizes, faces |

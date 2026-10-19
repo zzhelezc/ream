@@ -195,7 +195,7 @@ class CanvasView(QtWidgets.QGraphicsView):
         super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event: QtGui.QContextMenuEvent):
-        self.controller.open_palette(event.globalPos())
+        self.controller.context_menu(event.globalPos(), QtCore.QPointF(event.pos()))
 
     def focusNextPrevChild(self, forward: bool) -> bool:
         return False                    # Tab is the palette, never focus travel
