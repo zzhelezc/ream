@@ -325,6 +325,86 @@ is replaced). **delete** in a panel removes the active profile; **delete
 profile · name** in the palette removes any one. Switching re-lays the page in
 one step, so `⌘Z` takes back a switch's line and paragraph spacing.
 
+## Plugins
+
+ream takes plugins: Python files that add commands, panels and canvas frames
+without touching ream itself.
+
+**Where they come from** (in this order):
+
+1. built in: `src/ream/plugins/` (the scanner lives here);
+2. yours: `.py` files or packages in
+   `~/Library/Application Support/ream/plugins/` (**show plugins folder** in
+   the palette opens it);
+3. installed: Python packages with an entry point in the `ream.plugins` group.
+
+**plugin · name** in the palette turns one off or on. The choice is
+remembered. If a plugin fails to load, a toast says so and ream carries on.
+
+**Writing one.** A plugin is a `Plugin` class with a `name` and a
+`setup(host)`:
+
+```python
+from ream.plugin import Plugin as Base
+
+class Plugin(Base):
+    name = "stamp"
+
+    def setup(self, host):
+        host.command("stamp: today", self.stamp, shortcut="Ctrl+Alt+T")
+
+    def stamp(self):
+        import time
+        self.host.place_text(time.strftime("%d.%m.%Y"))
+```
+
+`host` is the plugin's way in; see `src/ream/plugin.py` for the full API:
+
+| `host.` | does |
+| --- | --- |
+| `command(title, run, hint, keywords, shortcut)` | a palette entry, optionally with a shortcut |
+| `panel(title)` | a slider panel like ream's own: `slider`, `choice`, `toggle`, `swatches`, `links`, `buttons` |
+| `frame(label, size, paint_content=, drag_out=, on_change=)` | a frame on the canvas. You move it by its label or edge and resize it by its corner; clicks inside go through, unless it has a `drag_out`, in which case dragging from inside picks up the image it returns |
+| `render(rect, dpi)` | what is on the canvas in a rect, as RGBA numpy, without the frames |
+| `place_image(image, rect)` | put an image on the canvas (it pins if dropped on the page) |
+| `place_text(text)` | start a text block with some words in it |
+| `timer(ms, run)` | a repeating timer, stopped when ream closes |
+| `settings` / `save_settings()` | the plugin's own saved dict |
+| `toast`, `visible_rect`, `window`, `scene`, `view` | the rest |
+
+### Scanner
+
+A slit-scanner after [snitscanner.xyz](https://snitscanner.xyz). **scanner**
+in the palette opens three things:
+
+- **A · scan bed:** a frame on the canvas. Put anything in it (images, PDF
+  pages, text blocks, a corner of the page) and it gets scanned.
+- **B · scan result:** a frame of the same size, filled in as the scan line
+  crosses the bed. **Drag out of it** to pick the scan up as a new image.
+- **scanner:** a settings panel.
+
+On every tick, the strip of canvas under the blue line is copied into the
+result at the same place. Move something in the bed while the line is on it
+and it smears. Resizing either frame resizes both and starts a fresh result.
+
+| Setting | Does |
+| --- | --- |
+| ▶ scan / ■ stop, clear | run the line; start a fresh result |
+| direction | down the bed, or across it |
+| speed | 1 is a pass in eight seconds |
+| loop | start again at the end (for stacked passes) |
+| ink | colour, xerox (hard toner, high contrast) or dither (ordered, two-tone) |
+| tone | lighter … darker |
+| grain | fine … coarse: the size of noise, toner and dither cells |
+| layering, blend | replace each pass, or stack passes with darken / multiply / screen |
+| noise | grain over the scan |
+| paper | what empty bed scans as, and what xerox and dither print on |
+| dpi | the result's resolution |
+| to canvas, export png | the scan as an image beside the result, or as a file |
+
+Also in the palette: **scanner: scan / stop**, **clear result**, **result to
+canvas** and **export png**. Positions, size and settings are remembered.
+
 ## Paper stock
 
 A paper stock lays a photographed paper's surface under the page, on screen,
@@ -471,6 +551,8 @@ Choosing a theme sets its canvas colour. Any colour from the page panel or
 | `src/ream/distress.py` | finding the Distressor, extracting its textures, applying them |
 | `src/ream/export.py` | drawing pages for the PDF, PNGs and the preview |
 | `src/ream/project.py` | reading images and PDFs, the `.ream` file |
+| `src/ream/plugin.py` | plugins: the API (`Plugin`, `Host`, `Frame`) and the loader |
+| `src/ream/plugins/scanner.py` | the scanner plugin |
 | `src/ream/profiles.py` | profiles: the store of named settings |
 | `src/ream/papers.py` | paper stock: the papers folder, the tooth map, laying it on a page |
 | `src/ream/style.py` | ink, paper, themes, page sizes, faces |

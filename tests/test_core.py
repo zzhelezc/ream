@@ -983,6 +983,130 @@ def test_write_mode():
     w.close()
 
 
+def test_plugins_load_and_switch():
+    from ream import plugin
+    folder = plugin.user_folder()
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "hello.py").write_text(
+        "from ream.plugin import Plugin as Base\n"
+        "class Plugin(Base):\n"
+        "    name = 'hello'\n"
+        "    def setup(self, host):\n"
+        "        self.calls = 0\n"
+        "        host.command('hello: wave', self.wave, keywords='greet')\n"
+        "    def wave(self):\n"
+        "        self.calls += 1\n")
+    (folder / "broken.py").write_text("raise RuntimeError('nope')\n")
+    w = fresh()
+    names = {p.name: p for p, _h in w.plugins}
+    assert "scanner" in names and "hello" in names
+    assert any("broken" in e for e in w.plugin_errors)
+    titles = [c.title for c in w.commands()]
+    assert "scanner" in titles and "hello: wave" in titles and "plugin · hello" in titles
+    [c for c in w.commands() if c.title == "hello: wave"][0].run()
+    assert names["hello"].calls == 1
+    # off: its commands go, and it stays off next time
+    w.switch_plugin(names["hello"])
+    assert "hello: wave" not in [c.title for c in w.commands()]
+    assert "hello" in w.prefs["plugins_off"]
+    w.switch_plugin(names["hello"])
+    assert "hello: wave" in [c.title for c in w.commands()]
+    w.close()
+    (folder / "hello.py").unlink()
+    (folder / "broken.py").unlink()
+
+
+def scanner_of(w):
+    return [p for p, _h in w.plugins if p.name == "scanner"][0]
+
+
+def run_scan(scanner, steps: int = 400):
+    """Drive the scan without waiting for real time."""
+    scanner.start()
+    for _ in range(steps):
+        if not scanner.running:
+            break
+        scanner._last -= 0.2                  # pretend 0.2 s went by
+        scanner.tick()
+
+
+def test_scanner_scans_smears_and_drags_out():
+    w = fresh()
+    sc = scanner_of(w)
+    sc.s.update({"speed": 5.0, "ink": "colour", "noise": 0.0, "tone": 0.0, "dpi": 72.0,
+                 "direction": "down", "layering": "replace", "paper": "white", "loop": False})
+    sc.open()
+    pump(0.05)
+    assert sc.bed.isVisible() and sc.result.isVisible() and sc.panel.isVisible()
+    page = w.sheet.scene_page_rect()
+    sc.bed.setPos(page.right() + 120, page.top())          # on bare canvas
+    sc.result.setPos(page.right() + 120 + sc.bed.w + 40, page.top())
+    w.view.frame(sc.bed.scene_rect().united(sc.result.scene_rect()).adjusted(0, -40, 0, 300))
+    pump(0.05)
+    bed = sc.bed.scene_rect()
+    red = os.path.join(TMP, "red.png")
+    image = QtGui.QImage(100, 60, QtGui.QImage.Format_RGB32)
+    image.fill(QtGui.QColor("#e01010"))
+    image.save(red)
+    w.add_files([red], QtCore.QPointF(bed.left() + 90, bed.top() + 70))
+    (thing,) = [t for t in w.things.values() if t.alive]
+    thing.resize(100, 60)
+    thing.setPos(bed.left() + 40, bed.top() + 40)
+    w.clear_selection()
+    sc.clear()
+    run_scan(sc)
+    assert not sc.running and sc.pos >= sc.length()
+    buf = sc.buffer.astype(int)
+    assert buf.shape[:2] == (round(bed.height()), round(bed.width()))
+    inside = buf[50:90, 50:130]
+    assert inside[..., 0].mean() > 180 and inside[..., 1].mean() < 60, "the red picture is scanned"
+    assert buf[5:30, 5:30].min() > 245, "empty bed scans as paper"
+    still = buf.copy()
+    # smear: halfway through, the picture moves; the bottom half of it lands elsewhere
+    sc.clear()
+    sc.start()
+    while sc.pos < 70:
+        sc._last -= 0.05
+        sc.tick()
+    thing.moveBy(120, 0)
+    run_scan(sc)
+    smeared = sc.buffer.astype(int)
+    assert np.abs(smeared[40:65, 40:140] - still[40:65, 40:140]).max() < 20   # top: as it was
+    assert smeared[80:95, 50:130, 1].mean() > 200                               # bottom: moved away
+    assert smeared[80:95, 170:250, 0].mean() > 180 and smeared[80:95, 170:250, 1].mean() < 60
+    # xerox and dither
+    for ink in ("xerox", "dither"):
+        sc.s["ink"] = ink
+        sc.clear()
+        run_scan(sc)
+        tones = np.unique(sc.buffer.reshape(-1, 3), axis=0)
+        if ink == "dither":
+            assert len(tones) <= 2, tones
+        else:
+            grey = sc.buffer.mean(axis=2)
+            assert ((grey < 40) | (grey > 200)).mean() > 0.9
+    # dragging out of the result picks the scan up as a new image
+    before = len([t for t in w.things.values() if t.alive])
+    result = sc.result.scene_rect()
+    start = view_point(w, result.center())
+    drag(w, start, start + QtCore.QPoint(0, int(result.height() * w.view.zoom()) + 40))
+    alive = [t for t in w.things.values() if t.alive]
+    assert len(alive) == before + 1
+    scan = [t for t in alive if t is not thing][0]
+    assert abs(scan.w - result.width()) < 0.5 and scan.image.width() == sc.buffer.shape[1]
+    assert scan.sceneBoundingRect().top() > result.bottom()
+    # frames: moved by the label, resized by the corner - both frames together
+    label = sc.bed.label_rect(w.view.viewportTransform()).center()
+    drag(w, label.toPoint(), label.toPoint() + QtCore.QPoint(-50, 0))
+    assert sc.bed.scene_rect().left() < bed.left() - 10
+    corner = w.view.viewportTransform().map(sc.bed.scene_rect().bottomRight())
+    drag(w, corner.toPoint(), corner.toPoint() + QtCore.QPoint(60, 30))
+    assert sc.result.w == sc.bed.w > bed.width() and sc.buffer.shape[1] == round(sc.bed.w)
+    sc.close()
+    assert not sc.bed.isVisible()
+    w.close()
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in globals().items() if name.startswith("test_")]
     failed = 0

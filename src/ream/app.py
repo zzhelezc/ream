@@ -36,7 +36,7 @@ from pathlib import Path
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from . import __version__, distress, export, papers, profiles, project, style
+from . import __version__, distress, export, papers, plugin, profiles, project, style
 from .canvas import CanvasView
 from .page import GhostPage, Note, NoteText, Sheet, Thing, draw_stock
 from .palette import Command, CommandPalette
@@ -213,6 +213,11 @@ class Ream(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(0, lambda: self.add_files(others, None))
         if self.prefs.get("distress_view"):
             QtCore.QTimer.singleShot(0, lambda: self.set_distress_view(True, quiet=True))
+        # plugins last, so they find ream whole
+        self.plugins, self.plugin_errors = plugin.load_all(self)
+        if self.plugin_errors:
+            QtCore.QTimer.singleShot(400, lambda: self.toast(
+                "plugin failed · " + "; ".join(self.plugin_errors)))
 
     # -- prefs ---------------------------------------------------------------
     def _read_prefs(self) -> dict:
@@ -528,6 +533,10 @@ class Ream(QtWidgets.QMainWindow):
             painter.drawEllipse(knob, 4.0, 4.0)
             painter.drawRect(self._handle_rect(corners[2]))
         self._paint_live_caret(painter)
+        meta = style.qc(self.th()["meta"])
+        for frame in self.plugin_frames():
+            if frame.isVisible():
+                frame.paint_chrome(painter, transform, meta)
         if self.drag and self.drag.get("mode") == "rotate":
             thing = self.drag["thing"]
             painter.setPen(style.qc(self.th()["meta"]))
@@ -682,6 +691,38 @@ class Ream(QtWidgets.QMainWindow):
                 return thing, "scale"
         return None
 
+    def plugin_frames(self) -> list:
+        return [frame for _p, host in getattr(self, "plugins", []) for frame in host.frames]
+
+    def frame_at(self, view_pos: QtCore.QPointF):
+        """(frame, part) of the topmost shown plugin frame under the pointer."""
+        transform = self.view.viewportTransform()
+        for frame in sorted((f for f in self.plugin_frames() if f.isVisible()),
+                            key=lambda f: -f.zValue()):
+            part = frame.part_at(view_pos, transform)
+            if part:
+                return frame, part
+        return None
+
+    def place_qimage(self, image: QtGui.QImage, rect: QtCore.QRectF, name: str) -> Thing:
+        """A picture made by a plugin, as an image on the canvas at `rect`
+        (pinned if its middle is on a shown page).  One undo step."""
+        data = QtCore.QByteArray()
+        buffer = QtCore.QBuffer(data)
+        buffer.open(QtCore.QIODevice.WriteOnly)
+        image.save(buffer, "PNG")
+        thing = Thing(image, rect.size(), bytes(data), ".png", None, name)
+        before = self.snapshot()
+        self.things[thing.uid] = thing
+        self.scene.addItem(thing)
+        thing.setPos(rect.topLeft())
+        thing.setZValue(self.top_z() + 1.0)
+        if self.live_on(rect.center()):
+            self.pin(thing)
+        self.push("things", before)
+        self.changed()
+        return thing
+
     def pin(self, thing: Thing):
         if thing.pinned:
             return
@@ -714,6 +755,23 @@ class Ream(QtWidgets.QMainWindow):
             if self._inside(self.editing, at):
                 return False                # the note's editor places the caret
             self.finish_editing()
+        hit = self.frame_at(pos)
+        if hit is not None:
+            frame, part = hit
+            if part in ("move", "resize"):
+                self.drag = {"mode": "frame-" + part, "frame": frame, "start": at,
+                             "from": QtCore.QPointF(frame.pos()), "w": frame.w, "h": frame.h}
+                return True
+            if part == "inside" and frame.drag_out is not None:
+                image = frame.drag_out(at)
+                if image is not None and not image.isNull():
+                    # pick the picture up: a new image under the pointer, being carried
+                    self.clear_selection()
+                    thing = self.place_qimage(image, frame.scene_rect(), frame.label)
+                    self.select([thing])
+                    self.drag = {"mode": "press", "lead": thing, "start": at, "press": pos,
+                                 "before": self.snapshot()}
+                    return True
         if mods & QtCore.Qt.ControlModifier:
             # Cmd+click: write from here, over whatever is there
             hit = self.thing_at(at)
@@ -763,6 +821,15 @@ class Ream(QtWidgets.QMainWindow):
         if drag is None:
             self._hover_cursor(pos, at)
             return True
+        if drag["mode"] in ("frame-move", "frame-resize"):
+            frame, delta = drag["frame"], at - drag["start"]
+            if drag["mode"] == "frame-move":
+                frame.setPos(drag["from"] + delta)
+            else:
+                frame.set_size(drag["w"] + delta.x(), drag["h"] + delta.y())
+            frame.changed()
+            self.view.viewport().update()
+            return True
         if drag["mode"] == "press":
             if (pos - drag["press"]).manhattanLength() < 3:
                 return True
@@ -799,6 +866,10 @@ class Ream(QtWidgets.QMainWindow):
         drag, self.drag = self.drag, None
         if drag is None:
             return
+        if drag["mode"] in ("frame-move", "frame-resize"):
+            drag["frame"].changed()
+            self.view.viewport().update()
+            return
         if drag["mode"] == "move":
             carried = drag["things"]
             z = max((t.zValue() for t in self.things.values()
@@ -832,7 +903,13 @@ class Ream(QtWidgets.QMainWindow):
 
     def _hover_cursor(self, pos: QtCore.QPointF, at: QtCore.QPointF):
         viewport = self.view.viewport()
+        framed = self.frame_at(pos)
         if self.view.space_down:
+            viewport.setCursor(QtCore.Qt.OpenHandCursor)
+        elif framed is not None and framed[1] != "inside":
+            viewport.setCursor(QtCore.Qt.SizeFDiagCursor if framed[1] == "resize"
+                               else QtCore.Qt.SizeAllCursor)
+        elif framed is not None and framed[0].drag_out is not None:
             viewport.setCursor(QtCore.Qt.OpenHandCursor)
         elif self.editing is not None and self._inside(self.editing, at):
             viewport.setCursor(QtCore.Qt.IBeamCursor)
@@ -2702,6 +2779,12 @@ class Ream(QtWidgets.QMainWindow):
               for n, name in enumerate(self.profile_names(), 1)],
             *[C(f"delete profile · {name}", partial(self.delete_profile, name), "", "remove preset")
               for name in self.profile_names()],
+            *[C(title, run, hint, keywords) for p, host in self.plugins
+              if getattr(p, "active", False) for title, run, hint, keywords in host.commands],
+            *[C(f"plugin · {p.title or p.name}", partial(self.switch_plugin, p),
+                "on" if getattr(p, "active", False) else "off", f"plugins {p.where}")
+              for p, _host in self.plugins],
+            C("show plugins folder", self._show_plugins_folder, "", "plugins add your own"),
             C("new document", self.new_document, "⌘N", "blank clear"),
             C("open…", self.browse_open, "⇧⌘O", "load project"),
             C("save", self.save, "⌘S", "project"),
@@ -2757,6 +2840,20 @@ class Ream(QtWidgets.QMainWindow):
             out.append(Command(f"{name} → {value:g}", partial(self.set_param, name, value),
                                f"now {now:g}", key=f"set:{name}"))
         return out
+
+    def switch_plugin(self, which):
+        on = not getattr(which, "active", False)
+        try:
+            plugin.switch(self, which, on)
+            self.toast(f"plugin · {which.title or which.name} {'on' if on else 'off'}")
+        except Exception as exc:
+            self.toast(f"plugin · {which.name} failed: {exc}")
+        self.view.viewport().update()
+
+    def _show_plugins_folder(self):
+        folder = plugin.user_folder()
+        folder.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(folder)))
 
     def _set_theme(self, name: str):
         """A theme sets the canvas colour too."""
@@ -2821,6 +2918,14 @@ class Ream(QtWidgets.QMainWindow):
                 panel.keep_inside()
 
     def closeEvent(self, event):
+        for which, host in getattr(self, "plugins", []):
+            if getattr(which, "active", False):
+                try:
+                    which.teardown()
+                except Exception:
+                    pass
+                for timer in host.timers:
+                    timer.stop()
         self._pool.shutdown(wait=False)
         self.autosave()
         self.prefs["geometry"] = bytes(self.saveGeometry().toHex()).decode()
