@@ -571,6 +571,232 @@ def test_cmd_click_writes_anywhere():
     w.close()
 
 
+def test_design_mode_selects_instead_of_typing():
+    w = fresh()
+    w.show()
+    type_paragraphs(w, 3)
+    assert w.mode == "writer"
+    words = w.doc.toPlainText()
+    page = w.sheet.scene_page_rect()
+    viewport = w.view.viewport()
+    # ⌥⌘D: design mode - remembered
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_D, QtCore.Qt.ControlModifier | QtCore.Qt.AltModifier)
+    assert w.mode == "design" and w.prefs["mode"] == "design"
+    # a click on the page, away from the words, writes nothing and types nothing
+    corner = QtCore.QPointF(page.left() + 20, page.bottom() - 20)
+    QtTest.QTest.mouseClick(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, view_point(w, corner))
+    QtTest.QTest.keyClicks(w.view, "qq")   # (not tool letters)
+    assert w.doc.toPlainText() == words and w.editing is None and not w.story_editing
+    # a click on the words selects the main text's frame; typing still does nothing
+    over = QtCore.QPointF(page.left() + w.fmt.margin + 40, page.top() + w.fmt.head + 8)
+    QtTest.QTest.mouseClick(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, view_point(w, over))
+    assert w.story_selected and not w.story_editing
+    QtTest.QTest.keyClicks(w.view, "qq")   # (not tool letters)
+    assert w.doc.toPlainText() == words
+    w.view.grab()
+    # double-click writes there; Esc stops, leaving the frame selected
+    QtTest.QTest.mouseDClick(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, view_point(w, over))
+    assert w.story_editing
+    QtTest.QTest.keyClicks(w.view, "XY")
+    assert "XY" in w.doc.toPlainText() and w.doc.toPlainText().index("XY") < 20
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Escape)
+    assert not w.story_editing and w.story_selected
+    QtTest.QTest.keyClicks(w.view, "qq")   # (not tool letters)
+    assert "qq" not in w.doc.toPlainText()
+    # ↵ on the selected frame writes at the end
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Return)
+    assert w.story_editing
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Escape)
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Escape)
+    assert not w.story_selected
+    # T, then drag: a text box that wide, written in at once
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_T)
+    assert w.text_tool
+    a = QtCore.QPointF(page.left() + 100, page.top() + 400)
+    b = QtCore.QPointF(page.left() + 340, page.top() + 440)
+    drag(w, view_point(w, a), view_point(w, b))
+    note = w.editing
+    assert note is not None and note.pinned and not w.text_tool
+    assert abs(note.wrap - 240) < 3, note.wrap
+    assert abs(note.scenePos().x() - a.x()) < 2 and abs(note.scenePos().y() - a.y()) < 2
+    QtTest.QTest.keyClicks(w.view, "A Heading")
+    assert note.text() == "A Heading" and "Heading" not in w.doc.toPlainText()
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Escape)
+    assert w.editing is None
+    # click selects it; the text panel styles it alone
+    QtTest.QTest.mouseClick(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+                            view_point(w, note.sceneBoundingRect().center()))
+    assert w.selection() == [note]
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_T, QtCore.Qt.ControlModifier)
+    panel = w.text_panel
+    assert panel.isVisible() and "1 box" in panel.caption.text()
+    size_before = w.fmt.size
+    h_before = note.h
+    w.set_text_value("size", 24.0, slider=True)
+    w.set_text_value("size", 28.0, slider=True)          # one drag: one undo step
+    panel.on_release()
+    w.set_text_value("align", "centre")
+    w.set_text_value("font", w.face())
+    assert note.look["size"] == 28.0 and note.look["align"] == "centre"
+    assert note.editor.document().defaultFont().pointSizeF() == 28.0 and note.h > h_before * 2
+    assert w.fmt.size == size_before, "the main text keeps its type"
+    w.undo()                                             # the font
+    w.undo()                                             # the align
+    assert "align" not in note.look and note.look["size"] == 28.0
+    w.undo()                                             # the whole size drag
+    assert "size" not in note.look
+    w.redo()
+    w.redo()
+    assert note.look["size"] == 28.0 and note.look["align"] == "centre"
+    # nothing chosen: the panel styles the main text (the document's type)
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Escape)
+    assert w.text_targets() == "story" and "main text" in panel.caption.text()
+    w.set_text_value("track", 10.0)
+    w.set_text_value("align", "justify")
+    assert w.fmt.track == 10.0 and w.fmt.align == "justify"
+    assert w.doc.begin().blockFormat().alignment() & QtCore.Qt.AlignJustify
+    # a box with no look of its own follows the document; with one, keeps it
+    assert note.look["align"] == "centre"
+    # marquee: drag round the box from an empty spot
+    w.clear_selection()
+    box = note.sceneBoundingRect()
+    start = QtCore.QPointF(page.left() + 8, box.top() - 6)
+    end = QtCore.QPointF(box.right() + 6, box.bottom() + 6)
+    drag(w, view_point(w, start), view_point(w, end))
+    assert note in w.selection()
+    # the look is saved, and exported
+    state, media = w.state()
+    entry = [t for t in state["things"] if t.get("kind") == "text"][0]
+    assert entry["look"]["size"] == 28.0
+    w.load_state(state, media)
+    reloaded = [t for t in w.things.values() if isinstance(t, Note) and t.alive][0]
+    assert reloaded.look == {"size": 28.0, "align": "centre"}       # (the font step stayed undone)
+    assert reloaded.editor.document().defaultFont().pointSizeF() == 28.0
+    pdf = w.export_pdf(clean=True, path=os.path.join(TMP, "design.pdf"))
+    import pypdfium2
+    text = pypdfium2.PdfDocument(pdf)[0].get_textpage().get_text_range()
+    assert "A Heading" in text and "XY" in text
+    # write mode is writing: it takes you back to writer mode
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_F, QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier)
+    assert w.mode == "writer" and w.write_mode
+    w.leave_write_mode()
+    # writer mode as ever: a click on the page puts the caret in the words
+    QtTest.QTest.mouseClick(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, view_point(w, over))
+    QtTest.QTest.keyClicks(w.view, "Q")
+    assert "Q" in w.doc.toPlainText()
+    w.close()
+
+
+def test_style_selected_words():
+    import pypdfium2
+    from ream.page import char_props, doc_runs
+    w = fresh()
+    w.show()
+    w.distress.enabled = False
+    cursor = w.sheet.text.textCursor()
+    cursor.insertText("plain words then LOUD words then plain again")
+    w.sheet.text.setTextCursor(cursor)
+    pump(0.05)
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_T, QtCore.Qt.ControlModifier)
+    panel = w.text_panel
+    assert "main text" in panel.caption.text() and w.words_target() is None
+    # writer mode: select "LOUD" in the main text - the panel styles just it
+    start = w.doc.toPlainText().index("LOUD")
+    cursor.setPosition(start)
+    cursor.setPosition(start + 4, QtGui.QTextCursor.KeepAnchor)
+    w.sheet.text.setTextCursor(cursor)
+    w.caret_moved(follow=False)
+    assert w.words_target() == "story" and "words in the main text" in panel.caption.text()
+    steps = len(w.history)
+    w.set_text_value("weight", "bold")
+    w.set_text_value("size", 14.0, slider=True)
+    w.set_text_value("size", 18.0, slider=True)          # one drag: one step
+    w._text_panel_released()
+    assert len(w.history) == steps + 2, w.history[steps:]
+    assert w.text_value("weight") == "bold" and w.text_value("size") == 18.0
+    probe = QtGui.QTextCursor(w.doc)
+    probe.setPosition(start + 2)
+    assert char_props(probe.charFormat()) == {"weight": "bold", "size": 18.0}
+    probe.setPosition(3)
+    assert char_props(probe.charFormat()) == {}, "the rest keeps the document's type"
+    assert w.fmt.size == 9.0
+    # the document's type changing leaves the styled words their own
+    w.set_size(10)
+    probe.setPosition(start + 2)
+    assert char_props(probe.charFormat())["size"] == 18.0
+    w.set_size(9)
+    # undo: the size drag, then the bold
+    w.undo()
+    w.undo()        # (the two set_size calls)
+    w.undo()
+    probe.setPosition(start + 2)
+    assert char_props(probe.charFormat()) == {"weight": "bold"}, char_props(probe.charFormat())
+    w.redo()
+    probe.setPosition(start + 2)
+    assert char_props(probe.charFormat()) == {"weight": "bold", "size": 18.0}
+    # bold off again means "as the text": the property goes, not "regular" set
+    cursor.setPosition(start)
+    cursor.setPosition(start + 4, QtGui.QTextCursor.KeepAnchor)
+    w.sheet.text.setTextCursor(cursor)
+    w.set_text_value("italic", True)
+    w.set_text_value("italic", False)
+    probe.setPosition(start + 2)
+    assert "italic" not in char_props(probe.charFormat())
+    # nothing selected: weight on the main text is refused politely
+    cursor.clearSelection()
+    w.sheet.text.setTextCursor(cursor)
+    w.set_text_value("weight", "bold")
+    assert not w.doc.begin().charFormat().hasProperty(QtGui.QTextFormat.FontWeight)
+    # design mode: words inside a text box
+    w.set_mode("design")
+    page = w.sheet.scene_page_rect()
+    note = w.new_note(QtCore.QPointF(page.left() + 80, page.top() + 300), wrap=300.0, top=True)
+    QtTest.QTest.keyClicks(w.view, "a title with one word big")
+    ed = note.editor.textCursor()
+    at = note.text().index("big")
+    ed.setPosition(at)
+    ed.setPosition(at + 3, QtGui.QTextCursor.KeepAnchor)
+    note.editor.setTextCursor(ed)
+    w._refresh_text_panel()
+    assert w.words_target() is note and "words in a box" in panel.caption.text()
+    h = note.h
+    w.set_text_value("size", 36.0)
+    w.set_text_value("font", w.face())
+    assert note.h > h * 2 and not note.look, "the box's own type is untouched"
+    assert doc_runs(note.editor.document())[0][:2] == [at, 3]
+    w.undo()                                           # the font
+    assert doc_runs(note.editor.document()) == [[at, 3, {"size": 36.0}]]
+    # "as the box" clears the selected words' own type
+    w.set_text_value("track", 20.0)
+    w.reset_look()
+    assert doc_runs(note.editor.document()) == []
+    w.undo()
+    assert doc_runs(note.editor.document()) == [[at, 3, {"size": 36.0, "track": 20.0}]]
+    # box-level bold and italic
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Escape)
+    w.select([note])
+    w.set_text_value("weight", "bold")
+    w.set_text_value("italic", True)
+    assert note.look == {"weight": "bold", "italic": True}
+    assert note.editor.document().defaultFont().bold() and note.editor.document().defaultFont().italic()
+    # saved, loaded, exported
+    state, media = w.state()
+    assert state["runs"] == doc_runs(w.doc) and state["runs"]
+    w.load_state(state, media)
+    assert doc_runs(w.doc) == state["runs"]
+    again = [t for t in w.things.values() if isinstance(t, Note) and t.alive][0]
+    assert doc_runs(again.editor.document()) == [[at, 3, {"size": 36.0, "track": 20.0}]]
+    assert again.look == {"weight": "bold", "italic": True}
+    pdf = w.export_pdf(clean=True, path=os.path.join(TMP, "words.pdf"))
+    text = pypdfium2.PdfDocument(pdf)[0].get_textpage().get_text_range()
+    assert "LOUD" in text and "big" in text
+    # an older file (no runs) still loads
+    state.pop("runs")
+    w.load_state(state, media)
+    assert doc_runs(w.doc) == [] and "LOUD" in w.doc.toPlainText()
+    w.close()
+
+
 def test_empty_note_leaves_nothing_and_notes_survive():
     w = fresh()
     page = w.sheet.scene_page_rect()
@@ -1536,6 +1762,94 @@ def test_imposition_orders():
     assert imposition.back_turn("single-top") == 180, "earlier names still work"
 
 
+def test_export_panel_pick_and_spreads():
+    import pypdfium2
+    w = fresh()
+    w.distress.enabled = False
+    type_paragraphs(w, 40)
+    w.set_covers(cover=True, back=False)
+    n = w.sheet.pages()
+    assert n >= 6, n
+    # page ranges, both ways
+    assert w.page_range_text([0, 1, 2, 3, 6]) == "1-4, 7"
+    assert w.parse_page_range("1-4, 7", n) == {0, 1, 2, 3, 6}
+    assert w.parse_page_range("", n) == set(range(n)) == w.parse_page_range("all", n)
+    assert w.parse_page_range(f"{n - 1}-", n) == {n - 2, n - 1}
+    assert w.parse_page_range("2 5 99", n) == {1, 4}
+    # ⌘E opens the panel; every page is picked to begin with
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_E, QtCore.Qt.ControlModifier)
+    pump(0.1)
+    panel, strip = w.export_panel, w.export_strip
+    assert panel.isVisible() and w.export_pages() == list(range(n))
+    # click page 2 on the map: left out; drag from 4 across 5: left out too
+    rects = strip.rects()
+    w.set_export_option("spreads", False)
+    QtTest.QTest.mouseClick(strip, QtCore.Qt.LeftButton, pos=rects[1].center())
+    assert w.export_pages() == [p for p in range(n) if p != 1]
+    QtTest.QTest.mousePress(strip, QtCore.Qt.LeftButton, pos=rects[3].center())
+    move = QtGui.QMouseEvent(QtCore.QEvent.MouseMove, QtCore.QPointF(rects[4].center()),
+                             QtCore.Qt.NoButton, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier)
+    app.sendEvent(strip, move)
+    QtTest.QTest.mouseRelease(strip, QtCore.Qt.LeftButton, pos=rects[4].center())
+    assert 3 not in w.export_pages() and 4 not in w.export_pages()
+    # ⇧-click takes in the run from the last one
+    QtTest.QTest.mouseClick(strip, QtCore.Qt.LeftButton, QtCore.Qt.ShiftModifier, rects[0].center())
+    assert w.export_pages()[:4] == [0, 1, 2, 3] and 4 not in w.export_pages()   # back to page 4
+    # the range field picks too
+    field = [f for f in panel.findChildren(QtWidgets.QLineEdit)][0]
+    field.setFocus()
+    field.clear()
+    QtTest.QTest.keyClicks(field, "1, 3-4")
+    assert w.export_pages() == [0, 2, 3]
+    assert "3 pages" in w.export_summary()
+    # single pages, clean: three PDF pages, words still words
+    path = w.export_now(os.path.join(TMP, "picked.pdf"))
+    doc = pypdfium2.PdfDocument(path)
+    assert len(doc) == 3
+    assert abs(doc[0].get_size()[0] - w.sheet.W) < 1
+    assert doc[1].get_textpage().get_text_range().strip(), "clean pages keep their words"
+    # spreads: the cover alone, then whole spreads, twice as wide
+    w.set_export_option("spreads", True)
+    assert w.export_units([0, 2, 3]) == [(0,), (1, 2), (3, 4)]
+    doc = pypdfium2.PdfDocument(w.export_now(os.path.join(TMP, "spreads.pdf")))
+    assert len(doc) == 3
+    assert abs(doc[0].get_size()[0] - w.sheet.W) < 1
+    assert abs(doc[1].get_size()[0] - 2 * w.sheet.W) < 1 and abs(doc[1].get_size()[1] - w.sheet.H) < 1
+    # in spreads, a click on the map takes the whole spread
+    w.set_export_pages(set())
+    QtTest.QTest.mouseClick(strip, QtCore.Qt.LeftButton, pos=strip.rects()[5].center())
+    assert set(w.export_pages()) == set(w.export_units([5])[0])
+    # distressed: pages are images (no words to pick out)
+    w.set_export_pages({0})
+    w.set_export_option("spreads", False)
+    w.set_export_distressed(True)
+    assert "distressed" in w.export_summary()
+    doc = pypdfium2.PdfDocument(w.export_now(os.path.join(TMP, "rough_pick.pdf")))
+    assert len(doc) == 1 and not doc[0].get_textpage().get_text_range().strip()
+    # png spreads: one image per spread, named for its pages
+    w.set_export_distressed(False)
+    w.set_export_option("format", "png")
+    w.set_export_option("spreads", True)
+    w.set_export_pages({1})
+    written = w.export_now(os.path.join(TMP, "pick.png"))
+    assert [os.path.basename(p) for p in written] == ["pick_02-03.png"], written
+    image = QtGui.QImage(written[0])
+    assert image.width() > 1.9 * image.height() * w.sheet.W / w.sheet.H
+    # nothing picked: nothing written
+    w.set_export_option("format", "pdf")
+    w.set_export_pages(set())
+    assert w.export_now(os.path.join(TMP, "none.pdf")) is None
+    assert not os.path.exists(os.path.join(TMP, "none.pdf"))
+    # ⌘E with the panel open exports
+    w.set_export_pages({0})
+    w.set_export_option("spreads", False)
+    target = os.path.join(TMP, "again.pdf")
+    w._export_target = lambda *a: target
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_E, QtCore.Qt.ControlModifier)
+    assert len(pypdfium2.PdfDocument(target)) == 1
+    w.close()
+
+
 def impose_of(w):
     return [p for p, _h in w.plugins if p.name == "impose"][0]
 
@@ -1845,6 +2159,115 @@ def test_impose_prints_fronts_then_backs():
         w.close()
     finally:
         printing.RUN, printing.available = real_run, real_available
+
+
+def right_click(w, scene_point: QtCore.QPointF):
+    at = view_point(w, scene_point)
+    viewport = w.view.viewport()
+    QtTest.QTest.mousePress(viewport, QtCore.Qt.RightButton, QtCore.Qt.NoModifier, at)
+    QtTest.QTest.mouseRelease(viewport, QtCore.Qt.RightButton, QtCore.Qt.NoModifier, at)
+    event = QtGui.QContextMenuEvent(QtGui.QContextMenuEvent.Mouse, at, viewport.mapToGlobal(at))
+    app.sendEvent(viewport, event)
+    pump(0.05)
+
+
+def test_right_click_opens_panels_and_tools_panel():
+    w = fresh()
+    w.show()
+    w.distress.enabled = False
+    type_paragraphs(w, 2)
+    page = w.sheet.scene_page_rect()
+    # a text box: the text panel, for it
+    note = w.new_note(QtCore.QPointF(page.left() + 100, page.top() + 500), wrap=200.0, top=True)
+    QtTest.QTest.keyClicks(w.view, "a box")
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Escape)
+    right_click(w, note.sceneBoundingRect().center())
+    assert w.text_panel is not None and w.text_panel.isVisible()
+    assert w.selection() == [note] and "1 box" in w.text_panel.caption.text()
+    w.text_panel.close_panel()
+    # an image: stik's panel
+    qimage = QtGui.QImage(60, 40, QtGui.QImage.Format_ARGB32)
+    qimage.fill(QtGui.QColor("#c33"))
+    image = w.place_qimage(qimage, QtCore.QRectF(page.left() - 300, page.top(), 60, 40), "red")
+    stik = stik_of(w)
+    assert not stik.panel.isVisible()
+    right_click(w, image.sceneBoundingRect().center())
+    assert stik.panel.isVisible() and w.selection() == [image]
+    stik.panel.close_panel()
+    # the page round the words: the page panel; the words: the text panel
+    right_click(w, QtCore.QPointF(page.left() + 12, page.bottom() - 12))
+    assert w.page_panel is not None and w.page_panel.isVisible()
+    w.page_panel.close_panel()
+    w.set_mode("design")
+    right_click(w, QtCore.QPointF(page.left() + w.fmt.margin + 30, page.top() + w.fmt.head + 6))
+    assert w.text_panel.isVisible() and w.story_selected and "main text" in w.text_panel.caption.text()
+    w.text_panel.close_panel()
+    # the scanner's frames: its panel
+    scanner = scanner_of(w)
+    scanner.open()
+    scanner.panel.hide()                 # (closing it would close the scanner too)
+    right_click(w, scanner.bed.scene_rect().center())
+    assert scanner.panel.isVisible()
+    scanner.close()
+    # the empty canvas: the palette, as before
+    right_click(w, page.topLeft() - QtCore.QPointF(400, 300))
+    assert w.palette.isVisible()
+    w.palette.hide()
+    # the tools panel: every tool, the current one inked
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_T, QtCore.Qt.ControlModifier | QtCore.Qt.AltModifier)
+    tools = w.tools_panel
+    assert tools.isVisible()
+    labels = [e["label"] for e in w.tool_entries()]
+    for label in ("write", "select", "text box", "lasso cut", "rectangle cut", "ellipse cut",
+                  "wand", "eraser"):
+        assert label in labels, labels
+    assert w.active_tool_id() == "select"
+    w.choose_tool("text box")
+    assert w.design() and w.text_tool and w.active_tool_id() == "text box"
+    lasso = [e for e in w.tool_entries() if e["label"] == "lasso cut"][0]
+    w.choose_tool(lasso["id"])
+    assert w.active_tool is stik.tools["lasso"] and not w.text_tool
+    assert w.active_tool_id() == lasso["id"]
+    # clicking a row in the panel picks it
+    from ream.panel import _Menu
+    menu = tools.findChild(_Menu)
+    row = [n for n, r in enumerate(menu.rows) if r[1] == "select"][0]
+    QtTest.QTest.mouseClick(menu, QtCore.Qt.LeftButton, pos=QtCore.QPoint(20, row * menu.ROW + 10))
+    assert w.active_tool is None and w.design() and not w.text_tool
+    # design mode: a tool's letter picks it
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_W)
+    assert w.active_tool is stik.tools["wand"]
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Escape)
+    assert w.active_tool is None
+    w.choose_tool("write")
+    assert w.mode == "writer" and w.active_tool_id() == "write"
+    stik.panel.close_panel()
+    w.close()
+
+
+def test_version_is_semver_and_in_the_changelog():
+    import re
+    import contextlib
+    import io
+    import ream
+    from ream import app as ream_app
+    semver = (r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+              r"(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?"
+              r"(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$")
+    assert re.match(semver, ream.__version__), ream.__version__
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pyproject = open(os.path.join(root, "pyproject.toml")).read()
+    assert 'dynamic = ["version"]' in pyproject and 'path = "src/ream/__init__.py"' in pyproject
+    assert not re.search(r"^version\s*=", pyproject, re.M), "one place only"
+    changelog = open(os.path.join(root, "CHANGELOG.md")).read()
+    assert f"## [{ream.__version__}] - " in changelog and "Semantic Versioning 2.0.0" in changelog
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        try:
+            ream_app.main(["--version"])
+        except SystemExit:
+            pass
+    assert out.getvalue().strip() == f"ream {ream.__version__}"
 
 
 def imposition_styles():

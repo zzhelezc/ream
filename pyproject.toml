@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ream"
-version = "0.1.0"
+dynamic = ["version"]           # from src/ream/__init__.py - semver 2.0, see CHANGELOG.md
 description = "One page on an infinite canvas: write, pin images and PDFs to it, export a distressed PDF"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -33,8 +33,11 @@ ai = ["rembg>=2.0", "onnxruntime>=1.16", "pillow>=10"]
 [project.scripts]
 ream = "ream.app:main"
 
+[tool.hatch.version]
+path = "src/ream/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/ream"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "README.md", "pyproject.toml"]
+include = ["src", "README.md", "CHANGELOG.md", "pyproject.toml"]

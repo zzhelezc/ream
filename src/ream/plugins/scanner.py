@@ -64,10 +64,12 @@ class Plugin(Base):
 
         w, h = self.s["bed"]
         self.bed = host.frame("A · scan bed", QtCore.QSizeF(w, h),
-                              paint_content=self.paint_bed, on_change=self.bed_changed)
+                              paint_content=self.paint_bed, on_change=self.bed_changed,
+                              on_context=self.open_panel)
         self.result = host.frame("B · scan result", QtCore.QSizeF(w, h),
                                  paint_content=self.paint_result, drag_out=self.take,
-                                 on_change=self.result_changed, fill=True)
+                                 on_change=self.result_changed, on_context=self.open_panel,
+                                 fill=True)
         self.panel = self.build_panel()
         self.timer = host.timer(30, self.tick)
 
@@ -81,6 +83,11 @@ class Plugin(Base):
         self.save()
 
     # -- opening ---------------------------------------------------------------
+    def open_panel(self):
+        """Right-click on either frame: the scanner's settings."""
+        self.panel.open()
+        self.panel.raise_()
+
     def toggle(self):
         if self.bed.isVisible():
             self.close()

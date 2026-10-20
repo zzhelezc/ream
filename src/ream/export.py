@@ -262,45 +262,85 @@ def final_page(sheet, index: int, dpi: float, settings: distress.Settings, paper
     return image
 
 
+def _units(pages: list[int], units) -> list[tuple[int, ...]]:
+    """What goes on each exported page: one page, or a spread's pages side by side."""
+    if units is None:
+        return [(p,) for p in pages]
+    return [tuple(p for p in unit if p is not None) for unit in units if any(p is not None for p in unit)]
+
+
 def write_pdf(path: str, sheet, pages: list[int], *, dpi: float, settings: distress.Settings,
               paper: QtGui.QColor, ink: QtGui.QColor, title: str = "", density: float = 1.0,
-              paper_stock: Stock | None = None,
-              progress: Callable[[int, int], None] | None = None):
+              paper_stock: Stock | None = None, units=None,
+              progress: Callable[[int, int], None] | None = None) -> int:
+    """The pages as a PDF: clean pages as vector, distressed ones as images.
+    `units`, when given, are spreads - (left, right), None for no page - each
+    on one PDF page as wide as its pages; else every page on its own.
+    Returns how many PDF pages were written."""
+    units = _units(pages, units)
     raster = settings.enabled
     writer = QtGui.QPdfWriter(path)
     writer.setCreator("ream")
     writer.setTitle(title)
-    writer.setPageSize(QtGui.QPageSize(QtCore.QSizeF(sheet.W, sheet.H), QtGui.QPageSize.Point,
-                                       "", QtGui.QPageSize.ExactMatch))
+
+    def size(unit):
+        return QtGui.QPageSize(QtCore.QSizeF(sheet.W * len(unit), sheet.H), QtGui.QPageSize.Point,
+                               "", QtGui.QPageSize.ExactMatch)
+
+    writer.setPageSize(size(units[0] if units else (0,)))
     writer.setPageMargins(QtCore.QMarginsF(0, 0, 0, 0))
     writer.setResolution(int(dpi) if raster else 1200)
     painter = QtGui.QPainter(writer)
-    target = QtCore.QRectF(0, 0, writer.width(), writer.height())
+    k = writer.resolution() / 72.0
+    pw, ph = sheet.W * k, sheet.H * k
     base = None if raster else clean_base(sheet, min(dpi, 300.0), paper, paper_stock)
-    for n, index in enumerate(pages):
-        if progress:
-            progress(n, len(pages))
+    total, done = sum(len(u) for u in units), 0
+    for n, unit in enumerate(units):
         if n:
+            writer.setPageSize(size(unit))           # takes effect on the new page
             writer.newPage()
-        if raster:
-            painter.drawImage(target, raster_page(sheet, index, dpi, settings, paper, ink, density,
-                                                  paper_stock))
-        else:
-            # vector words stay words, on top of the paper
-            draw_clean_page(painter, target, sheet, index, paper, ink, base)
+        for i, index in enumerate(unit):
+            if progress:
+                progress(done, total)
+            done += 1
+            target = QtCore.QRectF(i * pw, 0, pw, ph)
+            if raster:
+                painter.drawImage(target, raster_page(sheet, index, dpi, settings, paper, ink,
+                                                      density, paper_stock))
+            else:
+                # vector words stay words, on top of the paper
+                draw_clean_page(painter, target, sheet, index, paper, ink, base)
     painter.end()
+    return len(units)
 
 
 def write_pngs(stem: str, sheet, pages: list[int], *, dpi: float, settings: distress.Settings,
                paper: QtGui.QColor, ink: QtGui.QColor, density: float = 1.0,
-               paper_stock: Stock | None = None,
+               paper_stock: Stock | None = None, units=None,
                progress: Callable[[int, int], None] | None = None) -> list[str]:
+    """One PNG per page (stem_03.png), or per spread (stem_02-03.png)."""
     written = []
-    for n, index in enumerate(pages):
-        if progress:
-            progress(n, len(pages))
-        path = f"{stem}_{index + 1:02d}.png"
-        image = raster_page(sheet, index, dpi, settings, paper, ink, density, paper_stock)
+    units = _units(pages, units)
+    total, done = sum(len(u) for u in units), 0
+    for unit in units:
+        images = []
+        for index in unit:
+            if progress:
+                progress(done, total)
+            done += 1
+            images.append(final_page(sheet, index, dpi, settings, paper, ink, density, paper_stock))
+        if len(images) == 1:
+            image = images[0]
+        else:
+            image = QtGui.QImage(sum(i.width() for i in images), images[0].height(),
+                                 QtGui.QImage.Format_RGB32)
+            painter = QtGui.QPainter(image)
+            x = 0
+            for part in images:
+                painter.drawImage(x, 0, part)
+                x += part.width()
+            painter.end()
+        path = f"{stem}_{'-'.join(f'{i + 1:02d}' for i in unit)}.png"
         image.setDotsPerMeterX(int(dpi / 0.0254))
         image.setDotsPerMeterY(int(dpi / 0.0254))
         image.save(path)

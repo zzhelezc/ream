@@ -125,9 +125,11 @@ class Frame(QtWidgets.QGraphicsItem):
                  paint_content: Callable | None = None,
                  drag_out: Callable[[QtCore.QPointF], QtGui.QImage | None] | None = None,
                  on_change: Callable[[], None] | None = None,
+                 on_context: Callable[[], None] | None = None,
                  fill: bool = False):
         super().__init__()
         self.host = host
+        self.on_context = on_context            # right-click: open its panel
         self.label = label
         self.w, self.h = float(size.width()), float(size.height())
         self.paint_content = paint_content
@@ -217,6 +219,8 @@ class Host:
         self.commands: list[tuple] = []
         self.timers: list[QtCore.QTimer] = []
         self.actions: list[QtWidgets.QAction] = []
+        self.tools: list[tuple] = []             # (tool, label, key, choose)
+        self.contexts: list[tuple] = []          # (test(thing), open)
 
     def dispose(self):
         """Undo everything the plugin added (it is being turned off)."""
@@ -230,8 +234,10 @@ class Host:
                 self.scene.removeItem(frame)
         for action in self.actions:
             self.window.removeAction(action)
+        if self.window.active_tool in [t for t, *_rest in self.tools]:
+            self.window.use_tool(None)
         self.frames.clear(), self.panels.clear(), self.commands.clear()
-        self.timers.clear(), self.actions.clear()
+        self.timers.clear(), self.actions.clear(), self.tools.clear(), self.contexts.clear()
 
     # -- the window's parts ---------------------------------------------------
     @property
@@ -283,6 +289,18 @@ class Host:
     def use(self, tool: "Tool | None"):
         """Make `tool` the canvas tool (None: back to writing)."""
         self.window.use_tool(tool)
+
+    def tool(self, tool: "Tool", label: str | None = None, key: str = "",
+             choose: Callable[[], None] | None = None):
+        """List a tool in the tools panel.  `key`, one letter, picks it in
+        design mode; `choose` is what picking it does (default: use it)."""
+        self.tools.append((tool, label or tool.name, key.upper(),
+                           choose or (lambda t=tool: self.use(t))))
+
+    def context_panel(self, test: Callable[[object], bool], open_panel: Callable[[], None]):
+        """Right-click on a thing for which `test(thing)` is true opens this
+        plugin's panel (an image's, say).  Frames take `on_context` instead."""
+        self.contexts.append((test, open_panel))
 
     @property
     def active_tool(self):

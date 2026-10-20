@@ -215,6 +215,144 @@ class Thing(QtWidgets.QGraphicsItem):
                 round(self.rotation(), 3), self.version, self.flip)
 
 
+LOOK = {                              # a text box's own type: key -> (low, high) or choices
+    "font": None,
+    "size": (5.0, 96.0),              # pt
+    "line": (80.0, 300.0),            # % of the font's line height
+    "align": ("left", "centre", "right", "justify"),
+    "track": (-10.0, 50.0),           # % of normal letter spacing added
+    "weight": ("regular", "bold"),
+    "italic": (False, True),
+}
+WORDS = ("font", "size", "track", "weight", "italic")      # what selected words can set
+ALIGN = {"left": QtCore.Qt.AlignLeft, "centre": QtCore.Qt.AlignHCenter,
+         "right": QtCore.Qt.AlignRight, "justify": QtCore.Qt.AlignJustify}
+
+
+# -- styled words: character formats over the box's (or document's) type -------------
+
+def char_props(fmt: QtGui.QTextCharFormat) -> dict:
+    """The type a run of words sets for itself (only what it sets)."""
+    props = {}
+    if fmt.hasProperty(QtGui.QTextFormat.FontFamily) and fmt.fontFamily():
+        props["font"] = fmt.fontFamily()
+    if fmt.hasProperty(QtGui.QTextFormat.FontPointSize):
+        props["size"] = round(fmt.fontPointSize(), 2)
+    if fmt.hasProperty(QtGui.QTextFormat.FontLetterSpacing):
+        props["track"] = round(fmt.fontLetterSpacing() - 100.0, 2)
+    if fmt.hasProperty(QtGui.QTextFormat.FontWeight) and fmt.fontWeight() >= QtGui.QFont.DemiBold:
+        props["weight"] = "bold"
+    if fmt.hasProperty(QtGui.QTextFormat.FontItalic) and fmt.fontItalic():
+        props["italic"] = True
+    return props
+
+
+def set_char(fmt: QtGui.QTextCharFormat, key: str, value):
+    """Set one part of a run's type; None (or "*" for key) clears it, so the
+    words follow the box's type again."""
+    if key == "*":
+        for k in WORDS:
+            set_char(fmt, k, None)
+        return
+    if key == "font":
+        if value:
+            fmt.setFontFamily(value)
+        else:
+            fmt.clearProperty(QtGui.QTextFormat.FontFamily)
+            families = getattr(QtGui.QTextFormat, "FontFamilies", None)
+            if families is not None:
+                fmt.clearProperty(families)
+    elif key == "size":
+        if value:
+            fmt.setFontPointSize(float(value))
+        else:
+            fmt.clearProperty(QtGui.QTextFormat.FontPointSize)
+    elif key == "track":
+        if value is None:
+            fmt.clearProperty(QtGui.QTextFormat.FontLetterSpacing)
+        else:
+            if hasattr(fmt, "setFontLetterSpacingType"):
+                fmt.setFontLetterSpacingType(QtGui.QFont.PercentageSpacing)
+            fmt.setFontLetterSpacing(100.0 + float(value))
+    elif key == "weight":
+        if value == "bold":
+            fmt.setFontWeight(QtGui.QFont.Bold)
+        else:
+            fmt.clearProperty(QtGui.QTextFormat.FontWeight)
+    elif key == "italic":
+        if value:
+            fmt.setFontItalic(True)
+        else:
+            fmt.clearProperty(QtGui.QTextFormat.FontItalic)
+
+
+def restyle_range(doc: QtGui.QTextDocument, start: int, end: int, key: str, value):
+    """Set one part of the type on the words from `start` to `end`, keeping
+    whatever else each run sets (the caller owns the undo edit block)."""
+    pieces = []
+    block = doc.findBlock(start)
+    while block.isValid() and block.position() < end:
+        it = block.begin()
+        while not it.atEnd():
+            fragment = it.fragment()
+            if fragment.isValid():
+                a = max(start, fragment.position())
+                b = min(end, fragment.position() + fragment.length())
+                if a < b:
+                    pieces.append((a, b, QtGui.QTextCharFormat(fragment.charFormat())))
+            it += 1
+        block = block.next()
+    cursor = QtGui.QTextCursor(doc)
+    for a, b, fmt in pieces:
+        set_char(fmt, key, value)
+        cursor.setPosition(a)
+        cursor.setPosition(b, QtGui.QTextCursor.KeepAnchor)
+        cursor.setCharFormat(fmt)
+
+
+def doc_runs(doc: QtGui.QTextDocument) -> list[list]:
+    """The styled words, for saving: [[start, length, {type}], …] - only
+    runs that set something of their own, neighbours with the same type joined."""
+    runs: list[list] = []
+    block = doc.begin()
+    while block.isValid():
+        it = block.begin()
+        while not it.atEnd():
+            fragment = it.fragment()
+            if fragment.isValid():
+                props = char_props(fragment.charFormat())
+                if props:
+                    if runs and runs[-1][2] == props and runs[-1][0] + runs[-1][1] == fragment.position():
+                        runs[-1][1] += fragment.length()
+                    else:
+                        runs.append([fragment.position(), fragment.length(), props])
+            it += 1
+        block = block.next()
+    return runs
+
+
+def apply_runs(doc: QtGui.QTextDocument, runs) -> None:
+    """Put saved styled words back (outside the undo history)."""
+    if not runs:
+        return
+    undo = doc.isUndoRedoEnabled()
+    doc.setUndoRedoEnabled(False)
+    last = doc.characterCount() - 1
+    cursor = QtGui.QTextCursor(doc)
+    for start, length, props in runs:
+        a, b = max(0, min(int(start), last)), max(0, min(int(start) + int(length), last))
+        if a >= b:
+            continue
+        fmt = QtGui.QTextCharFormat()
+        for key, value in props.items():
+            if key in WORDS:
+                set_char(fmt, key, value)
+        cursor.setPosition(a)
+        cursor.setPosition(b, QtGui.QTextCursor.KeepAnchor)
+        cursor.mergeCharFormat(fmt)
+    doc.setUndoRedoEnabled(undo)
+
+
 class NoteText(QtWidgets.QGraphicsTextItem):
     """The editor inside a Note: live only while the note is being written."""
 
@@ -237,7 +375,12 @@ class NoteText(QtWidgets.QGraphicsTextItem):
         self.note.fit()
         if self.controller.write_mode:
             self.controller._write_follow()
+        self.controller._refresh_text_panel()
         self.controller.view.viewport().update()
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        self.controller._refresh_text_panel()          # it shows the selected words' type
 
     def inputMethodEvent(self, event):
         super().inputMethodEvent(event)
@@ -254,9 +397,10 @@ class NoteText(QtWidgets.QGraphicsTextItem):
 
 
 class Note(Thing):
-    """A block of text placed anywhere.  It wraps at `wrap` points (-1: one
-    line that grows), turns about its first corner, and takes the document's
-    face, size and spacing."""
+    """A block of text placed anywhere - a text box.  It wraps at `wrap`
+    points (-1: one line that grows) and turns about its first corner.  Its
+    type is the document's, except what its `look` sets for it alone:
+    font, size, line, align, track (see LOOK)."""
 
     kind = "text"
 
@@ -268,6 +412,7 @@ class Note(Thing):
         self.original = None
         self.w, self.h = 8.0, 8.0
         self.wrap = wrap
+        self.look: dict = {}                      # this box's own type; missing: the document's
         self.editor = NoteText(controller, self)
         doc = self.editor.document()
         doc.setDocumentMargin(0)
@@ -285,7 +430,9 @@ class Note(Thing):
         return self.editor.toPlainText()
 
     def style(self, font: QtGui.QFont, block: QtGui.QTextBlockFormat, ink: QtGui.QColor):
-        """Follow the document's type; kept out of the note's undo."""
+        """Set the type (the document's, with the box's look over it); kept
+        out of the note's undo."""
+        self.version += 1
         doc = self.editor.document()
         doc.setUndoRedoEnabled(False)
         doc.setDefaultFont(font)

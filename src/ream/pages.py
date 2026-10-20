@@ -167,3 +167,86 @@ class PageStrip(QtWidgets.QWidget):
         if index is not None:
             self.controller.go_to_page(index)
             self.controller.fit_page()
+
+
+class PickStrip(PageStrip):
+    """The page map in the export panel: the same thumbnails, but clicking
+    picks pages instead of going to them.  Click a page to take it in or
+    leave it out, drag across pages to do the same to each, ⇧-click for the
+    run from the last one.  Exporting spreads, a click takes the whole spread.
+    Pages left out are washed pale."""
+
+    def __init__(self, controller, get, put, by_spread):
+        super().__init__(controller)
+        self.get, self.put, self.by_spread = get, put, by_spread
+        self.anchor: int | None = None
+        self.mode: bool | None = None              # True: taking pages in, False: leaving out
+        self.touched: set[int] = set()
+
+    def group(self, index: int) -> list[int]:
+        if not self.by_spread():
+            return [index]
+        for spread in self.spreads():
+            if index in spread:
+                return [p for p in spread if p is not None]
+        return [index]
+
+    def apply(self, pages: list[int]):
+        picked = set(self.get())
+        if self.mode:
+            picked |= set(pages)
+        else:
+            picked -= set(pages)
+        self.touched |= set(pages)
+        self.put(picked)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setFont(style.ui_font(10))
+        picked = set(self.get())
+        for index, rect in self.rects().items():
+            painter.drawImage(rect, self.thumbnail(index))
+            on = index in picked
+            if not on:
+                painter.fillRect(rect, QtGui.QColor(255, 255, 255, 175))
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.setPen(QtGui.QPen(style.qc(style.INK if on else "#b9b8b2"), 1))
+            painter.drawRect(rect.adjusted(0, 0, -1, -1))
+            if on:
+                painter.setPen(QtGui.QPen(style.qc(style.INK), 2))
+                painter.drawRect(rect.adjusted(-2, -2, 1, 1))
+            label = QtCore.QRect(rect.center().x() - 11, rect.bottom() + 3, 22, 13)
+            if on:
+                painter.fillRect(label, style.qc(style.INK))
+                painter.setPen(QtGui.QColor("#ffffff"))
+            else:
+                painter.setPen(style.qc("#b9b8b2"))
+            painter.drawText(label, QtCore.Qt.AlignCenter, f"{index + 1:02d}")
+
+    def mousePressEvent(self, event):
+        index = self.page_at(event.pos())
+        if event.button() != QtCore.Qt.LeftButton or index is None:
+            return
+        self.touched = set()
+        if event.modifiers() & QtCore.Qt.ShiftModifier and self.anchor is not None:
+            lo, hi = sorted((self.anchor, index))
+            self.mode = True
+            self.apply([p for i in range(lo, hi + 1) for p in self.group(i)])
+        else:
+            self.mode = index not in set(self.get())
+            self.apply(self.group(index))
+        self.anchor = index
+
+    def mouseMoveEvent(self, event):
+        if self.mode is None or not event.buttons() & QtCore.Qt.LeftButton:
+            return
+        index = self.page_at(event.pos())
+        if index is not None and index not in self.touched:
+            self.apply(self.group(index))
+
+    def mouseReleaseEvent(self, event):
+        self.mode = None
+
+    def mouseDoubleClickEvent(self, event):
+        self.mousePressEvent(event)

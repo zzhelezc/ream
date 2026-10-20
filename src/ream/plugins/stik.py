@@ -201,6 +201,13 @@ class Plugin(Base):
         for key, label in (("lasso", "cut: lasso"), ("rect", "cut: rectangle"),
                            ("ellipse", "cut: ellipse"), ("wand", "wand"), ("eraser", "eraser")):
             host.command(label, lambda k=key: self.use(k), "", "stik tool cut")
+        # the tools panel lists them; in design mode their letters pick them
+        for key, label, letter in (("lasso", "lasso cut", "L"), ("rect", "rectangle cut", "M"),
+                                   ("ellipse", "ellipse cut", "O"), ("wand", "wand", "W"),
+                                   ("eraser", "eraser", "E")):
+            host.tool(self.tools[key], label, letter, choose=lambda k=key: self.use(k))
+        # right-click on an image: stik's panel (cut, clean, border, export)
+        host.context_panel(lambda thing: getattr(thing, "kind", "") == "image", self.open_panel)
         host.command("remove background", lambda: self.remove_background(full=True), "",
                      "stik matte cut out clean")
         host.command("auto-cut islands", self.islands, "", "stik sticker sheet split")
@@ -225,6 +232,10 @@ class Plugin(Base):
             self.panel.close_panel()
         else:
             self.panel.open()
+
+    def open_panel(self):
+        self.panel.open()
+        self.panel.raise_()
 
     def use(self, key: str | None):
         self.host.use(self.tools[key] if key else None)

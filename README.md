@@ -12,6 +12,23 @@ once. **Distress view** (`⇧⌘D`) lets you write on the distressed page itself
 
 A sibling of `stik`: the same infinite canvas, Tab palette and uv install.
 
+## Version
+
+ream follows [Semantic Versioning 2.0.0](https://semver.org): `MAJOR.MINOR.PATCH`.
+
+- **MAJOR:** `.ream` files or the plugin API stop working as they did.
+- **MINOR:** new features that keep them working.
+- **PATCH:** fixes.
+
+Until 1.0.0 anything may still change, and breaking changes are listed
+under **Changed** in [CHANGELOG.md](CHANGELOG.md). The version lives in
+`src/ream/__init__.py` alone, and `pyproject.toml` reads it from there.
+`ream --version` prints it, and so does **about ream** in the palette. Each
+saved `.ream` file records the version that wrote it.
+
+To release, add the changes under a new heading in the changelog, set
+`__version__`, and run `uv tool install --reinstall .`.
+
 ## Install
 
 ```bash
@@ -81,8 +98,73 @@ page's own words or anything else.
   (about its first letter) and deletes like an image. The corner square
   re-wraps it to a new width.
 
-Blocks always take the document's face, size, line height and paragraph
-spacing, and change with them.
+Blocks take the document's face, size, line height and paragraph spacing,
+and change with them, unless the text panel gives a block its own type
+(see below).
+
+### Writer and design modes
+
+ream has two modes. `⌥⌘D` switches between them (or **writer mode** /
+**design mode** in the palette). The mode is remembered.
+
+**Writer** is ream as a writing app. The page's words are always live: a
+click puts the caret in them and typing goes straight in. **Write mode**
+(`⇧⌘F`, the view that follows the page as you write) belongs to writer mode.
+Starting it from design mode switches back to writer.
+
+**Design** is for laying out a book, as in InDesign. The page is objects:
+the main text's frame, text boxes and images. Nothing types until you choose
+where.
+
+| Do | Does |
+| --- | --- |
+| click | selects: an image, a text box, or the main text's frame (a click on its words) |
+| drag on an empty spot | a marquee: selects what it touches (`⇧` adds to the selection) |
+| double-click | writes there: in a text box, or in the main text with the caret where you clicked |
+| `↵` | writes in the selected text box, or at the end of the main text |
+| `T` | a new text box: click for one that wraps at the margin, or drag its width |
+| `V`, `Esc` | back to selecting; `Esc` also stops writing, then clears the selection |
+| `⌘`+click | writes a block right there, as in writer mode |
+
+Outside the main text's frame, a click reaches what lies under the words,
+with no `⌥` needed. Delete, nudging, rotating, `⌘[` `⌘]` stacking and undo
+all work as in writer mode.
+
+**Frame edges.** Design mode draws InDesign's frame edges. A dotted line
+marks the main text's frame on each page with words, and every text box.
+The selected frame is solid, and the one you are writing in is dashed. The
+mode shows at the bottom right.
+
+### Text panel
+
+`⌘T` (or **text panel**) styles text: **font**, **size**, **line** spacing,
+**align** (left, centre, right, justify), **track** (letter spacing),
+**weight** (regular / bold) and **italic**. Its caption says what it is
+styling.
+
+- **Selected words:** select words while writing, in a text box or in the
+  main text (in writer mode, or while writing in it in design mode). Font,
+  size, track, weight and italic then apply to just those words, over their
+  box's type: one bold word, a bigger first line, an italic title. Line and
+  align stay per box (or per main text). **as the box** (or **as the text**)
+  clears the words' own type. Bold or italic switched off goes back to
+  following the box, rather than fixing "regular". Styled words keep their
+  type when the document's type changes, are undone a step at a time (a
+  slider's whole drag counts as one), are saved with the document (older
+  files still open), and are exported and distressed like everything else.
+
+- **Text boxes:** with boxes selected, or one being written in, the settings
+  are theirs alone. Each box keeps its own type, so a heading, a caption and
+  a pull quote can each have their own. Anything a box doesn't set follows
+  the document. **as document** gives a box back the document's type. Each
+  change is one undo step, and a slider's whole drag counts as one. A box's
+  type is saved with the document, exported and distressed like everything
+  else.
+- **The main text:** with no box chosen and no words selected, the panel
+  sets the document's own type, the same type the page panel sets.
+  Alignment and track are new for the main text too. Weight and italic are
+  for words and boxes: select words to make part of the main text bold or
+  italic.
 
 ### Pages panel
 
@@ -214,7 +296,8 @@ itself when you switch, and `⌘0` re-frames it.
 - **The other pages** are drawn straight from the document, so they are sharp
   at any zoom. In distress view they are distressed too, the ones in sight,
   and they re-render after a change.
-- **Exports** are the same whichever view you are in.
+- **Exports** are the same whichever view you are in (the export panel only
+  starts on spreads when you are in a spread view).
 
 The text is plain: one face, one size, one line height and one paragraph
 spacing for the whole document, set from the page panel or the palette. The default face is the first installed of
@@ -265,7 +348,7 @@ text width if it is wider.
 
 ## Command palette
 
-Press **Tab** anywhere (or right-click). The palette opens in the middle of
+Press **Tab** anywhere (or right-click the empty canvas). The palette opens in the middle of
 the window as a slip of paper. Its top stays put while the list filters, and
 anything it adds (images, paste) still lands where the pointer was. Its grey caption gives the document, the page, the word count
 and the distress style. Type to filter, `Enter` runs the command, and `Esc`
@@ -297,8 +380,9 @@ the number.
 
 | Group | Commands |
 | --- | --- |
-| Panels | distress panel (`⌘D`), page panel (`⌘L`) |
-| Export | export pdf (`⌘E`), export pdf · clean (`⇧⌘E`), export png pages |
+| Panels | distress panel (`⌘D`), page panel (`⌘L`), text panel (`⌘T`) |
+| Modes | writer mode / design mode (`⌥⌘D`), new text box (`T` in design mode) |
+| Export | export pdf (`⌘E`: the export panel, for PDF or PNG), export pdf · all pages now, export pdf · clean (`⇧⌘E`), export png pages |
 | Distress | distress view (`⇧⌘D`), distress on/off, distress images on/off, style · …, fade texture · …, reset distress |
 | Page and type | page size · a4 / letter / a5 / square, paper · white / cream / newsprint / bond, paper colour…, canvas colour…, font · … |
 | Pages | pages panel (`⌥⌘P`), add page, delete page, move page, cover on/off, back cover on/off, new page, next page (`⌘→`), previous page (`⌘←`), go to page |
@@ -309,6 +393,32 @@ the number.
 | File | new document (`⌘N`), open… (`⇧⌘O`), save (`⌘S`), save as… (`⇧⌘S`), show drafts, word count, quit |
 
 ## Panels
+
+**Right-click** a thing to open its control panel:
+
+| Right-click | Opens |
+| --- | --- |
+| a text box | the text panel, for that box |
+| the main text's words | the text panel; in design mode the main text's frame is selected too |
+| the page around the words (or another shown page) | the page panel |
+| an image | stik's panel (cut, clean, border, export), when stik is on |
+| a scanner frame | the scanner panel |
+| a misspelt word | its spelling suggestions, as before |
+| the empty canvas, or something with no panel | the palette, with the thing selected |
+
+Plugins add their own: see `host.context_panel` and `on_context` under
+Plugins.
+
+**Tools panel.** `⌥⌘T` (or **tools panel**) lists every tool, the current
+one inked. Click one to pick it.
+
+- **ream's own:** **write** (writer mode), **select** (`V`) and **text box**
+  (`T`), the last two in design mode.
+- **Each plugin's,** under its name: stik's lasso, rectangle and ellipse
+  cuts, wand and eraser (`L` `M` `O` `W` `E`).
+
+In design mode a tool's letter picks it, as in InDesign. In writer mode
+letters type, so pick tools from the panel or the palette.
 
 A panel is a slip of paper floating top right over the canvas. Both can be
 open at once; the second opens beside the first. Drag either by its caption;
@@ -341,7 +451,7 @@ saved with the document.
   resolution while a slider is held and full resolution on release, so the
   sliders never stall;
 - below the controls are the export dpi, **reset**, **new seed** and
-  **export pdf**.
+  **export…**.
 
 ### Writing on the distressed page
 
@@ -449,7 +559,9 @@ class Plugin(Base):
 | --- | --- |
 | `command(title, run, hint, keywords, shortcut)` | a palette entry, optionally with a shortcut |
 | `panel(title)` | a slider panel like ream's own: `slider`, `choice`, `toggle`, `swatches`, `links`, `buttons` |
-| `frame(label, size, paint_content=, drag_out=, on_change=)` | a frame on the canvas. You move it by its label or edge and resize it by its corner; clicks inside go through, unless it has a `drag_out`, in which case dragging from inside picks up the image it returns |
+| `frame(label, size, paint_content=, drag_out=, on_change=, on_context=)` | a frame on the canvas. You move it by its label or edge and resize it by its corner; clicks inside go through, unless it has a `drag_out`, in which case dragging from inside picks up the image it returns. `on_context` is what a right-click on it does (open the plugin's panel) |
+| `tool(tool, label, key, choose=)` | list a tool in the tools panel. `key` (one letter) picks it in design mode; `choose` is what picking it does (default: `use(tool)`) |
+| `context_panel(test, open)` | a right-click on a thing for which `test(thing)` is true calls `open` (stik opens its panel for images) |
 | `render(rect, dpi)` | what is on the canvas in a rect, as RGBA numpy, without the frames |
 | `place_image(image, rect)` | put an image on the canvas (it pins if dropped on the page) |
 | `place_text(text)` | start a text block with some words in it |
@@ -785,10 +897,40 @@ preview matches the export.
 **Previewing.** The distress view (`⇧⌘D`) is the preview: it is live, and
 palette changes like `edge 30` or `style · stamp` show in it straight away.
 
-**Exporting.** With distress on, `⌘E` writes a PDF of page images at the dpi
-(300 by default). With it off, or with **export pdf · clean**, the PDF is
-vector and the text stays real text. The distress settings are saved with the
-document.
+**Exporting.** A distressed PDF is made of page images at the dpi (300 by
+default). A clean one is vector, so the text stays real text. The distress
+settings are saved with the document.
+
+## Export
+
+`⌘E` opens the **export** panel: the page map, which pages to export, and
+how. `⌘E` again (or **export…**) asks where to save and writes the file.
+
+**Picking pages.** Every page is picked to begin with. Pages left out show
+pale on the map.
+
+- **The map:** click a page to take it in or leave it out. Drag across
+  pages to do the same to each one. `⇧`-click takes in the run back to the
+  last page you clicked.
+- **pages:** **all**, **none**, **this one** (the page you are on), **odd**,
+  **even**.
+- **range:** type pages, such as `1-4, 7`, or `5-` for page 5 to the end. It
+  follows the map, and the map follows it.
+
+**How:**
+
+| Row | Choices |
+| --- | --- |
+| **as** | **single pages**: one PDF page per page. **spreads**: facing pages side by side on one PDF page twice as wide, with a cover or back cover alone at single width, as InDesign exports spreads. A spread with any page picked goes out whole, and in spreads a click on the map takes the whole spread. It starts as you are viewing: spreads in spread or all-pages view |
+| **finish** | **distressed** (page images with the distress) or **clean** (vector, the words stay words). It starts as distress is set |
+| **paper** | **stock** (the paper stock, its texture and blend) or **plain** (just the paper colour) |
+| **format** | **pdf**, or **png**: one image per page (`name_03.png`) or per spread (`name_02-03.png`) |
+| **dpi** | for distressed pages and PNGs |
+
+Under the options a line sums it up, for example "5 pages on 3 spreads ·
+distressed · pdf". The as, paper and format choices are remembered. The
+palette's **export pdf · all pages now** and **export pdf · clean** (`⇧⌘E`)
+still export every page straight away.
 
 ## Files and saving
 
@@ -822,7 +964,7 @@ Choosing a theme sets its canvas colour. Any colour from the page panel or
 | `src/ream/app.py` | the window: input, page turning, pinning, undo, palette commands, saving, export |
 | `src/ream/page.py` | the sheet, the strip of pages behind it, the text editor, images |
 | `src/ream/preview.py` | preview: the finished pages full screen, one after another |
-| `src/ream/pages.py` | the pages panel's strip: thumbnails in spreads, drag to reorder |
+| `src/ream/pages.py` | the pages panel's strip: thumbnails in spreads, drag to reorder; the export panel's page map for picking pages |
 | `src/ream/canvas.py` | the infinite canvas: navigation, input routing, overlay drawing |
 | `src/ream/palette.py` | the Tab command palette |
 | `src/ream/panel.py` | the slider panels |

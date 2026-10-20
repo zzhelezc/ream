@@ -8,7 +8,8 @@ the panel never holds state of its own: `refresh()` re-reads everything.
 
 Row kinds: a slider (double-click its name for the default), a chooser
 (‹ name ›, or click the name for the list), colour swatches (+ opens a
-picker), a two-way toggle and a row of text buttons.
+picker), a two-way toggle, a row of text buttons and a menu to pick one
+from (the tools).
 """
 from __future__ import annotations
 
@@ -88,6 +89,68 @@ class _Swatch(QtWidgets.QWidget):
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
             self.clicked.emit()
+
+
+class _Menu(QtWidgets.QWidget):
+    ROW = 22
+
+    def __init__(self, items, active, choose):
+        super().__init__()
+        self.items, self.active, self.choose = items, active, choose
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.setMouseTracking(True)
+        self.hover: int | None = None
+        self.refresh()
+
+    def refresh(self):
+        self.rows = self.items()
+        self.setFixedHeight(max(1, len(self.rows)) * self.ROW + 2)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        chosen = self.active()
+        for n, (key, label, hint) in enumerate(self.rows):
+            rect = QtCore.QRect(0, n * self.ROW, self.width(), self.ROW)
+            if not key:
+                painter.setFont(style.ui_font(10))
+                painter.setPen(QtGui.QColor("#8c8b86"))
+                painter.drawText(rect.adjusted(2, 4, 0, 0), QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+                                 label)
+                continue
+            on = key == chosen
+            if on:
+                painter.fillRect(rect.adjusted(0, 2, 0, -2), QtGui.QColor(style.INK))
+            elif n == self.hover:
+                painter.fillRect(rect.adjusted(0, 2, 0, -2), QtGui.QColor("#efeee9"))
+            painter.setFont(style.ui_font(12))
+            painter.setPen(QtGui.QColor("#ffffff" if on else style.INK))
+            painter.drawText(rect.adjusted(8, 0, 0, 0), QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+                             label)
+            painter.setFont(style.ui_font(11))
+            painter.setPen(QtGui.QColor("#d8d7d2" if on else "#8c8b86"))
+            painter.drawText(rect.adjusted(0, 0, -8, 0), QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter,
+                             hint)
+
+    def row_at(self, pos) -> int | None:
+        n = pos.y() // self.ROW
+        return n if 0 <= n < len(self.rows) and self.rows[n][0] else None
+
+    def mouseMoveEvent(self, event):
+        hover = self.row_at(event.pos())
+        if hover != self.hover:
+            self.hover = hover
+            self.update()
+
+    def leaveEvent(self, event):
+        self.hover = None
+        self.update()
+
+    def mousePressEvent(self, event):
+        n = self.row_at(event.pos())
+        if n is not None and event.button() == QtCore.Qt.LeftButton:
+            self.choose(self.rows[n][0])
+            self.refresh()
 
 
 class Panel(QtWidgets.QFrame):
@@ -342,6 +405,15 @@ class Panel(QtWidgets.QFrame):
         self.grid.addWidget(self._name(name), row, 0)
         self.grid.addLayout(box, row, 1, 1, 2)
         self._refreshers.append(refresh)
+
+    def menu(self, items: Callable[[], list[tuple]], active: Callable[[], str],
+             choose: Callable[[str], None]):
+        """A list to pick one from (tools, say): `items()` gives (id, label,
+        hint) rows, or ("", group, "") for a heading; the active row is inked."""
+        widget = _Menu(items, active, choose)
+        self.grid.addWidget(widget, self._row(), 0, 1, 3)
+        self._refreshers.append(widget.refresh)
+        return widget
 
     def buttons(self, entries: list[tuple[str, Callable[[], None]]]):
         self.column.addSpacing(4)

@@ -38,9 +38,10 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from . import __version__, distress, export, papers, plugin, profiles, project, spelling, style
 from .canvas import CanvasView
-from .page import GhostPage, Note, NoteText, Sheet, Thing, draw_stock
+from .page import (ALIGN, LOOK, WORDS, GhostPage, Note, NoteText, Sheet, Thing, apply_runs,
+                   char_props, doc_runs, draw_stock, restyle_range)
 from .palette import Command, CommandPalette
-from .pages import PageStrip
+from .pages import PageStrip, PickStrip
 from .preview import Preview
 from .panel import Panel
 
@@ -80,6 +81,8 @@ class Format:
     stock_scale: float = 100.0  # % the paper's size: 100 covers the page
     cover: bool = True          # spreads: the first page alone on the right
     back_cover: bool = False    # spreads: the last page alone on the left
+    align: str = "left"         # left, centre, right, justify
+    track: float = 0.0          # % of normal letter spacing added (negative: tighter)
     ink: float = 100.0          # %: 100 is solid black, lower fades toward the paper,
                                 # higher strikes heavier and packs the ink denser
     dpi: float = 300.0          # export
@@ -89,6 +92,8 @@ class Format:
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in (data or {}).items() if k in known})
 
+
+MODES = ("writer", "design")
 
 FORMAT_PARAMS = {"size": (5, 72), "line": (80, 300), "para": (0, 72), "margin": (0, 200),
                  "head": (0, 200), "dpi": (72, 1200), "ink": (5, 150),
@@ -147,6 +152,15 @@ class Ream(QtWidgets.QMainWindow):
         self.page_panel: Panel | None = None
         self.pages_panel: Panel | None = None
         self.page_strip: PageStrip | None = None
+        self.export_panel: Panel | None = None
+        self.text_panel: Panel | None = None
+        self.tools_panel: Panel | None = None
+        self._look_before: dict | None = None      # a text panel slider being dragged
+        self._words_round = 0                       # a new one per words edit (a drag is one)
+        self._words_join: tuple | None = None
+        self.scene.selectionChanged.connect(self._selection_changed)
+        self.export_pick: set[int] | None = None    # pages to export, None: every page
+        self.export_finish: bool | None = None      # distressed?  None: as distress is
         self.editing: Note | None = None            # the free text being written
         self.active_tool = None                     # a plugin's canvas tool, until Esc
         self.write_mode = False
@@ -158,6 +172,13 @@ class Ream(QtWidgets.QMainWindow):
         self._follow_anim.setDuration(180)
         self._follow_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
         self._follow_anim.valueChanged.connect(self._follow_step)
+        # writer: the words are always live under your hands (and write mode
+        # follows them); design: the page is objects - text boxes, the main
+        # text's frame, images - selected and placed, written in on purpose
+        self.mode = self.prefs.get("mode", "writer") if self.prefs.get("mode") in MODES else "writer"
+        self.story_selected = False                 # design: the main text's frame is selected
+        self.story_editing = False                  # design: writing in the main text
+        self.text_tool = False                      # design: the next click makes a text box
         self.layout = self.prefs.get("layout", "single")    # single / spread / all
         if self.layout not in LAYOUTS:
             self.layout = "single"
@@ -380,6 +401,7 @@ class Ream(QtWidgets.QMainWindow):
         fmt = QtGui.QTextBlockFormat()
         fmt.setLineHeight(self.fmt.line, QtGui.QTextBlockFormat.ProportionalHeight)
         fmt.setBottomMargin(self.fmt.para)
+        fmt.setAlignment(ALIGN.get(self.fmt.align, QtCore.Qt.AlignLeft))
         return fmt
 
     def face(self) -> str:
@@ -393,6 +415,7 @@ class Ream(QtWidgets.QMainWindow):
         font.setStyleHint(QtGui.QFont.Monospace)
         font.setHintingPreference(QtGui.QFont.PreferNoHinting)
         font.setWeight(self.weight())
+        font.setLetterSpacing(QtGui.QFont.PercentageSpacing, 100.0 + self.fmt.track)
         undo = self.doc.isUndoRedoEnabled()
         loading, self._loading = self._loading, True
         steps = self.doc.availableUndoSteps()
@@ -417,7 +440,36 @@ class Ream(QtWidgets.QMainWindow):
     def restyle_notes(self):
         for thing in self.things.values():
             if isinstance(thing, Note):
-                thing.style(self.doc_font(), self.block_format(), self.ink())
+                self.style_note(thing)
+
+    def note_font(self, note: Note) -> QtGui.QFont:
+        """The document's face and size, with the box's own look over them."""
+        look = note.look
+        font = QtGui.QFont(self.doc_font())
+        face = look.get("font")
+        if face and style.installed(face):
+            font.setFamily(face)
+        if look.get("size"):
+            font.setPointSizeF(float(look["size"]))
+        track = look.get("track", self.fmt.track)
+        font.setLetterSpacing(QtGui.QFont.PercentageSpacing, 100.0 + float(track))
+        if look.get("weight") == "bold":
+            font.setWeight(QtGui.QFont.Bold)
+        if look.get("italic"):
+            font.setItalic(True)
+        return font
+
+    def note_block(self, note: Note) -> QtGui.QTextBlockFormat:
+        fmt = self.block_format()
+        look = note.look
+        if look.get("line"):
+            fmt.setLineHeight(float(look["line"]), QtGui.QTextBlockFormat.ProportionalHeight)
+        if look.get("align") in ALIGN:
+            fmt.setAlignment(ALIGN[look["align"]])
+        return fmt
+
+    def style_note(self, note: Note):
+        note.style(self.note_font(note), self.note_block(note), self.ink())
 
     def _format_edit(self, key: str, edit):
         """A layout change that Qt keeps in the words' undo stack (block and
@@ -529,6 +581,13 @@ class Ream(QtWidgets.QMainWindow):
                                                     box.bottom() - 2), label)
                 else:
                     painter.drawText(QtCore.QPointF(box.right() + 8, box.bottom() - 2), label)
+        if self.design():
+            self._paint_design(painter, transform, shown)
+            tag = "design" + (" · text box" if self.text_tool else
+                              " · writing" if self.story_editing or self.editing is not None else "")
+            area = QtCore.QRectF(self.view.viewport().rect()).adjusted(18, 0, -18, -16)
+            painter.setPen(style.qc(th["meta"]))
+            painter.drawText(area, QtCore.Qt.AlignRight | QtCore.Qt.AlignBottom, tag)
         if self.write_mode:
             tag = f"write · {self.view.zoom() * 100:.0f}%"
             if self.spelling_on():
@@ -683,12 +742,22 @@ class Ream(QtWidgets.QMainWindow):
             thing.setSelected(True)
         if things:
             self.sheet.text.clearFocus()
+            self.story_selected = False
         self.view.viewport().update()
 
     def typing(self) -> bool:
+        if self.design():
+            return self.story_editing or self.editing is not None
         return not self.selection()
 
     def focus_text(self):
+        if self.design() and not self.story_editing:
+            # nothing types in design mode until you choose where
+            if not self.view.hasFocus():
+                self.view.setFocus(QtCore.Qt.OtherFocusReason)
+            if self.sheet.text.hasFocus():
+                self.sheet.text.clearFocus()
+            return
         if not self.view.hasFocus():
             self.view.setFocus(QtCore.Qt.OtherFocusReason)
         if self.scene.focusItem() is not self.sheet.text:
@@ -730,8 +799,10 @@ class Ream(QtWidgets.QMainWindow):
                 self.finish_editing()
             self.sheet.text.clearFocus()
             self.toast(f"{tool.name} · Esc to stop")
+            self.text_tool = False
         else:
             self.focus_text()
+        self._refresh_tools_panel()
         self.update_cursor()
         self.view.viewport().update()
 
@@ -808,6 +879,14 @@ class Ream(QtWidgets.QMainWindow):
             if self._inside(self.editing, at):
                 return False                # the note's editor places the caret
             self.finish_editing()
+        if self.design():
+            if self.text_tool:
+                self.drag = {"mode": "textbox", "start": at, "press": pos, "rect": None}
+                return True
+            if self.story_editing:
+                if self.story_hit(at, slack=True):
+                    return False            # the words' editor places the caret
+                self.leave_story_editing(select=False)
         hit = self.frame_at(pos)
         if hit is not None:
             frame, part = hit
@@ -843,8 +922,12 @@ class Ream(QtWidgets.QMainWindow):
                          "angle": math.degrees(math.atan2(at.y() - centre.y(), at.x() - centre.x())),
                          "rotation": thing.rotation()}
             return True
-        thing = self.thing_at(at, behind=bool(mods & QtCore.Qt.AltModifier))
+        behind = bool(mods & QtCore.Qt.AltModifier)
+        if self.design() and not self.story_hit(at):
+            behind = True                   # no words here: what lies under them is reachable
+        thing = self.thing_at(at, behind=behind)
         if thing is not None:
+            self.story_selected = False
             if mods & QtCore.Qt.ShiftModifier:
                 thing.setSelected(not thing.isSelected())
             elif not thing.isSelected():
@@ -856,6 +939,15 @@ class Ream(QtWidgets.QMainWindow):
             self.view.viewport().update()
             return True
         self.clear_selection()
+        if self.design():
+            self.live_on(at)
+            self.story_selected = self.story_hit(at)
+            if not self.story_selected:
+                # an empty spot: drag a marquee round what to select
+                self.drag = {"mode": "marquee", "start": at, "press": pos, "rect": None,
+                             "add": bool(mods & QtCore.Qt.ShiftModifier)}
+            self.view.viewport().update()
+            return True
         self.live_on(at)                    # a click on another shown page makes it live
         page = self.sheet.scene_page_rect()
         if page.contains(at):
@@ -877,6 +969,11 @@ class Ream(QtWidgets.QMainWindow):
             return True
         if drag["mode"] == "tool":
             self.active_tool.move(at, event.modifiers())
+            self.view.viewport().update()
+            return True
+        if drag["mode"] in ("marquee", "textbox"):
+            if (pos - drag["press"]).manhattanLength() >= 3:
+                drag["rect"] = QtCore.QRectF(drag["start"], at).normalized()
             self.view.viewport().update()
             return True
         if drag["mode"] in ("frame-move", "frame-resize"):
@@ -940,6 +1037,23 @@ class Ream(QtWidgets.QMainWindow):
             drag["frame"].changed()
             self.view.viewport().update()
             return
+        if drag["mode"] == "marquee":
+            rect = drag.get("rect")
+            if rect is not None:
+                hits = self.things_in(rect)
+                if drag.get("add"):
+                    hits = list(dict.fromkeys(self.selection() + hits))
+                self.select(hits)
+            self.view.viewport().update()
+            return
+        if drag["mode"] == "textbox":
+            rect = drag.get("rect")
+            self.set_text_tool(False, quiet=True)
+            if rect is not None and rect.width() >= 12:
+                self.new_note(rect.topLeft(), wrap=rect.width(), top=True)
+            else:
+                self.new_note(drag["start"])
+            return
         if drag["mode"] == "move":
             carried = drag["things"]
             z = max((t.zValue() for t in self.things.values()
@@ -958,6 +1072,8 @@ class Ream(QtWidgets.QMainWindow):
 
     def double_click(self, event: QtGui.QMouseEvent) -> bool:
         at = self.view.mapToScene(event.pos())
+        if self.design():
+            return self._design_double_click(at)
         hit = self.thing_at(at)
         if isinstance(hit, Note):
             if self.editing is not hit:
@@ -988,13 +1104,17 @@ class Ream(QtWidgets.QMainWindow):
             viewport.setCursor(QtCore.Qt.OpenHandCursor)
         elif self.editing is not None and self._inside(self.editing, at):
             viewport.setCursor(QtCore.Qt.IBeamCursor)
+        elif self.design() and self.text_tool:
+            viewport.setCursor(QtCore.Qt.IBeamCursor)
+        elif self.design() and self.story_editing and self.story_hit(at, slack=True):
+            viewport.setCursor(QtCore.Qt.IBeamCursor)
         elif self.handle_at(pos) is not None:
             kind = self.handle_at(pos)[1]
             viewport.setCursor(QtCore.Qt.SizeFDiagCursor if kind == "scale"
                                else QtCore.Qt.CrossCursor)
-        elif self.thing_at(at) is not None:
+        elif self.thing_at(at, behind=self.design() and not self.story_hit(at)) is not None:
             viewport.setCursor(QtCore.Qt.SizeAllCursor)
-        elif self.sheet.scene_page_rect().contains(at):
+        elif self.sheet.scene_page_rect().contains(at) and not self.design():
             viewport.setCursor(QtCore.Qt.IBeamCursor)
         else:
             viewport.setCursor(QtCore.Qt.ArrowCursor)
@@ -1509,6 +1629,7 @@ class Ream(QtWidgets.QMainWindow):
     def caret_moved(self, follow: bool = True):
         if self._loading:
             return
+        self._refresh_text_panel()                  # selected words show their type
         page = self.sheet.caret_page()
         if page != self.page:
             self.flip(page)
@@ -1571,6 +1692,8 @@ class Ream(QtWidgets.QMainWindow):
         little above the middle; from then on the view follows the writing."""
         if self.write_mode:
             return
+        if self.design():
+            self.set_mode("writer", quiet=True)         # write mode is writing
         # the exact view, scroll positions and all, so leaving puts it back to the pixel
         self._before_write = (QtGui.QTransform(self.view.transform()),
                               self.view.horizontalScrollBar().value(),
@@ -1802,11 +1925,13 @@ class Ream(QtWidgets.QMainWindow):
         self.view.viewport().update()
 
     def context_menu(self, global_pos: QtCore.QPoint, view_pos: QtCore.QPointF):
-        """Right-click: the palette - with spelling suggestions first when the
-        click is on a flagged word."""
+        """Right-click: spelling suggestions on a flagged word; else the
+        control panel of what is under the pointer (see panel_at); else the
+        palette."""
         mark = self._misspelling_at(view_pos)
         if mark is None:
-            self.open_palette(global_pos)
+            if not self.open_panel_at(view_pos):
+                self.open_palette(global_pos)
             return
         editor, start, end, word, _segments, _clip = mark
         speller = self.speller()
@@ -1820,6 +1945,58 @@ class Ream(QtWidgets.QMainWindow):
                              lambda: (speller.ignore(word), self.view.viewport().update()),
                              "this session", key="spell:ignore"))
         self.open_palette(global_pos, first=first)
+
+    def context_panels(self) -> list[tuple]:
+        """(test(thing), open) pairs: ream's own, then the plugins'."""
+        own = [(lambda t: isinstance(t, Note), self.open_text_panel)]
+        return own + [c for _p, host in getattr(self, "plugins", []) for c in host.contexts]
+
+    def open_panel_at(self, view_pos: QtCore.QPointF) -> bool:
+        """Right-click opens what you clicked's panel: a plugin frame's, a
+        text box's (the text panel), an image's (stik's, when it is on),
+        the main text's (the text panel), the page's (the page panel).
+        False: nothing here has one."""
+        at = self.view.mapToScene(view_pos.toPoint())
+        # a plugin frame anywhere inside it (left clicks inside go through it,
+        # but its panel belongs to the whole frame)
+        for frame in sorted((f for f in self.plugin_frames() if f.isVisible()),
+                            key=lambda f: -f.zValue()):
+            if frame.on_context is not None and \
+                    (frame.scene_rect().contains(at) or frame.part_at(view_pos,
+                                                                      self.view.viewportTransform())):
+                frame.on_context()
+                return True
+        on_words = self.story_hit(at) if self.design() else self._on_words(at)
+        thing = self.thing_at(at, behind=self.design() and not on_words)
+        if thing is not None:
+            if thing is not self.editing and not thing.isSelected():
+                if self.editing is not None:
+                    self.finish_editing()
+                self.select([thing])
+            for test, open_panel in self.context_panels():
+                if test(thing):
+                    open_panel()
+                    return True
+            return False                         # the palette, with it selected
+        page = self.sheet.scene_page_rect()
+        ghost = next((g for g in self.ghosts.values() if g.sceneBoundingRect().contains(at)), None)
+        if not page.contains(at) and ghost is None:
+            return False
+        if on_words:
+            if self.design() and not self.story_editing:
+                self.clear_selection()
+                self.story_selected = True
+                self.view.viewport().update()
+            self.open_text_panel()
+        else:
+            self.open_page_panel()
+        return True
+
+    def _on_words(self, at: QtCore.QPointF) -> bool:
+        """Writer mode: is `at` in the main text's frame on the live page?"""
+        page = self.sheet.scene_page_rect()
+        return page.contains(at) and self.page < self.sheet.text_pages() and \
+            self.margin_box().adjusted(-4, -4, 4, 4).contains(at - page.topLeft())
 
     def keep_caret_in_view(self):
         top, bottom = self.sheet.caret_span()
@@ -1896,6 +2073,15 @@ class Ream(QtWidgets.QMainWindow):
                     self.editing.fit()
                 return True
             return False                    # to the note's editor
+        if self.design():
+            if self.story_editing:
+                if key == QtCore.Qt.Key_Escape:
+                    self.leave_story_editing()
+                    return True
+            else:
+                handled = self._design_key(event)
+                if handled is not None:
+                    return handled
         if event.matches(QtGui.QKeySequence.Undo):
             self.undo()
             return True
@@ -1948,10 +2134,14 @@ class Ream(QtWidgets.QMainWindow):
                 return True
             if mods & QtCore.Qt.ControlModifier:
                 return True                 # no word to apply it to
+            if self.design():
+                return True                 # nothing types until you choose where
             self.clear_selection()          # typing goes back to the words
         if key == QtCore.Qt.Key_Escape:
             if self.write_mode:
                 self.leave_write_mode()
+            return True
+        if self.design() and not self.story_editing:
             return True
         self.focus_text()
         return False
@@ -1959,7 +2149,8 @@ class Ream(QtWidgets.QMainWindow):
     # -- history -------------------------------------------------------------
     def snapshot(self) -> dict:
         return {uid: (t.alive, t.pinned, t.pos().x(), t.pos().y(), t.w, t.h, t.zValue(),
-                      t.rotation(), (t.original, t.mask, t.matte, t.border, t.flip))
+                      t.rotation(), dict(t.look) if isinstance(t, Note) else
+                      (t.original, t.mask, t.matte, t.border, t.flip))
                 for uid, t in self.things.items()}
 
     def things_key(self) -> tuple:
@@ -1999,6 +2190,9 @@ class Ream(QtWidgets.QMainWindow):
                         thing.set_pixels(mask=mask, matte=matte, border=border)
                 if flip != thing.flip:
                     thing.set_flip(*flip)
+            elif isinstance(pixels, dict) and isinstance(thing, Note) and pixels != thing.look:
+                thing.look = dict(pixels)
+                self.style_note(thing)
         if self.editing is not None and not self.editing.alive:
             self.editing = None
             self.focus_text()
@@ -2351,32 +2545,552 @@ class Ream(QtWidgets.QMainWindow):
                 thing.setPos(self.fmt.margin, thing.pos().y())
         self._each_selected(act)
 
+    # -- the text panel: type for text boxes, or the main text -----------------------
+    def text_targets(self) -> list[Note] | str:
+        """The text boxes being styled: the selected ones (and the one being
+        written in) - or "story", the main text, when there are none."""
+        notes = [t for t in self.selection() if isinstance(t, Note)]
+        if self.editing is not None and self.editing not in notes:
+            notes.append(self.editing)
+        return notes or "story"
+
+    def story_look(self) -> dict:
+        return {"font": self.face(), "size": self.fmt.size, "line": self.fmt.line,
+                "align": self.fmt.align, "track": self.fmt.track, "weight": "regular",
+                "italic": False}
+
+    def words_target(self) -> Note | str | None:
+        """Where words are selected for styling: the text box being written
+        in, or "story" (the main text, while you write in it) - else None."""
+        if self.editing is not None:
+            return self.editing if self.editing.editor.textCursor().hasSelection() else None
+        if self.selection() or (self.design() and not self.story_editing):
+            return None
+        return "story" if self.sheet.text.textCursor().hasSelection() else None
+
+    def _words_doc(self, where) -> tuple[QtGui.QTextDocument, QtGui.QTextCursor]:
+        if where == "story":
+            return self.doc, self.sheet.text.textCursor()
+        return where.editor.document(), where.editor.textCursor()
+
+    def box_value(self, where, key: str):
+        """The type the words sit in: the box's look, or the document's."""
+        base = self.story_look()
+        return base[key] if where == "story" else where.look.get(key, base[key])
+
+    def text_value(self, key: str):
+        where = self.words_target()
+        if where is not None and key in WORDS:
+            doc, cursor = self._words_doc(where)
+            probe = QtGui.QTextCursor(doc)
+            probe.setPosition(cursor.selectionStart())
+            probe.movePosition(QtGui.QTextCursor.NextCharacter)      # the first selected word
+            return char_props(probe.charFormat()).get(key, self.box_value(where, key))
+        targets = self.text_targets()
+        base = self.story_look()
+        if targets == "story":
+            return base[key]
+        return targets[0].look.get(key, base[key])
+
+    def style_words(self, where, key: str, value, slider: bool = False):
+        """Selected words get a type of their own over their box's - one undo
+        step (a slider's whole drag is one).  `key` "*" with None: back to
+        the box's type."""
+        doc, cursor = self._words_doc(where)
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        if key != "*" and value == self.box_value(where, key) and key in ("weight", "italic"):
+            value = None                        # regular / upright: just follow the box
+        tag = (where if where == "story" else where.uid, key, self._words_round)
+        if where == "story":
+            self._format_edit(f"words:{key}:{self._words_round}",
+                              lambda _c: restyle_range(doc, start, end, key, value))
+            self.caret_moved(follow=False)
+        else:
+            join = slider and self._words_join == tag and doc.availableUndoSteps() > 0
+            edit = QtGui.QTextCursor(doc)
+            if join:
+                self._joining = True
+                edit.joinPreviousEditBlock()
+            else:
+                edit.beginEditBlock()
+            try:
+                restyle_range(doc, start, end, key, value)
+                edit.endEditBlock()
+            finally:
+                self._joining = False
+            where.fit()
+            where.version += 1
+            self.changed()
+        self._words_join = tag
+        if not slider:
+            self._words_round += 1
+        self._refresh_text_panel()
+        self.view.viewport().update()
+
+    def set_text_value(self, key: str, value, slider: bool = False):
+        """Set one part of the type.  On selected words it is theirs alone; on
+        boxes it is theirs alone; each one undo step (a slider's whole drag
+        is one).  On the main text it is the document's type, as the page
+        panel sets it."""
+        where = self.words_target()
+        if where is not None and key in WORDS:
+            self.style_words(where, key, value, slider)
+            return
+        targets = self.text_targets()
+        if targets == "story" and key in ("weight", "italic"):
+            self.toast("select words, or a text box, to set them bold or italic")
+            self._refresh_text_panel()
+            return
+        if targets == "story":
+            if key == "font":
+                self.set_format(font=value)
+            elif key == "size":
+                self.set_size(value)
+            elif key == "line":
+                self.set_line_height(value)
+            elif key == "align":
+                self.set_align(value)
+            elif key == "track":
+                self.set_format(track=value)
+            if self.page_panel is not None:
+                self.page_panel.refresh()
+            return
+        fresh = self._look_before is None
+        if fresh:
+            self._look_before = self.snapshot()
+        for note in targets:
+            note.look[key] = value
+            self.style_note(note)
+        if fresh:
+            self.push("things", self._look_before)
+        if not slider:
+            self._look_before = None
+        self.changed()
+        self.view.viewport().update()
+
+    def reset_look(self):
+        """Selected words back to their box's type; else the chosen boxes
+        back to the document's type."""
+        where = self.words_target()
+        if where is not None:
+            self.style_words(where, "*", None)
+            return
+        targets = self.text_targets()
+        if targets == "story" or not any(n.look for n in targets):
+            return
+        before = self.snapshot()
+        for note in targets:
+            note.look = {}
+            self.style_note(note)
+        self.push("things", before)
+        self.changed()
+        self._refresh_text_panel()
+
+    def set_align(self, value: str):
+        self.fmt.align = value
+        fmt = QtGui.QTextBlockFormat()
+        fmt.setAlignment(ALIGN.get(value, QtCore.Qt.AlignLeft))
+        self._format_edit("align", self._merge_blocks(fmt))
+        self.restyle_notes()
+        self.caret_moved(follow=False)
+
+    def build_text_panel(self) -> Panel:
+        panel = Panel(self, "text", on_tab=self.open_palette)
+        v = self.text_value
+        panel.choice("font", style.faces, lambda: v("font"), lambda x: self.set_text_value("font", x))
+        lo, hi = LOOK["size"]
+        panel.slider("size", lo, hi, lambda: v("size"),
+                     lambda x: self.set_text_value("size", x, slider=True), step=0.5, unit=" pt",
+                     default=9)
+        lo, hi = LOOK["line"]
+        panel.slider("line", lo, hi, lambda: v("line"),
+                     lambda x: self.set_text_value("line", x, slider=True), step=5, unit="%",
+                     default=150)
+        panel.choice("align", lambda: list(LOOK["align"]), lambda: v("align"),
+                     lambda x: self.set_text_value("align", x))
+        lo, hi = LOOK["track"]
+        panel.slider("track", lo, hi, lambda: v("track"),
+                     lambda x: self.set_text_value("track", x, slider=True), unit="%", default=0)
+        panel.toggle("weight", lambda: v("weight") != "bold",
+                     lambda on: self.set_text_value("weight", "regular" if on else "bold"),
+                     on="regular", off="bold")
+        panel.toggle("italic", lambda: not v("italic"),
+                     lambda on: self.set_text_value("italic", not on), on="upright", off="italic")
+        panel.links("", [(lambda: "as the box" if self.words_target() not in (None, "story")
+                          else "as the text" if self.words_target() == "story" else "as document",
+                          self.reset_look)])
+        panel.on_release = self._text_panel_released
+        panel.buttons([("new text box", lambda: (self.set_mode("design", quiet=True),
+                                                 self.set_text_tool(True))),
+                       ("close", panel.close_panel)])
+        return panel
+
+    def toggle_text_panel(self):
+        if self.text_panel is not None and self.text_panel.isVisible():
+            self.text_panel.close_panel()
+        else:
+            self.open_text_panel()
+
+    def open_text_panel(self):
+        if self.text_panel is None:
+            self.text_panel = self.build_text_panel()
+        self._open_beside(self.text_panel, self.page_panel)
+        self.text_panel.raise_()
+        self._refresh_text_panel()
+
+    # -- tools ---------------------------------------------------------------------
+    def tool_entries(self) -> list[dict]:
+        """Every tool: ream's own (write, select, text box), then each
+        plugin's, as {id, label, key, group, choose}."""
+        def design(text_tool: bool):
+            def choose():
+                if self.active_tool is not None:
+                    self.use_tool(None)
+                self.set_mode("design", quiet=True)
+                self.set_text_tool(text_tool, quiet=True)
+            return choose
+        entries = [
+            {"id": "write", "label": "write", "key": "⌥⌘D", "group": "ream",
+             "choose": lambda: (self.active_tool is not None and self.use_tool(None),
+                                self.set_mode("writer", quiet=True))},
+            {"id": "select", "label": "select", "key": "V", "group": "ream", "choose": design(False)},
+            {"id": "text box", "label": "text box", "key": "T", "group": "ream",
+             "choose": design(True)},
+        ]
+        for which, host in getattr(self, "plugins", []):
+            for n, (tool, label, key, choose) in enumerate(host.tools):
+                entries.append({"id": f"{which.name}:{n}", "label": label, "key": key,
+                                "group": which.title, "choose": choose, "tool": tool})
+        return entries
+
+    def active_tool_id(self) -> str:
+        if self.active_tool is not None:
+            for entry in self.tool_entries():
+                if entry.get("tool") is self.active_tool:
+                    return entry["id"]
+            return ""
+        if not self.design():
+            return "write"
+        return "text box" if self.text_tool else "select"
+
+    def choose_tool(self, tool_id: str):
+        for entry in self.tool_entries():
+            if entry["id"] == tool_id:
+                entry["choose"]()
+                break
+        self._refresh_tools_panel()
+
+    def build_tools_panel(self) -> Panel:
+        panel = Panel(self, "tools", on_tab=self.open_palette)
+
+        def rows():
+            out, group = [], None
+            for entry in self.tool_entries():
+                if entry["group"] != group:
+                    group = entry["group"]
+                    out.append(("", group, ""))
+                out.append((entry["id"], entry["label"], entry["key"]))
+            return out
+
+        panel.menu(rows, self.active_tool_id, self.choose_tool)
+        panel.buttons([("close", panel.close_panel)])
+        return panel
+
+    def toggle_tools_panel(self):
+        if self.tools_panel is not None and self.tools_panel.isVisible():
+            self.tools_panel.close_panel()
+            return
+        if self.tools_panel is None:
+            self.tools_panel = self.build_tools_panel()
+        fresh = not self.tools_panel.placed
+        self.tools_panel.open()
+        if fresh:                                 # the left side, like InDesign's tools
+            self.tools_panel.move(20, 20)
+            if self.pages_panel is not None and self.pages_panel.isVisible():
+                self.tools_panel.move(self.pages_panel.geometry().right() + 12, 20)
+            self.tools_panel.keep_inside()
+
+    def _refresh_tools_panel(self):
+        panel = self.tools_panel
+        if panel is not None and panel.isVisible():
+            panel.refresh()
+            panel.fit_height()
+
+    def _text_panel_released(self):
+        self._look_before = None
+        self._words_round += 1                  # the next drag is a step of its own
+
+    def _selection_changed(self):
+        # a bound method, not a lambda: it is let go with the window, so a
+        # scene tearing down never calls into a window that is gone
+        if not getattr(self.view, "closing", False):
+            self._refresh_text_panel()
+
+    def _refresh_text_panel(self):
+        panel = self.text_panel
+        if panel is None or not panel.isVisible():
+            return
+        where = self.words_target()
+        targets = self.text_targets()
+        if where is not None:
+            panel.caption.setText("text · words in the main text" if where == "story" else
+                                  "text · words in a box")
+        else:
+            panel.caption.setText("text · main text" if targets == "story" else
+                                  f"text · {len(targets)} box{'es' if len(targets) != 1 else ''}")
+        panel.refresh()
+
+    # -- writer and design modes ---------------------------------------------------
+    def design(self) -> bool:
+        return self.mode == "design"
+
+    def set_mode(self, mode: str, quiet: bool = False):
+        """Writer: the page's words are always live, a click puts the caret
+        in them.  Design: like InDesign - a click selects (a text box, the
+        main text's frame, an image), a drag on an empty spot draws a
+        marquee, double-click writes, T makes a new text box."""
+        if mode not in MODES:
+            return
+        if self.editing is not None:
+            self.finish_editing()
+        self.story_editing = self.story_selected = False
+        self.text_tool = False
+        self.mode = mode
+        self.prefs["mode"] = mode
+        self._write_prefs()
+        if mode == "design":
+            if self.write_mode:
+                self.leave_write_mode()
+            cursor = self.sheet.text.textCursor()
+            cursor.clearSelection()
+            self.sheet.text.setTextCursor(cursor)
+            self.sheet.text.clearFocus()
+            self.view.setFocus(QtCore.Qt.OtherFocusReason)
+            if not quiet:
+                self.toast("design · click selects · double-click writes · T text box · ⌥⌘D writer")
+        else:
+            self.focus_text()
+            if not quiet:
+                self.toast("writer · ⌥⌘D design")
+        self._refresh_text_panel()
+        self._refresh_tools_panel()
+        self.update_cursor()
+        self.view.viewport().update()
+
+    def toggle_mode(self):
+        self.set_mode("writer" if self.design() else "design")
+
+    def margin_box(self) -> QtCore.QRectF:
+        """The main text's frame on a page, in page coordinates."""
+        m, h = self.fmt.margin, self.fmt.head
+        return QtCore.QRectF(m, h, max(1.0, self.sheet.W - 2 * m), max(1.0, self.sheet.H - 2 * h))
+
+    def story_hit(self, at: QtCore.QPointF, slack: bool = False) -> bool:
+        """Is `at` on the main text's frame on the live page (one with
+        words)?  `slack`: a little round it too, for placing the caret."""
+        page = self.sheet.scene_page_rect()
+        if not page.contains(at):
+            return False
+        if self.page >= self.sheet.text_pages() or not self.doc.toPlainText().strip():
+            return slack and self.story_editing
+        grow = 24.0 if slack else 4.0
+        local = at - page.topLeft()
+        return self.margin_box().adjusted(-grow, -grow, grow, grow).contains(local)
+
+    def things_in(self, rect: QtCore.QRectF) -> list[Thing]:
+        """What a marquee touches - on the canvas, or on the shown page."""
+        page = self.sheet.scene_page_rect()
+        hits = []
+        for thing in self.things.values():
+            if not thing.alive or thing.scene() is None:
+                continue
+            box = thing.sceneBoundingRect()
+            if thing.pinned and not box.intersects(page):
+                continue                     # on another page of the strip, out of sight
+            if box.intersects(rect):
+                hits.append(thing)
+        return hits
+
+    def start_story_editing(self, at: QtCore.QPointF | None = None):
+        """Design mode: write in the main text, the caret where you clicked."""
+        self.clear_selection()
+        self.story_selected = False
+        self.story_editing = True
+        self.focus_text()
+        editor = self.sheet.text
+        cursor = editor.textCursor()
+        if at is not None:
+            local = editor.mapFromScene(at)
+            cursor.setPosition(max(0, self.doc.documentLayout().hitTest(local, QtCore.Qt.FuzzyHit)))
+        else:
+            cursor.movePosition(QtGui.QTextCursor.End)
+        editor.setTextCursor(cursor)
+        self.caret_moved(follow=False)
+        self._refresh_text_panel()
+        self.update_cursor()
+        self.view.viewport().update()
+
+    def leave_story_editing(self, select: bool = True):
+        """Stop writing in the main text; `select` leaves its frame selected."""
+        if not self.story_editing:
+            return
+        self.story_editing = False
+        editor = self.sheet.text
+        cursor = editor.textCursor()
+        cursor.clearSelection()
+        editor.setTextCursor(cursor)
+        editor.clearFocus()
+        self.story_selected = select
+        self._refresh_text_panel()
+        self.update_cursor()
+        self.view.viewport().update()
+
+    def set_text_tool(self, on: bool, quiet: bool = False):
+        self.text_tool = on
+        if on:
+            if self.editing is not None:
+                self.finish_editing()
+            self.leave_story_editing(select=False)
+            self.clear_selection()
+            self.story_selected = False
+            if self.active_tool is not None:
+                self.use_tool(None)
+            if not quiet:
+                self.toast("text box · click, or drag its width · Esc to stop")
+        self._refresh_tools_panel()
+        self.update_cursor()
+        self.view.viewport().update()
+
+    def _design_double_click(self, at: QtCore.QPointF) -> bool:
+        hit = self.thing_at(at, behind=not self.story_hit(at))
+        if isinstance(hit, Note):
+            if self.editing is not hit:
+                self.start_editing(hit, at)
+                return True
+            return False                    # already writing: selects a word
+        if hit is not None:
+            return True
+        if self.story_editing and self.story_hit(at, slack=True):
+            return False                    # selects a word
+        if self.story_hit(at):
+            self.start_story_editing(at)
+            return True
+        if not self.sheet.scene_page_rect().contains(at):
+            self.browse_files(at)
+        return True
+
+    def _design_key(self, event: QtGui.QKeyEvent) -> bool | None:
+        """Design mode's own keys; None: on to the shared ones (delete,
+        nudge, undo, stacking…)."""
+        key, mods = event.key(), event.modifiers()
+        plain = not mods & (QtCore.Qt.ControlModifier | QtCore.Qt.AltModifier | QtCore.Qt.MetaModifier)
+        chosen = self.selection()
+        if key == QtCore.Qt.Key_Escape:
+            if self.text_tool:
+                self.set_text_tool(False)
+            elif chosen or self.story_selected:
+                self.clear_selection()
+                self.story_selected = False
+                self._refresh_text_panel()
+                self.view.viewport().update()
+            return True
+        if plain and key == QtCore.Qt.Key_T:
+            self.set_text_tool(True)
+            return True
+        if plain and key == QtCore.Qt.Key_V:
+            self.set_text_tool(False)
+            if self.active_tool is not None:
+                self.use_tool(None)
+            return True
+        letter = event.text().upper()
+        if plain and letter:
+            for entry in self.tool_entries():
+                if entry["key"] == letter and entry["group"] != "ream":
+                    entry["choose"]()
+                    return True
+        if plain and key in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+            if len(chosen) == 1 and isinstance(chosen[0], Note):
+                self.start_editing(chosen[0])
+            elif self.story_selected:
+                self.start_story_editing()
+            return True
+        return None
+
+    def _paint_design(self, painter: QtGui.QPainter, transform: QtGui.QTransform, shown):
+        """Frame edges, as InDesign shows them: the main text's frame on the
+        pages with words, every text box's outline; the marquee."""
+        painter.save()
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        light = self.canvas_is_light()
+        quiet = QtGui.QPen(style.qc("#b9b8b2" if light else "#6b6a66"), 1.0, QtCore.Qt.CustomDashLine)
+        quiet.setDashPattern([2.0, 3.0])
+        strong = QtGui.QPen(style.qc(style.INK if light else "#ffffff"), 1.0)
+        zoom = self.view.zoom()
+        box = self.margin_box()
+        painter.setBrush(QtCore.Qt.NoBrush)
+        has_words = bool(self.doc.toPlainText().strip())
+        for index, rect in shown:
+            if not has_words or index >= self.sheet.text_pages():
+                continue
+            frame = QtCore.QRectF(rect.left() + box.left() * zoom, rect.top() + box.top() * zoom,
+                                  box.width() * zoom, box.height() * zoom)
+            if self.story_selected or self.story_editing:
+                pen = QtGui.QPen(strong)
+                if self.story_editing:
+                    pen.setStyle(QtCore.Qt.CustomDashLine)
+                    pen.setDashPattern([4.0, 3.0])
+                painter.setPen(pen)
+            else:
+                painter.setPen(quiet)
+            painter.drawRect(frame)
+        painter.setPen(quiet)
+        page = transform.mapRect(self.sheet.scene_page_rect())
+        for thing in self.things.values():
+            if not isinstance(thing, Note) or not thing.alive or thing.scene() is None \
+                    or thing.isSelected() or thing is self.editing:
+                continue
+            outline = transform.map(thing.mapToScene(thing.boundingRect()))
+            if thing.pinned and not outline.boundingRect().intersects(page):
+                continue
+            painter.drawPolygon(outline)
+        if self.drag and self.drag.get("mode") in ("marquee", "textbox") and self.drag.get("rect"):
+            pen = QtGui.QPen(strong)
+            if self.drag["mode"] == "marquee":
+                pen.setStyle(QtCore.Qt.CustomDashLine)
+                pen.setDashPattern([3.0, 3.0])
+            painter.setPen(pen)
+            painter.drawRect(transform.mapRect(self.drag["rect"]))
+        painter.restore()
+
     # -- free text -----------------------------------------------------------
     def _inside(self, note: Note, at: QtCore.QPointF) -> bool:
         local = note.mapFromScene(at)
         return note.boundingRect().adjusted(-4, -4, 4, 4).contains(local)
 
-    def new_note(self, at: QtCore.QPointF) -> Note:
+    def new_note(self, at: QtCore.QPointF, wrap: float | None = None, top: bool = False) -> Note:
         """A block of text whose first line starts at `at`.  On the page it
         is pinned and wraps at the right margin; on the canvas it is one
-        line that grows."""
+        line that grows.  `wrap` gives it a width (a text box drawn by
+        dragging), `top` puts its top-left corner at `at`."""
         self.clear_selection()
+        self.story_selected = False
         before = self.snapshot()
         on_page = self.live_on(at)
         page = self.sheet.scene_page_rect()
-        wrap = -1.0
-        if on_page:
-            x = at.x() - page.left()
-            right = self.sheet.W - self.fmt.margin
-            wrap = (right - x) if right - x >= 60 else max(40.0, self.sheet.W - x - 8)
+        if wrap is None:
+            wrap = -1.0
+            if on_page:
+                x = at.x() - page.left()
+                right = self.sheet.W - self.fmt.margin
+                wrap = (right - x) if right - x >= 60 else max(40.0, self.sheet.W - x - 8)
         note = Note(self, "", wrap)
-        note.style(self.doc_font(), self.block_format(), self.ink())
+        self.style_note(note)
         metrics = QtGui.QFontMetricsF(self.doc_font())
         line = metrics.height() * self.fmt.line / 100.0
         self.things[note.uid] = note
         self.scene.addItem(note)
         # the click lands on the middle of the first line, not its top
-        note.setPos(at.x(), at.y() - line / 2)
+        note.setPos(at.x(), at.y() - (0 if top else line / 2))
         note.setZValue(self.top_z() + 1.0)
         if on_page:
             self.pin(note)
@@ -2404,6 +3118,7 @@ class Ream(QtWidgets.QMainWindow):
         else:
             cursor.movePosition(QtGui.QTextCursor.End)
         editor.setTextCursor(cursor)
+        self._refresh_text_panel()
         self.view.viewport().update()
 
     def finish_editing(self):
@@ -2419,6 +3134,7 @@ class Ream(QtWidgets.QMainWindow):
         if not note.text().strip():
             self._discard(note)
         self._note_birth = None
+        self._refresh_text_panel()
         self.view.viewport().update()
 
     def _discard(self, note: Note):
@@ -2463,7 +3179,9 @@ class Ream(QtWidgets.QMainWindow):
     def duplicate(self, thing: Thing, offset: QtCore.QPointF = QtCore.QPointF(16, 16)) -> Thing:
         if thing.kind != "image":
             copy = Note(self, thing.text(), thing.wrap)
-            copy.style(self.doc_font(), self.block_format(), self.ink())
+            apply_runs(copy.editor.document(), doc_runs(thing.editor.document()))
+            copy.look = dict(thing.look)
+            self.style_note(copy)
         else:
             copy = Thing(thing.original, QtCore.QSizeF(thing.w, thing.h), thing.blob, thing.ext,
                          thing.pdf_page, thing.name)
@@ -3039,7 +3757,7 @@ class Ream(QtWidgets.QMainWindow):
                      lambda v: (setattr(self.fmt, "dpi", v), self.changed()), step=12, default=300)
         panel.buttons([("reset", self.reset_distress),
                        ("new seed", self._new_seed),
-                       ("export pdf", self.export_pdf)])
+                       ("export…", self.toggle_export_panel)])
         panel.on_release = lambda: (self._refresh_live_preview(fast=False), self._render_ghosts())
         return panel
 
@@ -3152,9 +3870,10 @@ class Ream(QtWidgets.QMainWindow):
             self.pages_panel.keep_inside()
 
     def _refresh_pages_panel(self):
-        if self.pages_panel is not None and self.pages_panel.isVisible():
-            self.pages_panel.refresh()
-            self.pages_panel.fit_height()
+        for panel in (self.pages_panel, self.export_panel):
+            if panel is not None and panel.isVisible():
+                panel.refresh()
+                panel.fit_height()
 
     def toggle_page_panel(self):
         if self.page_panel is not None and self.page_panel.isVisible():
@@ -3179,37 +3898,203 @@ class Ream(QtWidgets.QMainWindow):
             self._write_prefs()
         return path or None
 
-    def export_pdf(self, clean: bool = False, path: str | None = None) -> str | None:
+    def export_pdf(self, clean: bool = False, path: str | None = None, *,
+                   pages: list[int] | None = None, spreads: bool = False,
+                   stock: bool = True, distressed: bool | None = None) -> str | None:
+        """The pages (every one, or `pages`) as a PDF: distressed as distress
+        is set (or as `distressed` says) unless `clean`; `spreads` puts facing pages on one PDF page;
+        `stock` False leaves the paper stock out (plain paper colour)."""
         path = path or self._export_target("Export PDF", ".pdf", "PDF (*.pdf)")
         if not path:
             return None
         if not path.lower().endswith(".pdf"):
             path += ".pdf"
-        settings = replace(self.distress, enabled=self.distress.enabled and not clean)
-        pages = list(range(self.sheet.pages()))
+        on = self.distress.enabled if distressed is None else distressed
+        settings = replace(self.distress, enabled=on and not clean)
+        pages = list(range(self.sheet.pages())) if pages is None else pages
+        if not pages:
+            self.toast("export · no pages picked")
+            return None
         with busy():
-            export.write_pdf(path, self.sheet, pages, dpi=self.fmt.dpi, settings=settings,
-                             paper=self.paper(), ink=self.ink(), title=self.stem(),
-                             density=self.density(), paper_stock=self.paper_stock(),
-                             progress=lambda n, total: self.toast(f"page {n + 1} of {total}"))
+            written = export.write_pdf(
+                path, self.sheet, pages, dpi=self.fmt.dpi, settings=settings, paper=self.paper(),
+                ink=self.ink(), title=self.stem(), density=self.density(),
+                paper_stock=self.paper_stock() if stock else None,
+                units=self.export_units(pages) if spreads else None,
+                progress=lambda n, total: self.toast(f"page {n + 1} of {total}"))
         how = f"distressed · {settings.style}" if settings.enabled else "clean"
-        self.toast(f"{len(pages)} {'page' if len(pages) == 1 else 'pages'} {how} → {path}")
+        shape = f" on {written} spread{'s' if written != 1 else ''}" if spreads else ""
+        self.toast(f"{len(pages)} {'page' if len(pages) == 1 else 'pages'}{shape} {how} → {path}")
         return path
 
-    def export_png(self, path: str | None = None) -> list[str]:
+    def export_png(self, path: str | None = None, *, clean: bool = False,
+                   pages: list[int] | None = None, spreads: bool = False,
+                   stock: bool = True, distressed: bool | None = None) -> list[str]:
         path = path or self._export_target("Export pages as PNG", ".png", "PNG (*.png)")
         if not path:
             return []
         stem = path[:-4] if path.lower().endswith(".png") else path
-        pages = list(range(self.sheet.pages()))
+        pages = list(range(self.sheet.pages())) if pages is None else pages
+        if not pages:
+            self.toast("export · no pages picked")
+            return []
+        on = self.distress.enabled if distressed is None else distressed
+        settings = replace(self.distress, enabled=on and not clean)
         with busy():
             written = export.write_pngs(stem, self.sheet, pages, dpi=self.fmt.dpi,
-                                        settings=self.distress, paper=self.paper(), ink=self.ink(),
+                                        settings=settings, paper=self.paper(), ink=self.ink(),
                                         density=self.density(),
-                                        paper_stock=self.paper_stock(),
+                                        paper_stock=self.paper_stock() if stock else None,
+                                        units=self.export_units(pages) if spreads else None,
                                         progress=lambda n, t: self.toast(f"page {n + 1} of {t}"))
         self.toast(f"{len(written)} png → {os.path.dirname(stem)}")
         return written
+
+    # -- the export panel: which pages, and how ---------------------------------
+    EXPORT_DEFAULTS = {"spreads": None, "stock": True, "format": "pdf"}
+
+    def export_option(self, key: str):
+        value = self.prefs.get("export", {}).get(key, self.EXPORT_DEFAULTS[key])
+        if key == "spreads" and value is None:
+            return self.layout != "single"           # as you were looking at the pages
+        return value
+
+    def set_export_option(self, key: str, value):
+        self.prefs.setdefault("export", {})[key] = value
+        self._write_prefs()
+        self._refresh_export_panel()
+
+    def export_distressed(self) -> bool:
+        return self.distress.enabled if self.export_finish is None else self.export_finish
+
+    def set_export_distressed(self, on: bool):
+        self.export_finish = on
+        self._refresh_export_panel()
+
+    def export_pages(self) -> list[int]:
+        pick = self.export_pick
+        return [p for p in range(self.sheet.pages()) if pick is None or p in pick]
+
+    def set_export_pages(self, pages):
+        pages = {p for p in pages if 0 <= p < self.sheet.pages()}
+        self.export_pick = None if len(pages) == self.sheet.pages() else pages
+        self._refresh_export_panel()
+
+    def export_units(self, pages: list[int]) -> list[tuple[int, ...]]:
+        """The spreads holding any of `pages`, whole - a lone cover alone."""
+        chosen = set(pages)
+        return [tuple(p for p in spread if p is not None) for spread in self.spreads(self.sheet.pages())
+                if any(p in chosen for p in spread if p is not None)]
+
+    @staticmethod
+    def page_range_text(pages: list[int]) -> str:
+        """[0, 1, 2, 3, 6] → "1-4, 7"."""
+        runs: list[list[int]] = []
+        for p in sorted(pages):
+            if runs and p == runs[-1][1] + 1:
+                runs[-1][1] = p
+            else:
+                runs.append([p, p])
+        return ", ".join(f"{a + 1}" if a == b else f"{a + 1}-{b + 1}" for a, b in runs)
+
+    @staticmethod
+    def parse_page_range(text: str, count: int) -> set[int]:
+        """"1-4, 7" → {0, 1, 2, 3, 6}; "all" or "" → every page; "5-" → 5 to the end."""
+        text = text.strip().lower()
+        if text in ("", "all", "*"):
+            return set(range(count))
+        pages: set[int] = set()
+        for part in re.split(r"[,\s]+", text):
+            m = re.fullmatch(r"(\d*)\s*[-–]\s*(\d*)|(\d+)", part)
+            if not m:
+                continue
+            if m.group(3):
+                a = b = int(m.group(3))
+            else:
+                a = int(m.group(1) or 1)
+                b = int(m.group(2) or count)
+            pages |= {p - 1 for p in range(min(a, b), max(a, b) + 1) if 1 <= p <= count}
+        return pages
+
+    def export_summary(self) -> str:
+        pages = self.export_pages()
+        if not pages:
+            return "no pages picked"
+        n = len(pages)
+        text = f"{n} {'page' if n == 1 else 'pages'}"
+        if self.export_option("spreads"):
+            units = self.export_units(pages)
+            text += f" on {len(units)} {'spread' if len(units) == 1 else 'spreads'}"
+            if sum(len(u) for u in units) > n:
+                text += " (whole spreads)"
+        text += " · distressed" if self.export_distressed() else " · clean"
+        if self.fmt.texture and not self.export_option("stock"):
+            text += " · plain paper"
+        return text + f" · {self.export_option('format')}"
+
+    def export_now(self, path: str | None = None):
+        """Export as the export panel says."""
+        kwargs = dict(distressed=self.export_distressed(), pages=self.export_pages(),
+                      spreads=self.export_option("spreads"), stock=self.export_option("stock"))
+        if self.export_option("format") == "png":
+            return self.export_png(path, **kwargs)
+        return self.export_pdf(path=path, **kwargs)
+
+    def build_export_panel(self) -> Panel:
+        panel = Panel(self, "export", on_tab=self.open_palette)
+        count = lambda: self.sheet.pages()                            # noqa: E731
+        panel.links("pages", [("all", lambda: self.set_export_pages(range(count()))),
+                              ("none", lambda: self.set_export_pages(())),
+                              ("this one", lambda: self.set_export_pages({self.page})),
+                              ("odd", lambda: self.set_export_pages(range(0, count(), 2))),
+                              ("even", lambda: self.set_export_pages(range(1, count(), 2)))])
+        panel.text("range", lambda: self.page_range_text(self.export_pages()),
+                   lambda text: self.set_export_pages(self.parse_page_range(text, count())))
+        panel.toggle("as", lambda: not self.export_option("spreads"),
+                     lambda v: self.set_export_option("spreads", not v),
+                     on="single pages", off="spreads")
+        panel.toggle("finish", self.export_distressed, self.set_export_distressed,
+                     on="distressed", off="clean")
+        panel.toggle("paper", lambda: self.export_option("stock"),
+                     lambda v: self.set_export_option("stock", v), on="stock", off="plain")
+        panel.toggle("format", lambda: self.export_option("format") == "pdf",
+                     lambda v: self.set_export_option("format", "pdf" if v else "png"),
+                     on="pdf", off="png")
+        panel.slider("dpi", 72, 600, lambda: self.fmt.dpi,
+                     lambda v: (setattr(self.fmt, "dpi", v), self.changed()), step=12, default=300)
+        summary = QtWidgets.QLabel()
+        summary.setObjectName("PanelValue")
+        summary.setFont(style.ui_font(11))
+        summary.setWordWrap(True)
+        panel.widget(summary, lambda: summary.setText(self.export_summary()))
+        # the page map last, so the options above stay in view however many pages
+        self.export_strip = PickStrip(self, self.export_pages, self.set_export_pages,
+                                      lambda: self.export_option("spreads"))
+        panel.widget(self.export_strip, self.export_strip.refresh)
+        panel.buttons([("export…", self.export_now), ("close", panel.close_panel)])
+        return panel
+
+    def toggle_export_panel(self):
+        """⌘E: the export panel - and, when it is open, export."""
+        if self.export_panel is None:
+            self.export_panel = self.build_export_panel()
+        if self.export_panel.isVisible():
+            self.export_now()
+            return
+        fresh = not self.export_panel.placed
+        self.export_panel.open()
+        if fresh:
+            for other in (self.distress_panel, self.page_panel, self.pages_panel):
+                if other is not None and other.isVisible() and \
+                        self.export_panel.geometry().intersects(other.geometry()):
+                    self.export_panel.move(other.x() - self.export_panel.width() - 12, other.y())
+            self.export_panel.keep_inside()
+
+    def _refresh_export_panel(self):
+        panel = self.export_panel
+        if panel is not None and panel.isVisible():
+            panel.refresh()
+            panel.fit_height()
 
     # -- documents -----------------------------------------------------------
     def state(self) -> tuple[dict, dict[str, bytes]]:
@@ -3223,7 +4108,10 @@ class Ream(QtWidgets.QMainWindow):
                     things.append({"uid": thing.uid, "kind": "text", "text": thing.text(),
                                    "wrap": thing.wrap, "pinned": thing.pinned,
                                    "x": thing.pos().x(), "y": thing.pos().y(),
-                                   "z": thing.zValue(), "r": thing.rotation()})
+                                   "z": thing.zValue(), "r": thing.rotation(),
+                                   **({"look": dict(thing.look)} if thing.look else {}),
+                                   **({"runs": runs} if (runs := doc_runs(thing.editor.document()))
+                                      else {})})
                 continue
             name = project.media_name(thing.blob, thing.ext)
             media[name] = thing.blob
@@ -3247,6 +4135,7 @@ class Ream(QtWidgets.QMainWindow):
         return {
             "app": f"ream {__version__}",
             "text": project.doc_to_text(self.doc),
+            "runs": doc_runs(self.doc),             # the styled words (older files: none)
             "caret": self.sheet.text.textCursor().position(),
             "format": asdict(self.fmt),
             "distress": self.distress.to_dict(),
@@ -3274,13 +4163,16 @@ class Ream(QtWidgets.QMainWindow):
             self.doc.setUndoRedoEnabled(False)
             project.text_to_doc(self.doc, state.get("text", ""), self.block_format())
             self.doc.setUndoRedoEnabled(False)
+            apply_runs(self.doc, state.get("runs"))
             self.apply_format()
             pdf_cache: dict[tuple[str, int], tuple] = {}
             for entry in state.get("things", []):
                 if entry.get("kind") == "text":
                     note = Note(self, entry.get("text", ""), entry.get("wrap", -1.0),
                                 uid=entry.get("uid"))
-                    note.style(self.doc_font(), self.block_format(), self.ink())
+                    note.look = {k: v for k, v in (entry.get("look") or {}).items() if k in LOOK}
+                    apply_runs(note.editor.document(), entry.get("runs"))
+                    self.style_note(note)
                     self.things[note.uid] = note
                     if entry.get("pinned"):
                         note.setParentItem(self.sheet.strip)
@@ -3461,10 +4353,24 @@ class Ream(QtWidgets.QMainWindow):
         d, f = self.distress, self.fmt
         dot = "●"
         out = [
-            C("export pdf", self.export_pdf, "⌘E", "save print distressed"),
+            C("export pdf", self.toggle_export_panel, "⌘E",
+              "export pdf png pages spreads distressed clean pick"),
+            C("export pdf · all pages now", self.export_pdf, "", "save print distressed"),
             C("export pdf · clean", partial(self.export_pdf, True), "⇧⌘E", "vector no distress"),
             C("export png pages", self.export_png, "", "images raster"),
             C("distress panel", self.toggle_distress_panel, "⌘D", "sliders live preview dial"),
+            C("design mode", partial(self.set_mode, "design"), "⌥⌘D",
+              "layout indesign select boxes frames objects"),
+            C("writer mode", partial(self.set_mode, "writer"), "⌥⌘D", "write words caret"),
+            C(f"about ream {__version__}", lambda: self.toast(
+                f"ream {__version__} · semver · CHANGELOG.md has what changed"), "",
+              "version release changelog"),
+            C("tools panel", self.toggle_tools_panel, "⌥⌘T",
+              "tools select text box lasso wand eraser toolbar"),
+            C("text panel", self.toggle_text_panel, "⌘T",
+              "type font size line align tracking style box"),
+            C("new text box", lambda: (self.set_mode("design", quiet=True), self.set_text_tool(True)),
+              "T", "frame type tool add"),
             C("page panel", self.toggle_page_panel, "⌘L",
               "sliders margins line spacing paragraph size background canvas colour paper"),
             C("distress images off" if self.distress.images else "distress images on",
@@ -3709,7 +4615,7 @@ class Ream(QtWidgets.QMainWindow):
 
     def _shortcuts(self):
         bindings = [
-            ("Ctrl+E", self.export_pdf), ("Ctrl+Shift+E", partial(self.export_pdf, True)),
+            ("Ctrl+E", self.toggle_export_panel), ("Ctrl+Shift+E", partial(self.export_pdf, True)),
             ("Ctrl+D", self.toggle_distress_panel), ("Ctrl+L", self.toggle_page_panel),
             ("Ctrl+Shift+D", self.toggle_distress_view),
             ("Ctrl+Alt+S", self.save_profile),
@@ -3728,6 +4634,8 @@ class Ream(QtWidgets.QMainWindow):
             ("Ctrl+Shift+P", self.toggle_preview_mode),
             ("Ctrl+Alt+P", self.toggle_pages_panel),
             ("Ctrl+;", self.toggle_spelling),
+            ("Ctrl+Alt+D", self.toggle_mode), ("Ctrl+T", self.toggle_text_panel),
+            ("Ctrl+Alt+T", self.toggle_tools_panel),
         ]
         for keys, slot in bindings:
             action = QtWidgets.QAction(self)
