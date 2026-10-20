@@ -26,6 +26,9 @@ class CanvasView(QtWidgets.QGraphicsView):
         self.controller = controller
         self.bg = QtGui.QColor("#e8e7e3")
         self.space_down = False
+        self._space_tap = None           # what a tap of Space does (a plugin's), if claimed
+        self._space_since = 0.0
+        self._space_panned = False
         self._pan_from: QtCore.QPointF | None = None
         self._to_scene = False
         self._toast = ""
@@ -147,6 +150,7 @@ class CanvasView(QtWidgets.QGraphicsView):
         return super().viewportEvent(event)
 
     def start_pan(self, pos: QtCore.QPointF):
+        self._space_panned = True        # a hold, not a tap
         self._pan_from = QtCore.QPointF(pos)
         self.viewport().setCursor(QtCore.Qt.ClosedHandCursor)
 
@@ -210,12 +214,20 @@ class CanvasView(QtWidgets.QGraphicsView):
         return super().event(event)
 
     def keyPressEvent(self, event: QtGui.QKeyEvent):
-        if (event.key() == QtCore.Qt.Key_Space and not self.controller.typing()
-                and not event.isAutoRepeat()):
-            self.space_down = True
-            self.controller.update_cursor()
-            event.accept()
-            return
+        if event.key() == QtCore.Qt.Key_Space:
+            if event.isAutoRepeat() and self.space_down:
+                event.accept()           # held down: still the same press
+                return
+            tap = self.controller.space_claim() if not event.isAutoRepeat() else None
+            if not event.isAutoRepeat() and (tap is not None or not self.controller.typing()):
+                # hold and drag to pan; a tap goes to whoever claimed Space
+                self.space_down = True
+                self._space_tap = tap
+                self._space_since = time.monotonic()
+                self._space_panned = False
+                self.controller.update_cursor()
+                event.accept()
+                return
         if self.controller.key(event):
             event.accept()
             return
@@ -225,6 +237,10 @@ class CanvasView(QtWidgets.QGraphicsView):
         if event.key() == QtCore.Qt.Key_Space and not event.isAutoRepeat() and self.space_down:
             self.space_down = False
             self.controller.update_cursor()
+            tap, self._space_tap = self._space_tap, None
+            if tap is not None and not self._space_panned \
+                    and time.monotonic() - self._space_since < 0.5:
+                tap()
             event.accept()
             return
         super().keyReleaseEvent(event)

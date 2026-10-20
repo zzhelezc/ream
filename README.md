@@ -562,6 +562,7 @@ class Plugin(Base):
 | `frame(label, size, paint_content=, drag_out=, on_change=, on_context=)` | a frame on the canvas. You move it by its label or edge and resize it by its corner; clicks inside go through, unless it has a `drag_out`, in which case dragging from inside picks up the image it returns. `on_context` is what a right-click on it does (open the plugin's panel) |
 | `tool(tool, label, key, choose=)` | list a tool in the tools panel. `key` (one letter) picks it in design mode; `choose` is what picking it does (default: `use(tool)`) |
 | `context_panel(test, open)` | a right-click on a thing for which `test(thing)` is true calls `open` (stik opens its panel for images) |
+| `space(claim, tap)` | while `claim()` is true and nothing is being written, a tap of Space calls `tap` (the scanner plays and stops). Holding Space and dragging still pans |
 | `render(rect, dpi)` | what is on the canvas in a rect, as RGBA numpy, without the frames |
 | `place_image(image, rect)` | put an image on the canvas (it pins if dropped on the page) |
 | `place_text(text)` | start a text block with some words in it |
@@ -789,6 +790,13 @@ and it smears. Resizing either frame resizes both and starts a fresh result.
 | paper | what empty bed scans as, and what xerox and dither print on |
 | dpi | the result's resolution |
 | to canvas, export png | the scan as an image beside the result, or as a file |
+
+**Space plays and stops it.** While the scanner is open and nothing is being
+written, a tap of Space starts the line and another tap stops it. "Nothing
+being written" means design mode, or something selected in writer mode.
+Wherever you are writing, Space stays a space: in writer mode's page, in a
+text box, or in the main text in design mode. Holding Space and dragging
+still pans. Right-click either frame for the settings.
 
 Also in the palette: **scanner: scan / stop**, **clear result**, **result to
 canvas** and **export png**. Positions, size and settings are remembered.

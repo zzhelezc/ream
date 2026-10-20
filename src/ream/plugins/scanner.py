@@ -72,6 +72,8 @@ class Plugin(Base):
                                  fill=True)
         self.panel = self.build_panel()
         self.timer = host.timer(30, self.tick)
+        # while the scanner is open, a tap of Space plays and stops it
+        host.space(lambda: self.bed.isVisible(), self.space_tap)
 
         host.command("scanner", self.toggle, "", "snit slit scan scanner bed open")
         host.command("scanner: scan / stop", self.toggle_scan, "", "start run")
@@ -186,6 +188,10 @@ class Plugin(Base):
     def restart(self):
         self.pos, self.passes = 0.0, 0
         self.bed.update()
+
+    def space_tap(self):
+        self.toggle_scan()
+        self.host.toast("scanning · Space to stop" if self.running else "scanner · stopped · Space goes on")
 
     def toggle_scan(self):
         if self.running:

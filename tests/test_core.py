@@ -2270,6 +2270,74 @@ def test_version_is_semver_and_in_the_changelog():
     assert out.getvalue().strip() == f"ream {ream.__version__}"
 
 
+def test_space_plays_and_stops_the_scanner():
+    w = fresh()
+    w.show()
+    type_paragraphs(w, 1)
+    words = w.doc.toPlainText()
+    scanner = scanner_of(w)
+    # closed: Space is a space, as ever
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Space)
+    assert w.doc.toPlainText() == words + " "
+    w.undo()
+    words = w.doc.toPlainText()
+    scanner.open()
+    pump(0.05)
+    w.view.setFocus()
+    # open, in writer mode: the page is being written, so Space is still a space
+    w.focus_text()
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Space)
+    assert not scanner.running and w.doc.toPlainText() == words + " "
+    w.undo()
+    words = w.doc.toPlainText()
+    # design mode, nothing being written: a tap plays, another stops - types nothing
+    w.set_mode("design", quiet=True)
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Space)
+    assert scanner.running
+    pump(0.1)
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Space)
+    assert not scanner.running and scanner.pos > 0
+    assert w.doc.toPlainText() == words
+    # holding Space and dragging still pans, and doesn't play
+    viewport = w.view.viewport()
+    before = w.view.horizontalScrollBar().value()
+    QtTest.QTest.keyPress(w.view, QtCore.Qt.Key_Space)
+    start = QtCore.QPoint(300, 300)
+    QtTest.QTest.mousePress(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, start)
+    app.sendEvent(viewport, QtGui.QMouseEvent(QtCore.QEvent.MouseMove, QtCore.QPointF(200, 300),
+                                              QtCore.Qt.LeftButton, QtCore.Qt.LeftButton,
+                                              QtCore.Qt.NoModifier))
+    QtTest.QTest.mouseRelease(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, QtCore.QPoint(200, 300))
+    QtTest.QTest.keyRelease(w.view, QtCore.Qt.Key_Space)
+    assert w.view.horizontalScrollBar().value() != before and not scanner.running
+    # writing in a text box: Space is a space there
+    page = w.sheet.scene_page_rect()
+    note = w.new_note(QtCore.QPointF(page.left() + 80, page.top() + 400))
+    QtTest.QTest.keyClicks(w.view, "two words")
+    assert note.text() == "two words" and not scanner.running
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Escape)
+    # writing in the main text in design mode: a space too
+    w.start_story_editing()
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Space)
+    assert not scanner.running and w.doc.toPlainText().endswith(" ")
+    w.leave_story_editing(select=False)
+    w.undo()
+    # writer mode with something selected (nothing being written): it plays
+    w.set_mode("writer", quiet=True)
+    w.select([note])
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Space)
+    assert scanner.running
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Space)
+    assert not scanner.running
+    w.clear_selection()
+    # closed again: Space types once more
+    scanner.close()
+    w.focus_text()
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Space)
+    assert not scanner.running and w.doc.toPlainText().endswith(" ")
+    w.close()
+
+
 def imposition_styles():
     from ream import imposition
     return list(imposition.STYLES)

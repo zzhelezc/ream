@@ -221,6 +221,7 @@ class Host:
         self.actions: list[QtWidgets.QAction] = []
         self.tools: list[tuple] = []             # (tool, label, key, choose)
         self.contexts: list[tuple] = []          # (test(thing), open)
+        self.spaces: list[tuple] = []            # (claim(), tap())
 
     def dispose(self):
         """Undo everything the plugin added (it is being turned off)."""
@@ -238,6 +239,7 @@ class Host:
             self.window.use_tool(None)
         self.frames.clear(), self.panels.clear(), self.commands.clear()
         self.timers.clear(), self.actions.clear(), self.tools.clear(), self.contexts.clear()
+        self.spaces.clear()
 
     # -- the window's parts ---------------------------------------------------
     @property
@@ -296,6 +298,12 @@ class Host:
         design mode; `choose` is what picking it does (default: use it)."""
         self.tools.append((tool, label or tool.name, key.upper(),
                            choose or (lambda t=tool: self.use(t))))
+
+    def space(self, claim: Callable[[], bool], tap: Callable[[], None]):
+        """While `claim()` is true, a tap of Space calls `tap` (play / stop,
+        say) - but only when nothing is being written (design mode, or
+        something selected); holding Space and dragging still pans."""
+        self.spaces.append((claim, tap))
 
     def context_panel(self, test: Callable[[object], bool], open_panel: Callable[[], None]):
         """Right-click on a thing for which `test(thing)` is true opens this

@@ -1946,6 +1946,19 @@ class Ream(QtWidgets.QMainWindow):
                              "this session", key="spell:ignore"))
         self.open_palette(global_pos, first=first)
 
+    def space_claim(self):
+        """What a tap of Space does now, if a plugin has claimed it (the
+        scanner while it is open) - None whenever something is being written
+        (writer mode's page, a text box, the main text in design mode): there
+        Space is a space."""
+        if self.typing():
+            return None
+        for _p, host in getattr(self, "plugins", []):
+            for claim, tap in host.spaces:
+                if claim():
+                    return tap
+        return None
+
     def context_panels(self) -> list[tuple]:
         """(test(thing), open) pairs: ream's own, then the plugins'."""
         own = [(lambda t: isinstance(t, Note), self.open_text_panel)]

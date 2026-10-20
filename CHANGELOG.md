@@ -19,6 +19,26 @@ version that wrote it. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-20
+
+### Changed
+
+- **Space only plays the scanner when nothing is being written.** In writer
+  mode, Space types into the page even with the scanner open. It plays and
+  stops the scanner in design mode, or in writer mode with something
+  selected. `host.space` claims follow the same rule.
+
+## [0.3.0] - 2026-10-20
+
+### Added
+
+- **Space plays and stops the scanner** while it is open. A tap starts or
+  stops the scan line, and holding Space and dragging still pans. Space
+  stays a space while you write in a text box, or in the main text in
+  design mode.
+- **Plugin API:** `host.space(claim, tap)` claims taps of Space while
+  `claim()` is true.
+
 ## [0.2.0] - 2026-10-20
 
 ### Added
@@ -78,5 +98,7 @@ Everything before versioning started.
     including draft and test prints.
 
 [Unreleased]: #unreleased
+[0.3.1]: #031---2026-10-20
+[0.3.0]: #030---2026-10-20
 [0.2.0]: #020---2026-10-20
 [0.1.0]: #010---2026-10-20
