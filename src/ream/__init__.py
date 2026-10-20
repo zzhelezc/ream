@@ -9,4 +9,4 @@ with the PDF - optionally run through the Texturelabs Distressor's textures.
 # MAJOR when .ream files or the plugin API stop working as they did, MINOR
 # for new features that keep them working, PATCH for fixes.  Until 1.0.0
 # anything may still change.  Every version has its entry in CHANGELOG.md.
-__version__ = "0.5.5"
+__version__ = "0.7.0"

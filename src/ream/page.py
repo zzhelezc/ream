@@ -786,6 +786,7 @@ class Sheet(QtWidgets.QGraphicsRectItem):
         self.stock = StockLayer(self)
         self.stock.setVisible(False)
         self.facing_layers = (FacingLayer(self, False), FacingLayer(self, True))
+        self.hidden: set[int] = set()          # uids left out of page_things (an export moving them)
 
     # -- geometry ------------------------------------------------------------
     def set_geometry(self, w: float, h: float, side: float, head: float):
@@ -859,7 +860,7 @@ class Sheet(QtWidgets.QGraphicsRectItem):
         own things (cut at its edges), and the overhang of things on the
         facing page of its spread."""
         clip = QtCore.QRectF(0.0, index * self.H, self.W, self.H)
-        things = self.pinned()
+        things = [t for t in self.pinned() if t.uid not in self.hidden]
         # its own things only: what hangs off the page above or below stays there
         shown = [(t, 0.0, 0.0) for t in things
                  if self.page_of(t) == index and t.parent_rect().intersects(clip)]

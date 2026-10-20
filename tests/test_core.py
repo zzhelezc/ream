@@ -2911,6 +2911,121 @@ def test_an_image_hanging_off_a_page_still_pins_and_exports():
     w.close()
 
 
+def test_instagram_moves_pictures_without_touching_the_book():
+    w = fresh()
+    w.show()
+    w.distress.enabled = False
+    type_paragraphs(w, 6)
+    w.set_covers(cover=False, back=False)
+    w.go_to_page(0)
+    pump(0.3)
+    page = w.sheet.scene_page_rect()
+    red = QtGui.QImage(200, 140, QtGui.QImage.Format_ARGB32)
+    red.fill(QtGui.QColor("#dd2211"))
+    pic = w.place_qimage(red, QtCore.QRectF(page.left() + 60, page.top() + 300, 200, 140), "pic")
+    where = QtCore.QPointF(pic.pos())
+    book_before = export.final_page(w.sheet, 0, 50, w.distress, w.paper(), w.ink())
+    plugin = [p for p, _h in w.plugins if p.name == "instagram"][0]
+    plugin.s.update({"mode": "pages", "fit": "fit", "margin": 4.0, "background": "white",
+                     "full": "no", "shape": "4:5", "width": 1080})
+    plugin.put_back_all()
+    plugin.open()
+    pump(0.2)
+    view = plugin.view
+    view.grab()                                        # lays the slides out
+    p = plugin.plan()
+    rect = plugin.thing_rect(pic, p)
+    target, n = view.cells[0]
+    def on_screen(x, y):
+        return QtCore.QPoint(int(target.left() + (x - n * p.slide_w) * view.k),
+                             int(target.top() + y * view.k))
+    start = on_screen(rect.center().x(), rect.center().y())
+    end = on_screen(rect.center().x() + 300, rect.center().y() + 200)
+    QtTest.QTest.mousePress(view, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, start)
+    for k in range(1, 6):
+        spot = start + (end - start) * (k / 5.0)
+        app.sendEvent(view, QtGui.QMouseEvent(QtCore.QEvent.MouseMove, QtCore.QPointF(spot),
+                                              QtCore.Qt.LeftButton, QtCore.Qt.LeftButton,
+                                              QtCore.Qt.NoModifier))
+    QtTest.QTest.mouseRelease(view, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, end)
+    dx, dy = plugin.offset(pic)
+    scale = plugin.thing_scale(pic, p)
+    assert abs(dx * scale - 300) < 12 and abs(dy * scale - 200) < 12, (dx, dy)
+    # the book is untouched
+    assert pic.pos() == where and w.sheet.page_of(pic) == 0
+    assert export.final_page(w.sheet, 0, 50, w.distress, w.paper(), w.ink()) == book_before
+    # the slide shows it moved
+    slide = plugin.slides()[0]
+    old, new = rect.center(), plugin.thing_rect(pic, p).center()
+    was = QtGui.QColor(slide.pixel(int(old.x() + 40), int(old.y() - 40)))
+    now = QtGui.QColor(slide.pixel(int(new.x()), int(new.y())))
+    assert now.red() > 200 > now.green(), "it is where it was put"
+    assert not (was.red() > 200 and was.green() < 90), "and not where it was"
+    assert plugin.s["moves"][w.path or "draft"][str(pic.uid)], "remembered"
+    # double-click puts it back
+    view.grab()
+    spot = plugin.thing_rect(pic, p).center()
+    QtTest.QTest.mouseDClick(view, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+                             on_screen(spot.x(), spot.y()))
+    assert plugin.offset(pic) == [0.0, 0.0]
+    # put back all
+    plugin.set_offset(pic, 30.0, 10.0)
+    assert plugin.moves()
+    plugin.put_back_all()
+    assert not plugin.moves()
+    plugin.close()
+    w.close()
+
+
+def test_instagram_drops_slides():
+    w = fresh()
+    w.show()
+    w.distress.enabled = False
+    type_paragraphs(w, 12)
+    plugin = [p for p, _h in w.plugins if p.name == "instagram"][0]
+    plugin.s.update({"mode": "pages", "full": "last slide + file", "format": "png", "shape": "4:5",
+                     "width": 1080, "background": "white"})
+    plugin.bring_back_all()
+    plugin.open()
+    pump(0.2)
+    view = plugin.view
+    view.grab()
+    p = plugin.plan()
+    assert p.slides >= 3 and plugin.posted() == p.slides + 1
+    # hover shows the ×; a click on it drops the slide
+    target, n = view.cells[1]
+    box = view.close_box(target).center().toPoint()
+    app.sendEvent(view, QtGui.QMouseEvent(QtCore.QEvent.MouseMove, QtCore.QPointF(box), QtCore.Qt.NoButton,
+                                          QtCore.Qt.NoButton, QtCore.Qt.NoModifier))
+    assert view.hover == 1
+    QtTest.QTest.mouseClick(view, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, box)
+    assert plugin.dropped() == {1} and plugin.kept() == [k for k in range(p.slides) if k != 1]
+    assert plugin.posted() == p.slides, "one fewer slide, plus the whole picture"
+    view.grab()
+    # the export leaves it out, numbers the rest without gaps, joins the full picture
+    folder = plugin.export(TMP)
+    names = sorted(os.listdir(folder))
+    kept = p.slides - 1
+    assert names == [f"{k:02d}.png" for k in range(1, kept + 2)] + ["full.png"], names
+    full = QtGui.QImage(os.path.join(folder, "full.png"))
+    assert full.width() == kept * 1080 and full.height() == 1350
+    slides = plugin.slides()
+    second = QtGui.QImage(os.path.join(folder, "02.png"))
+    assert second.convertToFormat(QtGui.QImage.Format_RGB32) == slides[2].convertToFormat(QtGui.QImage.Format_RGB32), \
+        "the second posted slide is the third cut"
+    # a click on it again brings it back; so does bring back all
+    view.grab()
+    QtTest.QTest.mouseClick(view, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, box)
+    assert plugin.dropped() == set()
+    plugin.toggle_slide(0)
+    plugin.toggle_slide(2)
+    assert plugin.dropped() == {0, 2}
+    plugin.bring_back_all()
+    assert plugin.dropped() == set() and plugin.posted() == p.slides + 1
+    plugin.close()
+    w.close()
+
+
 def imposition_styles():
     from ream import imposition
     return list(imposition.STYLES)

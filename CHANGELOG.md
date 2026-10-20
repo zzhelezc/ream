@@ -19,6 +19,31 @@ version that wrote it. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-20
+
+### Added
+
+- **instagram: drop slides.** Hover over a slide and click its × to leave it
+  out of the carousel. It stays in the preview, faded, and a click brings
+  it back, as does **bring back all** in the panel.
+  - The export numbers the kept slides without gaps.
+  - The full picture (`full.jpg` and the fitted last slide) is the kept
+    slides joined.
+  - The slide count, and the 20-a-post warning, count only kept slides.
+  - Drops are remembered for the document.
+
+## [0.6.0] - 2026-10-20
+
+### Added
+
+- **instagram: move pictures in the export only.** Drag a picture in the
+  slides preview to place it anywhere in the carousel (across a cut, out of
+  the way). Its place in the book doesn't change.
+  - Moved pictures are laid over the full picture where you put them,
+    distressed like any image, and show on the fitted last slide too.
+  - Double-click puts one back; **put back all** puts every one back.
+  - Moves are remembered for the document.
+
 ## [0.5.5] - 2026-10-20
 
 ### Fixed
@@ -272,6 +297,8 @@ Everything before versioning started.
     including draft and test prints.
 
 [Unreleased]: #unreleased
+[0.7.0]: #070---2026-10-20
+[0.6.0]: #060---2026-10-20
 [0.5.5]: #055---2026-10-20
 [0.5.4]: #054---2026-10-20
 [0.5.3]: #053---2026-10-20

@@ -850,6 +850,27 @@ picture across the gutter, swipes as one image.
 - **background:** the canvas colour, the paper, white or black.
 - **finish:** as distress is set, distressed, or clean.
 
+**Moving pictures for Instagram only.** Drag any picture in the slides
+preview to put it somewhere else in the carousel, off a cut between two
+slides, say. The book is untouched: the move belongs to the export.
+
+- **How it's drawn:** a moved picture is taken off its page and laid over
+  the full picture where you put it, on top of the words, free of page
+  edges and slide cuts. It is distressed like any image when the finish is
+  distressed.
+- **Putting it back:** double-click a picture, or use **put back all** in
+  the panel (it shows how many are moved).
+- **Remembered:** moves are kept for the document.
+
+**Dropping slides.** Hover over a slide and click the **×** in its corner
+to drop it, for example one left empty after moving pictures. It stays in
+the preview, faded, and a click on its **↺** brings it back (or use **bring
+back all** in the panel). The export leaves dropped slides out and numbers
+the rest without gaps. The full picture, both `full.jpg` and the fitted last
+slide, is the kept slides joined, so the slides on either side of a dropped
+one no longer run seamlessly into each other. Drops are kept for the
+document.
+
 **The whole picture.** Instagram crops every image in a carousel to the
 shape of the first one, so the long full picture can't go in as it is.
 **full picture** chooses what to do with it:
