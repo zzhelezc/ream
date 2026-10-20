@@ -20,8 +20,14 @@ round them, **fill** fills the slides and crops; **zoom**, **margin** and
 white or black.  Instagram takes up to 20 slides in a carousel - more, and
 the preview says so.
 
-**export…** writes a folder: `01.jpg`, `02.jpg`, … (post them in that order),
-and `full.jpg`, the uncut picture.
+Instagram crops every image in a carousel to the first one's shape, so the
+whole picture can't go in as it is: **full picture · last slide** adds it as
+one more slide of the same shape, the whole picture scaled down to fit (the
+background round it).  **file** also writes it uncut, as `full.jpg`, for
+posting on its own.
+
+**export…** writes a folder: `01.jpg`, `02.jpg`, … (post them in that order,
+the fitted full picture last), and `full.jpg` when asked for.
 """
 from __future__ import annotations
 
@@ -42,7 +48,8 @@ BACKGROUNDS = ("canvas", "paper", "white", "black")
 MAX_SLIDES = 20                  # what Instagram takes in one carousel
 DEFAULTS = {"shape": "4:5", "width": 1080, "mode": "spreads", "per_spread": 2, "fit": "fit",
             "zoom": 100.0, "margin": 4.0, "gap": 0.0, "nudge_x": 0.0, "nudge_y": 0.0,
-            "background": "canvas", "finish": "as set", "full": True, "format": "jpg"}
+            "background": "canvas", "finish": "as set", "full": "last slide", "format": "jpg"}
+FULL = ("last slide", "last slide + file", "file", "no")    # where the whole picture goes
 
 
 @dataclass
@@ -160,19 +167,20 @@ class InstaView(QtWidgets.QWidget):
             painter.drawText(self.rect(), QtCore.Qt.AlignCenter, "no pages to post")
             return
         room = self.room()
+        cells = self.plugin.posted(p)
         # rows of slides, as many across as keeps them a good size
         best = None
-        for across in range(1, p.slides + 1):
-            rows = math.ceil(p.slides / across)
+        for across in range(1, cells + 1):
+            rows = math.ceil(cells / across)
             k = min(room.width() / (across * p.slide_w), (room.height() - (rows - 1) * 26) / (rows * p.slide_h))
             if best is None or k > best[0]:
                 best = (k, across)
         k, across = best
         sw, sh = p.slide_w * k, p.slide_h * k
         picture = self.plugin.picture(scale=max(0.05, min(1.0, k * self.devicePixelRatioF())))
-        rows = math.ceil(p.slides / across)
+        rows = math.ceil(cells / across)
         top0 = room.top() + (room.height() - (rows * sh + (rows - 1) * 26)) / 2
-        left0 = room.left() + (room.width() - min(across, p.slides) * sw) / 2
+        left0 = room.left() + (room.width() - min(across, cells) * sw) / 2
         painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
         ratio = picture.width() / max(1, p.width)
         for n in range(p.slides):
@@ -185,11 +193,22 @@ class InstaView(QtWidgets.QWidget):
             painter.drawRect(target)
             painter.drawText(QtCore.QRectF(target.left(), target.bottom() + 3, sw, 18),
                              QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop, f"{n + 1:02d}")
+        if cells > p.slides:
+            # the whole picture, fitted into one more slide of the same shape
+            r, col = divmod(p.slides, across)
+            target = QtCore.QRectF(left0 + col * sw, top0 + r * (sh + 26), sw, sh)
+            painter.fillRect(target, self.plugin.background())
+            painter.drawImage(self.plugin.fit_rect(picture.width(), picture.height(), target), picture)
+            painter.setPen(QtGui.QPen(meta, 1))
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.drawRect(target)
+            painter.drawText(QtCore.QRectF(target.left(), target.bottom() + 3, sw, 18),
+                             QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop, f"{cells:02d} · the whole picture")
         s = self.plugin.s
-        words = [f"{p.slides} slide{'s' if p.slides != 1 else ''}", f"{s['shape']} · {p.slide_w}×{p.slide_h}",
+        words = [f"{cells} slide{'s' if cells != 1 else ''}", f"{s['shape']} · {p.slide_w}×{p.slide_h}",
                  s["mode"], f"full picture {p.width}×{p.slide_h}"]
-        if p.slides > MAX_SLIDES:
-            words.append(f"Instagram takes {MAX_SLIDES} a post: this makes {math.ceil(p.slides / MAX_SLIDES)} posts")
+        if cells > MAX_SLIDES:
+            words.append(f"Instagram takes {MAX_SLIDES} a post: this makes {math.ceil(cells / MAX_SLIDES)} posts")
         painter.setPen(meta)
         painter.drawText(QtCore.QRectF(self.rect()).adjusted(0, 16, 0, 0), QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop,
                          "   ·   ".join(words))
@@ -215,6 +234,8 @@ class Plugin(Base):
     def setup(self, host):
         self.host = host
         self.s = {**DEFAULTS, **host.settings}
+        if self.s["full"] not in FULL:              # older settings: on / off
+            self.s["full"] = "last slide" if self.s["full"] else "no"
         self.pages_text = ""                       # "" = every page
         self._pictures: dict[tuple, QtGui.QImage] = {}
         self.view = InstaView(self)
@@ -285,7 +306,7 @@ class Plugin(Base):
         panel.section("export")
         panel.choice("finish", lambda: ["as set", "distressed", "clean"], lambda: s["finish"],
                      put("finish"))
-        panel.toggle("full picture", lambda: s["full"], put("full"), on="too", off="no")
+        panel.choice("full picture", lambda: list(FULL), lambda: s["full"], put("full"))
         panel.toggle("format", lambda: s["format"] == "jpg", lambda v: put("format")("jpg" if v else "png"),
                      on="jpg", off="png")
         panel.buttons([("export…", self.export), ("close", panel.close_panel)])
@@ -371,6 +392,45 @@ class Plugin(Base):
         picture = picture or self.picture()
         return [picture.copy(n * p.slide_w, 0, p.slide_w, p.slide_h) for n in range(p.slides)]
 
+    def full_last(self) -> bool:
+        return self.s["full"] in ("last slide", "last slide + file")
+
+    def posted(self, p: Plan | None = None) -> int:
+        """How many slides the carousel has: the cut ones, and the fitted full picture."""
+        p = p or self.plan()
+        return p.slides + (1 if self.full_last() and p.slides else 0)
+
+    def fit_rect(self, picture_w: float, picture_h: float, box: QtCore.QRectF) -> QtCore.QRectF:
+        """Where the whole picture goes in a slide-shaped `box`: as big as fits."""
+        margin = max(0.03, self.s["margin"] / 100.0)
+        room = box.adjusted(box.width() * margin, box.height() * margin,
+                            -box.width() * margin, -box.height() * margin)
+        k = min(room.width() / max(1.0, picture_w), room.height() / max(1.0, picture_h))
+        w, h = picture_w * k, picture_h * k
+        return QtCore.QRectF(room.center().x() - w / 2, room.center().y() - h / 2, w, h)
+
+    def full_slide(self, picture: QtGui.QImage | None = None) -> QtGui.QImage:
+        """The whole picture as one more slide of the carousel's shape (which
+        Instagram forces on every image), scaled down to fit."""
+        p = self.plan()
+        picture = picture or self.picture()
+        slide = QtGui.QImage(p.slide_w, p.slide_h, QtGui.QImage.Format_RGB32)
+        slide.fill(self.background())
+        painter = QtGui.QPainter(slide)
+        painter.setRenderHints(QtGui.QPainter.SmoothPixmapTransform | QtGui.QPainter.Antialiasing)
+        painter.drawImage(self.fit_rect(picture.width(), picture.height(),
+                                        QtCore.QRectF(0, 0, p.slide_w, p.slide_h)), picture)
+        painter.end()
+        return slide
+
+    def carousel(self, picture: QtGui.QImage | None = None) -> list[QtGui.QImage]:
+        """Every image to post, in order."""
+        picture = picture or self.picture()
+        out = self.slides(picture)
+        if self.full_last() and out:
+            out.append(self.full_slide(picture))
+        return out
+
     # -- exporting --------------------------------------------------------------------
     def export(self, parent: str | None = None) -> str | None:
         if parent is None:
@@ -395,12 +455,13 @@ class Plugin(Base):
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
             picture = self.picture()
-            for n, slide in enumerate(self.slides(picture), 1):
+            for n, slide in enumerate(self.carousel(picture), 1):
                 slide.save(os.path.join(folder, f"{n:02d}.{ext}"), None, 95)
-            if self.s["full"]:
+            if self.s["full"] in ("last slide + file", "file"):
                 picture.save(os.path.join(folder, f"full.{ext}"), None, 95)
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
-        posts = math.ceil(p.slides / MAX_SLIDES)
-        self.host.toast(f"instagram · {p.slides} slides{f' ({posts} posts)' if posts > 1 else ''} → {folder}")
+        count = self.posted(p)
+        posts = math.ceil(count / MAX_SLIDES)
+        self.host.toast(f"instagram · {count} slides{f' ({posts} posts)' if posts > 1 else ''} → {folder}")
         return folder

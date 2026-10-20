@@ -850,10 +850,21 @@ picture across the gutter, swipes as one image.
 - **background:** the canvas colour, the paper, white or black.
 - **finish:** as distress is set, distressed, or clean.
 
-**export…** writes a folder with `01.jpg`, `02.jpg` and so on (post them in
-that order), and `full.jpg`, the whole uncut picture (turn **full picture**
-off to skip it). JPEG or PNG. Instagram takes up to 20 slides a post; past
-that, the preview says how many posts it takes.
+**The whole picture.** Instagram crops every image in a carousel to the
+shape of the first one, so the long full picture can't go in as it is.
+**full picture** chooses what to do with it:
+
+| Choice | What you get |
+| --- | --- |
+| **last slide** (the default) | one more slide of the same shape: the whole picture scaled down to fit, the background round it |
+| **last slide + file** | that, and the uncut picture as `full.jpg`, to post on its own |
+| **file** | only `full.jpg` |
+| **no** | neither |
+
+**export…** writes a folder with `01.jpg`, `02.jpg` and so on. Post them in
+that order; the fitted whole picture comes last. JPEG or PNG. Instagram
+takes up to 20 slides a post, the fitted picture included; past that, the
+preview says how many posts it takes.
 
 ### Wear
 

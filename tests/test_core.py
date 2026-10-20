@@ -2666,14 +2666,33 @@ def test_instagram_slides_and_seamless_carousel():
     plugin.s.update({"mode": "spreads"})
     assert sorted(pl.page for pl in plugin.plan().placed) == [1, 2] and plugin.plan().slides == 2
     plugin.set_pages("all")
-    # export: numbered slides and the full picture
-    plugin.s.update({"mode": "spreads", "format": "jpg", "full": True})
+    # export: numbered slides, then the whole picture fitted into one more slide
+    # of the same shape (Instagram crops every image to the first one's shape)
+    plugin.s.update({"mode": "spreads", "format": "jpg", "full": "last slide + file",
+                     "background": "black"})
     folder = plugin.export(TMP)
     names = sorted(os.listdir(folder))
     count = plugin.plan().slides
-    assert names == [f"{k:02d}.jpg" for k in range(1, count + 1)] + ["full.jpg"], names
-    assert QtGui.QImage(os.path.join(folder, "01.jpg")).size() == QtCore.QSize(1080, 1350)
+    assert plugin.posted() == count + 1
+    assert names == [f"{k:02d}.jpg" for k in range(1, count + 2)] + ["full.jpg"], names
+    sizes = {(lambda i: (i.width(), i.height()))(QtGui.QImage(os.path.join(folder, f"{k:02d}.jpg")))
+             for k in range(1, count + 2)}
+    assert sizes == {(1080, 1350)}, "every image the carousel's shape"
     assert QtGui.QImage(os.path.join(folder, "full.jpg")).size() == QtCore.QSize(count * 1080, 1350)
+    last = QtGui.QImage(os.path.join(folder, f"{count + 1:02d}.jpg"))
+    fitted = plugin.fit_rect(count * 1080, 1350, QtCore.QRectF(0, 0, 1080, 1350))
+    assert abs(fitted.width() / fitted.height() - count * 1080 / 1350) < 0.01, "the whole picture, not cropped"
+    assert fitted.width() <= 1080 and fitted.height() < 1350 / 2
+    assert QtGui.QColor(last.pixel(540, 20)).lightness() < 20, "background above it"
+    assert QtGui.QColor(last.pixel(540, 1330)).lightness() < 20, "and below"
+    assert QtGui.QColor(last.pixel(540, 675)).lightness() > 60, "the picture in the middle"
+    # the other choices
+    for full, extra, file in (("last slide", 1, False), ("file", 0, True), ("no", 0, False)):
+        plugin.s["full"] = full
+        names = sorted(os.listdir(plugin.export(TMP)))
+        assert names == [f"{k:02d}.jpg" for k in range(1, count + 1 + extra)] + (["full.jpg"] if file else []), (full, names)
+    plugin.s["full"] = "last slide"
+    plugin.view.grab()
     # more than Instagram takes in one post: said in the preview
     plugin.s.update({"mode": "pages", "shape": "1.91:1"})
     w.view.grab()

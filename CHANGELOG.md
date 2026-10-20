@@ -19,6 +19,18 @@ version that wrote it. The format follows
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-10-20
+
+### Fixed
+
+- **instagram: the whole picture fits in the carousel.** Instagram crops
+  every image in a carousel to the first one's shape, so `full.jpg` was cut
+  down when posted with the slides. **full picture** now adds it as a last
+  slide of the same shape, the whole picture scaled down to fit, by
+  default. You can also have the uncut file as well, the file only, or
+  neither. The preview shows the extra slide and counts it towards
+  Instagram's 20.
+
 ## [0.5.4] - 2026-10-20
 
 ### Fixed
@@ -260,6 +272,7 @@ Everything before versioning started.
     including draft and test prints.
 
 [Unreleased]: #unreleased
+[0.5.5]: #055---2026-10-20
 [0.5.4]: #054---2026-10-20
 [0.5.3]: #053---2026-10-20
 [0.5.2]: #052---2026-10-20
