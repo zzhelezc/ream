@@ -2721,6 +2721,177 @@ def test_a_bleeding_spread_picture_keeps_no_extra_page():
     w.close()
 
 
+def test_saving_big_media_never_stalls():
+    import zipfile
+    from ream import project
+    w = fresh()
+    w.show()
+    w._ready = True
+    # a PDF of many pages: every page shares the whole file
+    pdf = os.path.join(TMP, "many.pdf")
+    writer = QtGui.QPdfWriter(pdf)
+    painter = QtGui.QPainter(writer)
+    for n in range(12):
+        if n:
+            writer.newPage()
+        painter.fillRect(QtCore.QRectF(0, 0, writer.width(), writer.height() / 3),
+                         QtGui.QColor.fromHsv(n * 30, 200, 200))
+    painter.end()
+    page = w.sheet.scene_page_rect()
+    hashed = []
+    real = project.media_name
+    project.media_name = lambda blob, ext: (hashed.append(len(blob)), real(blob, ext))[1]
+    try:
+        w.add_files([pdf], page.center())
+        assert len([t for t in w.things.values() if t.alive]) == 12
+        w.state()
+        w.state()
+        assert len(hashed) == 1, "the PDF is hashed once, not per page per save"
+    finally:
+        project.media_name = real
+    # the timer's saves go on a thread; a second one while it runs is folded in
+    target = str(w.draft_path())
+    w.autosave(background=True)
+    w.autosave(background=True)
+    assert w._save_again
+    w.wait_for_save()
+    pump(0.3)                                         # the follow-up save comes round
+    w.wait_for_save()
+    assert not w._save_again and os.path.exists(target)
+    # media are stored as they are (no squeezing a PDF again)
+    with zipfile.ZipFile(target) as archive:
+        kinds = {i.filename.rsplit(".", 1)[-1]: i.compress_type for i in archive.infolist()
+                 if i.filename.startswith("media/")}
+    assert kinds.get("pdf") == zipfile.ZIP_STORED, kinds
+    state, media = project.load(target)
+    assert len([t for t in state["things"] if t.get("pdf_page") is not None]) == 12
+    # an explicit save waits for one under way, then writes at once
+    w.autosave(background=True)
+    w.save_as(os.path.join(TMP, "big.ream"))
+    assert w._saving.done() and os.path.exists(os.path.join(TMP, "big.ream"))
+    w.close()
+
+
+def test_big_pdfs_stay_light_on_memory():
+    from ream import page as P
+    w = fresh()
+    w.show()
+    w.distress.enabled = False
+    pdf = os.path.join(TMP, "light.pdf")
+    writer = QtGui.QPdfWriter(pdf)
+    writer.setResolution(150)
+    painter = QtGui.QPainter(writer)
+    for n in range(8):
+        if n:
+            writer.newPage()
+        painter.fillRect(QtCore.QRectF(0, 0, writer.width(), writer.height() / 2),
+                         QtGui.QColor.fromHsv(n * 40, 200, 210))
+        painter.drawText(QtCore.QRectF(0, 0, writer.width(), writer.height()), QtCore.Qt.AlignCenter, str(n))
+    painter.end()
+    limit = P.ORIGINALS.limit
+    try:
+        P.ORIGINALS.limit = 40 * 2 ** 20                  # room for only a few pages' originals
+        w.add_files([pdf], w.sheet.scene_page_rect().center())
+        things = [t for t in w.things.values() if t.alive]
+        assert len(things) == 8
+        held = [t for t in things if t._original is not None]
+        assert len(held) < 8 and P.ORIGINALS.total <= P.ORIGINALS.limit + things[0].px_w * things[0].px_h * 4
+        # the on-screen copies are small; the pixels are let go, not lost
+        assert all(max(t.preview.width(), t.preview.height()) <= P.PREVIEW_SMALL for t in things)
+        gone = [t for t in things if t._original is None][0]
+        again = gone.original
+        reference = gone._decode()
+        assert again is not None and again == reference, "decoded again, the same pixels"
+        assert gone.px_w == again.width() and gone.px_h == again.height()
+        # drawing the pages beside the live one, and the thumbnails, decode nothing
+        decoded = []
+        real = P.Thing._decode
+        P.Thing._decode = lambda self: (decoded.append(self.uid), real(self))[1]
+        try:
+            for t in things:
+                t._let_go()
+            w.set_layout("spread")
+            w.fit_layout()
+            pump(0.1)
+            w.view.viewport().repaint()
+            w.toggle_pages_panel()
+            pump(0.1)
+            w.pages_panel.grab()
+            assert decoded == [], decoded
+            # an export does (each page as it goes)
+            w.export_pdf(clean=True, path=os.path.join(TMP, "light-out.pdf"))
+            assert decoded
+        finally:
+            P.Thing._decode = real
+        # undo keeps no copy of the original, and still works after it was let go
+        target = things[0]
+        target._let_go()
+        w.set_border([target], 6.0, "#ffffff", 2.0)
+        assert target.border is not None
+        target._let_go()
+        w.undo()
+        assert target.border is None and target.image.size() == QtCore.QSize(target.px_w, target.px_h)
+        # drawn big, an image gets a bigger copy; drawn small, the small one
+        image = QtGui.QImage(100, 100, QtGui.QImage.Format_ARGB32)
+        p = QtGui.QPainter(image)
+        assert target.shown_pixmap(p) is target.preview
+        p.scale(6.0, 6.0)
+        big = target.shown_pixmap(p)
+        p.end()
+        assert big is not target.preview and big.width() > target.preview.width()
+        assert P.BIG_PREVIEWS.total > 0
+    finally:
+        P.ORIGINALS.limit = limit
+    w.close()
+
+
+def test_an_image_hanging_off_a_page_still_pins_and_exports():
+    w = fresh()
+    w.show()
+    w.distress.enabled = False
+    type_paragraphs(w, 12)
+    w.set_covers(cover=False, back=False)            # spreads 1-2, 3-4
+    w.set_layout("spread")
+    w.go_to_page(0)
+    pump(0.3)
+    page = w.sheet.scene_page_rect()                  # page 1, the left of its spread
+    red = QtGui.QImage(240, 160, QtGui.QImage.Format_ARGB32)
+    red.fill(QtGui.QColor("#dd2211"))
+    # hanging off the outer edge: its middle off the page, half of it on
+    out = w.place_qimage(red, QtCore.QRectF(page.left() - 150, page.top() + 300, 240, 160), "bleed")
+    assert out.pinned and out.home == 0, "pinned to the page it covers"
+    image = export.final_page(w.sheet, 0, 36, w.distress, w.paper(), w.ink())
+    k = 36 / 72.0
+    pixel = QtGui.QColor(image.pixel(int(40 * k), int(380 * k)))
+    assert pixel.red() > 200 > pixel.green(), "and exported, cut at the edge"
+    # barely touching a page: stays on the canvas
+    far = w.place_qimage(red, QtCore.QRectF(page.left() - 230, page.top() + 600, 240, 160), "touch")
+    assert not far.pinned
+    # bleeding off the head: still its page's, not the page above's
+    w.go_to_page(2)
+    pump(0.3)
+    third = w.sheet.scene_page_rect()
+    top = w.place_qimage(red, QtCore.QRectF(third.left() + 100, third.top() - 110, 240, 160), "head")
+    assert top.pinned and top.home == 2 and w.sheet.page_of(top) == 2
+    shown = {i: [t for t, _dx, _dy in w.sheet.page_things(i)] for i in range(w.sheet.pages())}
+    assert top in shown[2] and top not in shown[1], "it shows on its own page only"
+    # undo / redo, save / load keep where it belongs
+    w.undo()
+    assert not top.alive
+    w.redo()
+    assert top.alive and top.home == 2
+    state, media = w.state()
+    entry = [t for t in state["things"] if t.get("name") == "head"][0]
+    assert entry["home"] == 2
+    w.load_state(state, media)
+    again = [t for t in w.things.values() if t.alive and t.name == "head"][0]
+    assert again.home == 2 and w.sheet.page_of(again) == 2
+    # deleting a page before it moves it along
+    w.delete_page(0)
+    assert again.home == 1 and w.sheet.page_of(again) == 1
+    w.close()
+
+
 def imposition_styles():
     from ream import imposition
     return list(imposition.STYLES)

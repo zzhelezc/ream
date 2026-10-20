@@ -327,11 +327,21 @@ Mono, SF Mono or Menlo, at 9 pt with 150% leading on A4.
   photos come in the right way up. Each page of a PDF becomes its own image,
   laid out in a row.
 
+**Big documents.** A dropped PDF becomes one image per page, rendered at
+200 dpi. On screen each image is drawn from a small copy, and a sharper one
+is made only while you zoom in on it. The full pixels are kept for the
+images used most lately, up to a memory budget, and decoded again from the
+file when an export, distress or a cut needs them. So a 50-page photo PDF
+costs about half a gigabyte, not two, and exports come out exactly the
+same.
+
 ### Pinning to the page
 
-Drag an image so **its middle is over the page** and it is pinned to that
-page. A heavy outline round the page while you drag says it will pin. A pinned
-image:
+Drag an image so **its middle is over the page**, or so it covers at least
+a quarter of itself there (a picture bleeding off the edge), and it is pinned
+to that page. A heavy outline round the page while you drag says it will
+pin. The image remembers its page, so bleeding off the head or foot never
+moves it onto the neighbouring page. A pinned image:
 
 - scrolls with its page and is clipped to it;
 - goes out with the PDF (anything still on the canvas does not);

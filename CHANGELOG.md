@@ -19,6 +19,66 @@ version that wrote it. The format follows
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-10-20
+
+### Fixed
+
+- **A picture bleeding off a page's edge is pinned and exported.** An image
+  pinned only if its middle was over a page. So a picture hanging off a
+  page's outer edge, middle just outside, stayed on the canvas: it looked
+  placed but never exported.
+  - **Pinning:** an image now also pins to the page it covers most, if
+    that's at least a quarter of it.
+  - **Remembered page:** it remembers its page, through undo, saving and
+    page moves, so a picture bleeding off the head or foot stays with its
+    page rather than being taken for the next one.
+
+  Files from before still open: things there go to the page their middle
+  is on, as before.
+
+## [0.5.3] - 2026-10-20
+
+### Changed
+
+- **Big PDFs take a third of the memory.** With 50 A4 photo pages, memory
+  went from +1.73 GB to +0.58 GB. Drawing, dragging and saving are as quick
+  as before, and exports are pixel-for-pixel the same.
+  - **On-screen copies:** each image keeps a small on-screen copy (900 px).
+    A bigger one is made only while it is drawn bigger (zoomed in), and the
+    bigger ones share a 192 MB budget.
+  - **Originals:** they share a 256 MB budget. The least lately used are let
+    go and decoded again from the file when needed (about 14 ms for a PDF
+    page), for exports, distress and cutting.
+  - **Screen drawing:** the pages beside the live one and the pages panel's
+    thumbnails draw from the on-screen copies, never the full pixels.
+  - **Undo** no longer holds a copy of each original; originals never
+    change.
+
+## [0.5.2] - 2026-10-20
+
+### Fixed
+
+- **No more stalls with big PDFs.** With a 50-page PDF of photos (59 MB) on
+  the page, every autosave froze the window for about 2 s, a second after
+  every move: moving things lagged, and so did the palette. Each page carries
+  the whole PDF, and each save fingerprinted it once per page, recompressed
+  it into the `.ream` file, and did it all on the main thread.
+
+  | | before | after |
+  | --- | --- | --- |
+  | building a save | 893 ms | 19 ms |
+  | a save that blocks the window | 1.95 s | 85 ms |
+  | window after letting go of a drag | frozen about 2 s | free |
+
+  - **Fingerprints once:** a file is fingerprinted once and remembered, and
+    masks are encoded once.
+  - **No recompressing:** media go into the `.ream` file as they are
+    (images and PDFs are compressed already). Older files open as before.
+  - **Background autosave:** autosaves are written on a thread of their
+    own, one at a time, with changes made meanwhile saved straight after.
+    Saving, opening, new document and quitting still save at once, after
+    waiting for any save under way.
+
 ## [0.5.1] - 2026-10-20
 
 ### Fixed
@@ -200,6 +260,9 @@ Everything before versioning started.
     including draft and test prints.
 
 [Unreleased]: #unreleased
+[0.5.4]: #054---2026-10-20
+[0.5.3]: #053---2026-10-20
+[0.5.2]: #052---2026-10-20
 [0.5.1]: #051---2026-10-20
 [0.5.0]: #050---2026-10-20
 [0.4.2]: #042---2026-10-20

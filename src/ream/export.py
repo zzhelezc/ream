@@ -27,8 +27,11 @@ from PyQt5 import QtCore, QtGui
 from . import distress, papers
 
 
-def draw_page(painter: QtGui.QPainter, sheet, index: int, ink: QtGui.QColor):
-    """Draw page `index` in page points, origin at its top-left corner."""
+def draw_page(painter: QtGui.QPainter, sheet, index: int, ink: QtGui.QColor, screen: bool = False):
+    """Draw page `index` in page points, origin at its top-left corner.
+    `screen`: for showing it (the pages beside the live one, thumbnails) -
+    images from their on-screen copies, sized to the painter, so drawing it
+    never needs a picture's full pixels."""
     w, h = sheet.W, sheet.H
     clip = QtCore.QRectF(0.0, index * h, w, h)
     painter.save()
@@ -47,7 +50,10 @@ def draw_page(painter: QtGui.QPainter, sheet, index: int, ink: QtGui.QColor):
             painter.translate(dx, dy)
             placed, _ok = thing.itemTransform(thing.parentItem())
             painter.setTransform(placed, True)
-            thing.render(painter, ink)
+            if screen and thing.kind == "image":
+                thing.paint(painter, None)
+            else:
+                thing.render(painter, ink)
             painter.restore()
 
     things_where(lambda z: z < 0)

@@ -98,16 +98,16 @@ def text_to_doc(doc: QtGui.QTextDocument, text: str, block_format: QtGui.QTextBl
 # -- the project file ---------------------------------------------------------
 
 def save(path: str, state: dict, media: dict[str, bytes]):
-    """Write atomically: a crash mid-save never eats the last good file."""
+    """Write atomically: a crash mid-save never eats the last good file.
+    Media go in as they are - images and PDFs are compressed already, and
+    squeezing a big PDF again on every autosave cost seconds for nothing."""
     folder = os.path.dirname(os.path.abspath(path))
     os.makedirs(folder, exist_ok=True)
     temp = path + ".saving"
     with zipfile.ZipFile(temp, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("ream.json", json.dumps({"format": FORMAT, **state}, indent=1))
         for name, blob in media.items():
-            stored = name.endswith((".png", ".jpg", ".jpeg", ".webp", ".heic", ".gif"))
-            archive.writestr(name, blob,
-                             compress_type=zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED)
+            archive.writestr(name, blob, compress_type=zipfile.ZIP_STORED)
     os.replace(temp, path)
 
 

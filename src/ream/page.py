@@ -21,13 +21,52 @@ with the PDF.
 from __future__ import annotations
 
 import itertools
+import math
+from collections import OrderedDict
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 PREVIEW_MAX = 2400          # px: the on-screen copy of a big image is no larger
+PREVIEW_SMALL = 900         # px: the everyday on-screen copy; bigger only when drawn bigger
 DRAFT_MAX = 900             # px: while a slider is dragged, an image is reworked this big
 _uids = itertools.count(1)
+
+
+class _Budget:
+    """Pixels kept in memory, up to `limit` bytes, the least lately used let
+    go first (`drop(thing)`): a book of big pictures can't fill the machine."""
+
+    def __init__(self, limit: int, drop):
+        self.limit, self.drop = limit, drop
+        self.items: OrderedDict = OrderedDict()      # id(thing) -> (thing, bytes)
+        self.total = 0
+
+    def touch(self, thing, size: int):
+        old = self.items.pop(id(thing), None)
+        if old is not None:
+            self.total -= old[1]
+        self.items[id(thing)] = (thing, size)
+        self.total += size
+        while self.total > self.limit and len(self.items) > 1:
+            key, (other, used) = next(iter(self.items.items()))
+            if other is thing:
+                break
+            del self.items[key]
+            self.total -= used
+            self.drop(other)
+
+    def forget(self, thing):
+        old = self.items.pop(id(thing), None)
+        if old is not None:
+            self.total -= old[1]
+
+
+# an image's original can always be decoded again from its file (a PDF page
+# re-rendered, an image read): past this, the least lately used are let go
+ORIGINALS = _Budget(256 * 2 ** 20, lambda thing: thing._let_go())
+# the bigger on-screen copies, made only while an image is drawn big
+BIG_PREVIEWS = _Budget(192 * 2 ** 20, lambda thing: setattr(thing, "_big", None))
 
 
 def qimage_to_bgra(image: QtGui.QImage) -> np.ndarray:
@@ -69,9 +108,13 @@ class Thing(QtWidgets.QGraphicsItem):
         self.pdf_page = pdf_page
         self.name = name
         self.w, self.h = float(size.width()), float(size.height())
-        self.original = image.convertToFormat(QtGui.QImage.Format_ARGB32)
-        self.image = self.original
+        image = image.convertToFormat(QtGui.QImage.Format_ARGB32)
+        self.px_w, self.px_h = image.width(), image.height()
+        self._original: QtGui.QImage | None = image
+        self._image: QtGui.QImage | None = None      # the composed result; None: the original
+        self._big: QtGui.QPixmap | None = None       # the bigger on-screen copy, when drawn big
         self._bgra: np.ndarray | None = None
+        ORIGINALS.touch(self, image.byteCount())
         self._make_preview()
         self.setTransformOriginPoint(self.w / 2, self.h / 2)    # turns about its middle
 
@@ -87,9 +130,47 @@ class Thing(QtWidgets.QGraphicsItem):
         self.pad_px = 0                           # how far the border reaches past the art
         self.version = 0                          # bumped whenever the pixels change
         self.drafted = False                      # shown from a quick draft; recompose() pending
+        self.home: int | None = None              # pinned: the page it belongs to
         self.setFlag(QtWidgets.QGraphicsItem.ItemIsSelectable)
 
     # -- pixels ----------------------------------------------------------------
+    @property
+    def original(self) -> QtGui.QImage | None:
+        """The image's own pixels, decoded again from its file if they were let go."""
+        if self._original is None and getattr(self, "blob", None):
+            self._original = self._decode()
+        if self._original is not None:
+            ORIGINALS.touch(self, self._original.byteCount())
+        return self._original
+
+    @original.setter
+    def original(self, value):
+        self._original = value
+
+    @property
+    def image(self) -> QtGui.QImage | None:
+        """What is drawn, exported and distressed: the original, or it with
+        its masks, tear and border."""
+        return self._image if self._image is not None else self.original
+
+    @image.setter
+    def image(self, value):
+        self._image = None if value is None or value is self._original else value
+
+    def _decode(self) -> QtGui.QImage:
+        from . import project
+        if self.pdf_page is not None:
+            image = project.pdf_page(self.blob, self.pdf_page)[0]
+        else:
+            image = project.image_from_bytes(self.blob)
+        return image.convertToFormat(QtGui.QImage.Format_ARGB32)
+
+    def _let_go(self):
+        """Memory is tight: forget the original's pixels (and their numpy
+        copy) - they come back from the file when needed."""
+        self._original = None
+        self._bgra = None
+
     def bgra(self) -> np.ndarray:
         """The original pixels (BGRA), read once."""
         if self._bgra is None:
@@ -97,7 +178,7 @@ class Thing(QtWidgets.QGraphicsItem):
         return self._bgra
 
     def px_per_pt(self) -> float:
-        return self.original.width() / max(1e-6, self.w)
+        return self.px_w / max(1e-6, self.w)
 
     def alpha(self) -> np.ndarray:
         """How much of each original pixel shows, after both masks: uint8."""
@@ -113,11 +194,12 @@ class Thing(QtWidgets.QGraphicsItem):
         rebuild.  `draft`: rebuild just what is shown, from a small copy -
         quick enough to follow a slider; recompose() finishes it."""
         if "original" in changes:
-            self.original = changes.pop("original").convertToFormat(QtGui.QImage.Format_ARGB32)
+            image = changes.pop("original").convertToFormat(QtGui.QImage.Format_ARGB32)
+            self._original, self.px_w, self.px_h = image, image.width(), image.height()
             self._bgra = None
         for key, value in changes.items():
             setattr(self, key, value)
-        if draft and max(self.original.width(), self.original.height()) > DRAFT_MAX:
+        if draft and max(self.px_w, self.px_h) > DRAFT_MAX:
             self._draft()
         else:
             self.recompose()
@@ -126,7 +208,7 @@ class Thing(QtWidgets.QGraphicsItem):
         """What is shown, worked out at DRAFT_MAX px; `image` waits for recompose()."""
         import cv2
         from . import matting
-        k = DRAFT_MAX / max(self.original.width(), self.original.height())
+        k = DRAFT_MAX / max(self.px_w, self.px_h)
         pixels = self.bgra().copy()
         pixels[..., 3] = self.alpha()
         small = cv2.resize(pixels, (max(1, round(pixels.shape[1] * k)), max(1, round(pixels.shape[0] * k))),
@@ -151,7 +233,7 @@ class Thing(QtWidgets.QGraphicsItem):
         from . import matting
         self.drafted = False
         if self.mask is None and self.matte is None and self.border is None and not self.tear:
-            self.image, self.pad_px = self.original, 0
+            self._image, self.pad_px = None, 0
         else:
             pixels = self.bgra().copy()
             pixels[..., 3] = self.alpha()
@@ -165,26 +247,52 @@ class Thing(QtWidgets.QGraphicsItem):
                 grown = matting.add_outline(pixels, width, (c.red(), c.green(), c.blue()), smooth)
                 pad = (grown.shape[1] - pixels.shape[1]) // 2
                 pixels = grown
-            self.image, self.pad_px = bgra_to_qimage(pixels), pad
+            self._image, self.pad_px = bgra_to_qimage(pixels), pad
+            self._bgra = None                        # the numpy copy is rebuilt when needed
         self.version += 1
         self.prepareGeometryChange()
         self._make_preview()
         self.update()
 
     def _make_preview(self):
+        """The everyday on-screen copy, small; a bigger one is made in
+        paint() only while the image is drawn bigger than this."""
         image = self.image
         big = max(image.width(), image.height())
-        shown = image if big <= PREVIEW_MAX else image.scaled(
-            PREVIEW_MAX, PREVIEW_MAX, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        shown = image if big <= PREVIEW_SMALL else image.scaled(
+            PREVIEW_SMALL, PREVIEW_SMALL, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
         self.preview = QtGui.QPixmap.fromImage(shown)
+        self._big = None
+        BIG_PREVIEWS.forget(self)
+
+    def shown_pixmap(self, painter: QtGui.QPainter) -> QtGui.QPixmap:
+        """The copy to draw at the painter's scale: the small one, or a
+        bigger one made (and kept, within BIG_PREVIEWS) when it is drawn big."""
+        if self.drafted:
+            return self.preview
+        t = painter.worldTransform()
+        ratio = painter.device().devicePixelRatioF() if painter.device() else 1.0
+        need = max(self.w, self.h) * math.hypot(t.m11(), t.m12()) * ratio
+        small = max(self.preview.width(), self.preview.height())
+        full = max(self.px_w, self.px_h) + 2 * self.pad_px
+        if need <= small * 1.15 or full <= small:
+            return self.preview
+        want = int(min(full, PREVIEW_MAX, need * 1.25))
+        if self._big is None or max(self._big.width(), self._big.height()) < min(want, need) * 0.95:
+            image = self.image
+            self._big = QtGui.QPixmap.fromImage(image if want >= max(image.width(), image.height())
+                                                else image.scaled(want, want, QtCore.Qt.KeepAspectRatio,
+                                                                  QtCore.Qt.SmoothTransformation))
+        BIG_PREVIEWS.touch(self, self._big.width() * self._big.height() * 4)
+        return self._big
 
     def pad_pt(self) -> float:
         return self.pad_px / self.px_per_pt() if self.pad_px else 0.0
 
     def to_pixels(self, item_point: QtCore.QPointF) -> tuple[float, float]:
         """An item-coordinate point as a position on the original's pixels."""
-        return (item_point.x() * self.original.width() / max(1e-6, self.w),
-                item_point.y() * self.original.height() / max(1e-6, self.h))
+        return (item_point.x() * self.px_w / max(1e-6, self.w),
+                item_point.y() * self.px_h / max(1e-6, self.h))
 
     def set_flip(self, flip_x: bool, flip_y: bool):
         self.flip = (bool(flip_x), bool(flip_y))
@@ -216,7 +324,8 @@ class Thing(QtWidgets.QGraphicsItem):
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
-        painter.drawPixmap(self.boundingRect(), self.preview, QtCore.QRectF(self.preview.rect()))
+        shown = self.shown_pixmap(painter)
+        painter.drawPixmap(self.boundingRect(), shown, QtCore.QRectF(shown.rect()))
 
     def resize(self, w: float, h: float):
         """New size about the same middle, so a turned image stays put."""
@@ -243,7 +352,7 @@ class Thing(QtWidgets.QGraphicsItem):
         return self.mapRectToParent(self.boundingRect())
 
     def natural_aspect(self) -> float:
-        return self.original.width() / max(1, self.original.height())
+        return self.px_w / max(1, self.px_h)
 
     def key(self) -> tuple:
         """Everything about where and what it is - for caches, never for undo."""
@@ -731,7 +840,11 @@ class Sheet(QtWidgets.QGraphicsRectItem):
         return [c for c in self.strip.childItems() if isinstance(c, Thing)]
 
     def page_of(self, thing) -> int:
-        """The page a pinned thing belongs to: the one its middle is on."""
+        """The page a pinned thing belongs to: the one it was pinned to (it may
+        hang off it - bleed), or, for one that never said, the one its middle is on."""
+        home = getattr(thing, "home", None)
+        if home is not None:
+            return home
         return max(0, int(thing.parent_rect().center().y() // self.H))
 
     def facing(self, index: int):

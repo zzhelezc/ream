@@ -74,7 +74,7 @@ class PageStrip(QtWidgets.QWidget):
         if getattr(c, "_surface", None) is not None:
             painter.drawImage(QtCore.QRectF(0, 0, w, h), c._surface)
         painter.scale(w / c.sheet.W, h / c.sheet.H)
-        export.draw_page(painter, c.sheet, index, c.ink())
+        export.draw_page(painter, c.sheet, index, c.ink(), screen=True)
         painter.end()
         image.setDevicePixelRatio(ratio)
         self.cache[index] = (key, image)

@@ -111,6 +111,7 @@ def busy():
 
 class Ream(QtWidgets.QMainWindow):
     preview_ready = QtCore.pyqtSignal(int, object)      # from the preview worker
+    save_done = QtCore.pyqtSignal(str)                  # from the saving thread: "" or the error
     ghost_ready = QtCore.pyqtSignal(int, object, object)  # page, key, image
 
     def __init__(self, paths: list[str] | None = None, theme: str | None = None):
@@ -201,7 +202,15 @@ class Ream(QtWidgets.QMainWindow):
         self._note_birth: tuple[int, int] | None = None
 
         self.save_timer = QtCore.QTimer(self, singleShot=True, interval=1200)
-        self.save_timer.timeout.connect(self.autosave)
+        self.save_timer.timeout.connect(lambda: self.autosave(background=True))
+        # autosaves are written on a thread of their own, so a document with
+        # big media never stalls the window; one at a time, the newest last
+        self._save_pool = ThreadPoolExecutor(max_workers=1)
+        self._saving = None
+        self._save_again = False
+        self._media_names: dict[int, tuple] = {}         # id(blob) -> (blob, name): hashed once
+        self._plane_pngs: dict[int, tuple] = {}          # id(mask) -> (mask, png bytes)
+        self.save_done.connect(self._saved)
         self.anim = QtCore.QVariantAnimation(self)
         self.anim.setDuration(260)
         self.anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
@@ -838,7 +847,7 @@ class Ream(QtWidgets.QMainWindow):
         self.scene.addItem(thing)
         thing.setPos(rect.topLeft())
         thing.setZValue(self.top_z() + 1.0)
-        if self.live_on(rect.center()):
+        if self.page_under(thing.sceneBoundingRect()):
             self.pin(thing)
         if push:
             self.push("things", before)
@@ -851,6 +860,7 @@ class Ream(QtWidgets.QMainWindow):
         at = thing.scenePos()
         thing.setParentItem(self.sheet.strip)
         thing.setPos(self.sheet.strip.mapFromScene(at))
+        thing.home = self.page                      # it belongs to the live page, bleed and all
         front = [t.zValue() for t in self.sheet.pinned() if t is not thing and t.zValue() >= 0]
         thing.setZValue(max(front, default=0.0) + 1.0)
 
@@ -860,6 +870,7 @@ class Ream(QtWidgets.QMainWindow):
         at = thing.scenePos()
         thing.setParentItem(None)
         thing.setPos(at)
+        thing.home = None
         thing.setVisible(True)
 
     def top_z(self) -> float:
@@ -1012,7 +1023,8 @@ class Ream(QtWidgets.QMainWindow):
             for thing, origin in zip(drag["things"], drag["from"]):
                 thing.setPos(origin + delta)
             lead = drag["lead"]
-            drag["over"] = self.page_rect_at(lead.sceneBoundingRect().center())
+            choice = self.page_choice(lead.sceneBoundingRect())
+            drag["over"] = choice[1] if choice else None
         elif drag["mode"] == "scale" and isinstance(drag["thing"], Note):
             note = drag["thing"]
             note.set_width(note.mapFromScene(at).x())
@@ -1068,7 +1080,7 @@ class Ream(QtWidgets.QMainWindow):
             for thing in carried:
                 z += 1.0
                 thing.setZValue(z)
-                if self.live_on(thing.sceneBoundingRect().center()):
+                if self.page_under(thing.sceneBoundingRect()):
                     self.pin(thing)
             self.push("things", drag["before"])
             self.changed()
@@ -1154,7 +1166,7 @@ class Ream(QtWidgets.QMainWindow):
         return None
 
     def _page_of(self, thing) -> int:
-        return max(0, int(thing.parent_rect().center().y() // self.sheet.H))
+        return self.sheet.page_of(thing)
 
     def fix_pages(self):
         """Give every page its own words: a paragraph running over a page's
@@ -1240,6 +1252,7 @@ class Ream(QtWidgets.QMainWindow):
                 self.scene.removeItem(thing)
             elif new != old:
                 thing.moveBy(0.0, (new - old) * self.sheet.H)
+                thing.home = new
 
     def _page_edit(self, build):
         """Fix the pages, then `build(n)` -> (order, mapping, page to show)."""
@@ -1523,6 +1536,7 @@ class Ream(QtWidgets.QMainWindow):
         face = self.facing(self.page)
         if face is not None and thing.pinned and self.sheet.page_of(thing) == face[0]:
             thing.setPos(thing.pos() + QtCore.QPointF(face[1], face[2]))
+            thing.home = self.page
             thing.setVisible(True)                  # one of the live page's own now
 
     def ghost_at(self, at: QtCore.QPointF) -> GhostPage | None:
@@ -1551,6 +1565,37 @@ class Ream(QtWidgets.QMainWindow):
             self.request_preview()
             self._render_ghosts()
 
+    def page_choice(self, rect: QtCore.QRectF):
+        """The shown page something over `rect` goes to: the one under its
+        middle, else the one it covers most - if that is at least a quarter
+        of it (a picture bleeding off a page's edge belongs to that page).
+        (index, scene rect) or None."""
+        shown = [(self.page, self.sheet.scene_page_rect())] + \
+            [(i, g.sceneBoundingRect()) for i, g in sorted(self.ghosts.items())]
+        middle = rect.center()
+        for index, box in shown:
+            if box.contains(middle):
+                return index, box
+        best, most = None, 0.0
+        for index, box in shown:
+            overlap = box.intersected(rect)
+            area = max(0.0, overlap.width()) * max(0.0, overlap.height())
+            if area > most:
+                best, most = (index, box), area
+        if best is None or most < 0.25 * rect.width() * rect.height():
+            return None
+        return best
+
+    def page_under(self, rect: QtCore.QRectF) -> bool:
+        """Make the page `rect` goes to (page_choice) the live one; True if
+        there is one - the thing then pins to it."""
+        choice = self.page_choice(rect)
+        if choice is None:
+            return False
+        if choice[0] != self.page:
+            self.make_live(choice[0])
+        return True
+
     def live_on(self, at: QtCore.QPointF) -> bool:
         """If `at` is over a shown page, make that page live; True if so."""
         ghost = self.ghost_at(at)
@@ -1573,7 +1618,7 @@ class Ream(QtWidgets.QMainWindow):
             painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
             painter.drawImage(rect, ghost.distressed[1])    # the blend is in it already
             return
-        export.draw_page(painter, self.sheet, ghost.index, self.ink())
+        export.draw_page(painter, self.sheet, ghost.index, self.ink(), screen=True)
         if layer is not None:
             draw_stock(painter, rect, layer, self.blend_mode(), self.fmt.grain / 100.0)
 
@@ -2249,7 +2294,7 @@ class Ream(QtWidgets.QMainWindow):
     def snapshot(self) -> dict:
         return {uid: (t.alive, t.pinned, t.pos().x(), t.pos().y(), t.w, t.h, t.zValue(),
                       t.rotation(), dict(t.look) if isinstance(t, Note) else
-                      (t.original, t.mask, t.matte, t.border, t.flip, t.tear))
+                      (None, t.mask, t.matte, t.border, t.flip, t.tear), t.home)
                 for uid, t in self.things.items()}
 
     def things_key(self) -> tuple:
@@ -2258,8 +2303,9 @@ class Ream(QtWidgets.QMainWindow):
 
     def restore(self, snap: dict):
         for uid, thing in self.things.items():
-            alive, pinned, x, y, w, h, z, turn, pixels = snap.get(
-                uid, (False, False, 0, 0, thing.w, thing.h, 0, 0, None))
+            alive, pinned, x, y, w, h, z, turn, pixels, home = snap.get(
+                uid, (False, False, 0, 0, thing.w, thing.h, 0, 0, None, None))
+            thing.home = home if pinned else None
             if not alive:
                 if thing.scene() is not None:
                     thing.setSelected(False)
@@ -2280,14 +2326,12 @@ class Ream(QtWidgets.QMainWindow):
             thing.setZValue(z)
             thing.setRotation(turn)
             if pixels is not None and thing.kind == "image":
-                original, mask, matte, border, flip, tear = pixels
-                if (original is not thing.original or mask is not thing.mask
-                        or matte is not thing.matte or border != thing.border or tear != thing.tear):
-                    if original is not thing.original:
-                        thing.set_pixels(original=original, mask=mask, matte=matte, border=border,
-                                         tear=tear)
-                    else:
-                        thing.set_pixels(mask=mask, matte=matte, border=border, tear=tear)
+                # (an original never changes - it comes from the file - so undo
+                # keeps no copy of it: memory stays free for the pictures)
+                _original, mask, matte, border, flip, tear = pixels
+                if (mask is not thing.mask or matte is not thing.matte or border != thing.border
+                        or tear != thing.tear):
+                    thing.set_pixels(mask=mask, matte=matte, border=border, tear=tear)
                 if flip != thing.flip:
                     thing.set_flip(*flip)
             elif isinstance(pixels, dict) and isinstance(thing, Note) and pixels != thing.look:
@@ -3262,6 +3306,7 @@ class Ream(QtWidgets.QMainWindow):
         self.things[thing.uid] = thing
         if like.pinned:
             thing.setParentItem(self.sheet.strip)
+            thing.home = like.home
         else:
             self.scene.addItem(thing)
         thing.setRotation(like.rotation())
@@ -4208,24 +4253,27 @@ class Ream(QtWidgets.QMainWindow):
                 if thing is self.editing or thing.text().strip():
                     things.append({"uid": thing.uid, "kind": "text", "text": thing.text(),
                                    "wrap": thing.wrap, "pinned": thing.pinned,
+                                   **({"home": thing.home} if thing.pinned and thing.home is not None
+                                      else {}),
                                    "x": thing.pos().x(), "y": thing.pos().y(),
                                    "z": thing.zValue(), "r": thing.rotation(),
                                    **({"look": dict(thing.look)} if thing.look else {}),
                                    **({"runs": runs} if (runs := doc_runs(thing.editor.document()))
                                       else {})})
                 continue
-            name = project.media_name(thing.blob, thing.ext)
+            name = self.media_name(thing.blob, thing.ext)
             media[name] = thing.blob
             entry = {"uid": thing.uid, "media": name, "pdf_page": thing.pdf_page,
                      "name": thing.name, "pinned": thing.pinned,
+                     **({"home": thing.home} if thing.pinned and thing.home is not None else {}),
                      "x": thing.pos().x(), "y": thing.pos().y(),
                      "w": thing.w, "h": thing.h, "z": thing.zValue(),
                      "r": thing.rotation()}
             for field in ("mask", "matte"):                  # the masks, as greyscale PNGs
                 plane = getattr(thing, field)
                 if plane is not None:
-                    data = project.png_bytes(plane)
-                    entry[field] = project.media_name(data, ".png")
+                    data = self.plane_png(plane)
+                    entry[field] = self.media_name(data, ".png")
                     media[entry[field]] = data
             if thing.border is not None:
                 entry["border"] = list(thing.border)
@@ -4279,6 +4327,7 @@ class Ream(QtWidgets.QMainWindow):
                     self.things[note.uid] = note
                     if entry.get("pinned"):
                         note.setParentItem(self.sheet.strip)
+                        note.home = entry.get("home")
                     else:
                         self.scene.addItem(note)
                     note.setPos(entry["x"], entry["y"])
@@ -4307,6 +4356,7 @@ class Ream(QtWidgets.QMainWindow):
                 self.things[thing.uid] = thing
                 if entry.get("pinned"):
                     thing.setParentItem(self.sheet.strip)
+                    thing.home = entry.get("home")
                 else:
                     self.scene.addItem(thing)
                 thing.setPos(entry["x"], entry["y"])
@@ -4423,15 +4473,72 @@ class Ream(QtWidgets.QMainWindow):
             self.hide_preview()             # never leave a stale picture over the page
         self.view.viewport().update()
 
-    def autosave(self):
+    def autosave(self, background: bool = False):
+        """Save to the document (or the draft).  `background`: write it on the
+        saving thread - the timer's saves; an explicit save (or quitting)
+        waits for any save under way and writes there and then."""
         self.save_timer.stop()
         if self._loading or not self._ready:
             return
+        if background and self._saving is not None and not self._saving.done():
+            self._save_again = True                 # newer changes: once more when this one is done
+            return
         state, media = self.state()
+        target = self.path or str(self.draft_path())
+        if background:
+            self._saving = self._save_pool.submit(self._write, target, state, media)
+            return
+        self.wait_for_save()
         try:
-            project.save(self.path or str(self.draft_path()), state, media)
+            project.save(target, state, media)
         except OSError as exc:
             self.toast(f"could not save: {exc}")
+
+    def _write(self, target: str, state: dict, media: dict):
+        """On the saving thread."""
+        try:
+            project.save(target, state, media)
+            self.save_done.emit("")
+        except Exception as exc:                    # noqa: BLE001 - reported, never lost silently
+            self.save_done.emit(str(exc))
+
+    def _saved(self, error: str):
+        if error:
+            self.toast(f"could not save: {error}")
+        if self._save_again:
+            self._save_again = False
+            self.autosave(background=True)
+
+    def wait_for_save(self):
+        if self._saving is not None:
+            try:
+                self._saving.result()
+            except Exception:                       # noqa: BLE001 - its error was reported
+                pass
+
+    def media_name(self, blob: bytes, ext: str) -> str:
+        """A media file's name in the .ream file, hashed once per blob (every
+        page of a PDF shares the whole PDF: hashing it per page per save was
+        seconds of work)."""
+        hit = self._media_names.get(id(blob))
+        if hit is not None and hit[0] is blob:
+            return hit[1]
+        name = project.media_name(blob, ext)
+        if len(self._media_names) > 4096:
+            self._media_names.clear()
+        self._media_names[id(blob)] = (blob, name)
+        return name
+
+    def plane_png(self, plane) -> bytes:
+        """A mask as PNG bytes, encoded once (masks are replaced, never edited)."""
+        hit = self._plane_pngs.get(id(plane))
+        if hit is not None and hit[0] is plane:
+            return hit[1]
+        data = project.png_bytes(plane)
+        if len(self._plane_pngs) > 1024:
+            self._plane_pngs.clear()
+        self._plane_pngs[id(plane)] = (plane, data)
+        return data
 
     # -- palette -------------------------------------------------------------
     def open_palette(self, global_pos: QtCore.QPoint | None = None, text: str = "",
