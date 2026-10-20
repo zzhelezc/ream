@@ -19,6 +19,108 @@ version that wrote it. The format follows
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-20
+
+### Fixed
+
+- **A picture bleeding off a page no longer keeps an extra page alive.**
+  Before, a spread picture a little taller than the page made a third page,
+  and deleting that page didn't remove it. Now:
+  - a thing keeps only its own page (the one its middle is on) in being;
+  - each page shows its own things, cut at its edges, plus what hangs over
+    the gutter from its facing page, but nothing that hangs off the page
+    above or below it, on screen or in exports.
+
+## [0.5.0] - 2026-10-20
+
+### Added
+
+- **instagram** (`⌥⌘G`): the book as Instagram posts.
+  - **Slides:** one slide per page, each spread across slides, or the whole
+    book as one long strip.
+  - **Seamless:** all are cut edge to edge from one full picture, so the
+    carousel swipes seamlessly, even across a spread or a picture over the
+    gutter.
+  - **Shape:** 4:5, 1:1, 3:4 or 1.91:1, at 1080, 1440 or 2160 wide.
+  - **Fitting:** fit or fill, with zoom, margin, gap, nudge and background
+    controls.
+  - **Preview:** a slide preview that warns past Instagram's 20 slides a
+    post.
+  - **Export:** a folder of numbered slides plus `full.jpg`, the uncut
+    picture.
+
+## [0.4.2] - 2026-10-20
+
+### Fixed
+
+- **A picture can be placed across a spread.** Before, it was cut off at
+  the edge of whichever page its middle was on. Now it belongs to that page
+  and hangs over onto the facing page of the spread, so both pages show
+  their part:
+  - on screen, on the live page and the page beside it;
+  - in previews, distress, single-page and spread exports, and imposition.
+
+  Either half picks it up. Covers standing alone still cut it at the edge.
+  `.ream` files are unchanged: where a thing sits already said all this.
+
+## [0.4.1] - 2026-10-20
+
+### Changed
+
+- **Faster distress and exports, with identical output.** Distressed pages,
+  PNGs and impose bundles are pixel-for-pixel what 0.4.0 made; tests check
+  this against references.
+
+  | | 0.4.0 | 0.4.1 |
+  | --- | --- | --- |
+  | distress a page at 300 dpi | 571 ms | 291 ms |
+  | export 10 distressed pages (PDF) | 6.6 s | 2.0 s |
+  | export 3 distressed PNGs | 2.3 s | 0.95 s |
+  | tear a 4000×3000 image | 480 ms | 230 ms |
+  | a tear slider step on that image | 500 ms | 35–50 ms |
+
+  - **Distress works on just the ink and the margin round it** that the
+    effect can reach, not the whole page. Single-colour ink (type always
+    is) skips the colour-spreading blur. Layers go onto the paper only
+    where they have ink.
+  - **Distressed pages are made several at once** for PDF and PNG exports
+    and impose bundles. Qt draws each page on the main thread, threads
+    distress them, and pages come back in order.
+  - **Torn edges change only the torn strips.** While a tear slider is
+    dragged, a big image is re-torn from a small copy, and the full-size
+    tear follows when you let go (or a moment after you stop).
+  - **The textures the document's distress uses are loaded in the
+    background at startup,** so the first distressed view doesn't wait.
+  - **Misfire is still the slow setting** (about 0.7 s a page). Its wide
+    blur can't be cropped without changing the result.
+- `tests/bench.py` times the slow paths.
+
+### Fixed
+
+- **A flaky wear test:** it looked for the torn edge's paper rim in a single
+  column, which a thin, random rim could miss.
+
+## [0.4.0] - 2026-10-20
+
+### Added
+
+- **wear** (`⌥⌘W`): distress tools for what's on the page.
+  - **Torn edges for images:**
+    - drawn by ream, or along a torn matte from your stamps folder;
+    - any sides, with depth and roughness;
+    - a rim of paper core (paper, cream or burnt).
+
+    A tear is part of the image, like its border: the original is never
+    touched, the sliders change it live, and it is undoable, saved, exported
+    and distressed. There is a **tear** tool (`R`) too.
+  - **Stamps,** placed with the **stamp** tool (`S`):
+    - from your own textures in the stamps folder, plus coffee ring, ink
+      blot, specks and crease drawn by ream;
+    - size, jitter, turn, tint and strength;
+    - sheets of pieces give one piece per click;
+    - opaque textures are keyed from their lightness.
+- **.ream files** can hold a tear on an image (older versions ignore it).
+
 ## [0.3.1] - 2026-10-20
 
 ### Changed
@@ -98,6 +200,11 @@ Everything before versioning started.
     including draft and test prints.
 
 [Unreleased]: #unreleased
+[0.5.1]: #051---2026-10-20
+[0.5.0]: #050---2026-10-20
+[0.4.2]: #042---2026-10-20
+[0.4.1]: #041---2026-10-20
+[0.4.0]: #040---2026-10-20
 [0.3.1]: #031---2026-10-20
 [0.3.0]: #030---2026-10-20
 [0.2.0]: #020---2026-10-20

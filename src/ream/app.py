@@ -227,8 +227,12 @@ class Ream(QtWidgets.QMainWindow):
             self.resize(1280, 860)
         self.apply_theme()
 
-        # the textures take a few seconds to pull out of the PSDs the first time
+        # the textures take a few seconds to pull out of the PSDs the first time;
+        # once the document is in, the ones its distress uses are loaded too, so
+        # the first distressed preview doesn't wait for them
         threading.Thread(target=distress.library, daemon=True).start()
+        QtCore.QTimer.singleShot(0, lambda: threading.Thread(
+            target=distress.warm, args=(replace(self.distress),), daemon=True).start())
 
         documents = [p for p in (paths or []) if p.lower().endswith(project.SUFFIX)]
         others = [p for p in (paths or []) if not p.lower().endswith(project.SUFFIX)]
@@ -777,7 +781,8 @@ class Ream(QtWidgets.QMainWindow):
                 if item.zValue() < 0 and not behind:
                     continue                # behind the words: Alt+click reaches it
             return item
-        return None
+        hit = self.spread_hit(scene_pos, behind)  # a picture across the gutter, by its overhang
+        return hit[0] if hit is not None else None
 
     def handle_at(self, view_pos: QtCore.QPointF) -> tuple[Thing, str] | None:
         """(thing, "scale" | "rotate") under the pointer, for a selected thing."""
@@ -855,6 +860,7 @@ class Ream(QtWidgets.QMainWindow):
         at = thing.scenePos()
         thing.setParentItem(None)
         thing.setPos(at)
+        thing.setVisible(True)
 
     def top_z(self) -> float:
         return max((t.zValue() for t in self.things.values() if t.alive and not t.pinned),
@@ -927,6 +933,7 @@ class Ream(QtWidgets.QMainWindow):
             behind = True                   # no words here: what lies under them is reachable
         thing = self.thing_at(at, behind=behind)
         if thing is not None:
+            self.adopt_facing(thing)        # picked up by its overhang: home is the live page now
             self.story_selected = False
             if mods & QtCore.Qt.ShiftModifier:
                 thing.setSelected(not thing.isSelected())
@@ -1438,6 +1445,85 @@ class Ream(QtWidgets.QMainWindow):
         size = self.view.viewport().size()
         aspect = (size.width() / max(1, size.height())) * (self.sheet.H / (2 * self.sheet.W))
         self._grid_cols = max(1, min(n, round(math.sqrt(n * aspect)) or 1))
+
+    def facing(self, index: int):
+        """The page beside `index` in its spread, and the shift that shows
+        things on it on `index`: (page, dx, dy) in strip points - None for a
+        page standing alone.  Facing pages touch, so a picture across the
+        gutter belongs to one page and hangs over onto the other."""
+        for left, right in self.spreads(max(self.sheet.pages(), self.page + 1, index + 1)):
+            if index == left and right is not None:
+                return right, self.sheet.W, -self.sheet.H
+            if index == right and left is not None:
+                return left, -self.sheet.W, self.sheet.H
+        return None
+
+    def paint_facing(self, painter: QtGui.QPainter, front: bool):
+        """On the live page: the facing page's things that hang over onto it."""
+        face = self.facing(self.page)
+        if face is None:
+            return
+        other, dx, dy = face
+        sheet = self.sheet
+        clip = QtCore.QRectF(0.0, self.page * sheet.H, sheet.W, sheet.H)
+        painter.save()
+        painter.setClipRect(clip, QtCore.Qt.IntersectClip)
+        painter.setRenderHints(QtGui.QPainter.Antialiasing | QtGui.QPainter.SmoothPixmapTransform)
+        ink = self.ink()
+        for thing in sorted(sheet.pinned(), key=lambda t: t.zValue()):
+            if (thing.zValue() >= 0) != front or sheet.page_of(thing) != other:
+                continue
+            if not thing.parent_rect().translated(dx, dy).intersects(clip):
+                continue
+            painter.save()
+            painter.translate(dx, dy)
+            placed, _ok = thing.itemTransform(thing.parentItem())
+            painter.setTransform(placed, True)
+            if thing.kind == "image":
+                thing.paint(painter, None)              # its on-screen copy: quick
+            else:
+                thing.render(painter, ink)
+            painter.restore()
+        painter.restore()
+
+    def spread_hit(self, scene_pos: QtCore.QPointF, behind: bool = False):
+        """A pinned thing whose overhang is under `scene_pos` - on the live
+        page from the facing page, or on the facing page from the live one.
+        Qt's own hit test misses these: the sheet clips its things to the
+        live page.  (thing, from the facing page?) or None."""
+        face = self.facing(self.page)
+        if face is None:
+            return None
+        other, dx, dy = face
+        sheet = self.sheet
+        page = sheet.scene_page_rect()
+        ghost = self.ghosts.get(other)
+        if page.contains(scene_pos):
+            point = sheet.strip.mapFromScene(scene_pos) - QtCore.QPointF(dx, dy)
+            owner, from_facing = other, True
+        elif ghost is not None and ghost.sceneBoundingRect().contains(scene_pos):
+            local = scene_pos - ghost.sceneBoundingRect().topLeft()
+            point = QtCore.QPointF(local.x(), other * sheet.H + local.y()) + QtCore.QPointF(dx, dy)
+            owner, from_facing = self.page, False
+        else:
+            return None
+        for thing in sorted(sheet.pinned(), key=lambda t: -t.zValue()):
+            if not thing.alive or sheet.page_of(thing) != owner:
+                continue
+            if thing.zValue() < 0 and not behind:
+                continue
+            # its own shape: contains() would answer by the sheet's clip
+            if thing.shape().contains(thing.mapFromParent(point)):
+                return thing, from_facing
+        return None
+
+    def adopt_facing(self, thing):
+        """A thing picked up by its overhang on the live page moves its
+        home to the live page - where it is seen does not change."""
+        face = self.facing(self.page)
+        if face is not None and thing.pinned and self.sheet.page_of(thing) == face[0]:
+            thing.setPos(thing.pos() + QtCore.QPointF(face[1], face[2]))
+            thing.setVisible(True)                  # one of the live page's own now
 
     def ghost_at(self, at: QtCore.QPointF) -> GhostPage | None:
         for ghost in self.ghosts.values():
@@ -2163,7 +2249,7 @@ class Ream(QtWidgets.QMainWindow):
     def snapshot(self) -> dict:
         return {uid: (t.alive, t.pinned, t.pos().x(), t.pos().y(), t.w, t.h, t.zValue(),
                       t.rotation(), dict(t.look) if isinstance(t, Note) else
-                      (t.original, t.mask, t.matte, t.border, t.flip))
+                      (t.original, t.mask, t.matte, t.border, t.flip, t.tear))
                 for uid, t in self.things.items()}
 
     def things_key(self) -> tuple:
@@ -2194,13 +2280,14 @@ class Ream(QtWidgets.QMainWindow):
             thing.setZValue(z)
             thing.setRotation(turn)
             if pixels is not None and thing.kind == "image":
-                original, mask, matte, border, flip = pixels
+                original, mask, matte, border, flip, tear = pixels
                 if (original is not thing.original or mask is not thing.mask
-                        or matte is not thing.matte or border != thing.border):
+                        or matte is not thing.matte or border != thing.border or tear != thing.tear):
                     if original is not thing.original:
-                        thing.set_pixels(original=original, mask=mask, matte=matte, border=border)
+                        thing.set_pixels(original=original, mask=mask, matte=matte, border=border,
+                                         tear=tear)
                     else:
-                        thing.set_pixels(mask=mask, matte=matte, border=border)
+                        thing.set_pixels(mask=mask, matte=matte, border=border, tear=tear)
                 if flip != thing.flip:
                     thing.set_flip(*flip)
             elif isinstance(pixels, dict) and isinstance(thing, Note) and pixels != thing.look:
@@ -3198,7 +3285,8 @@ class Ream(QtWidgets.QMainWindow):
         else:
             copy = Thing(thing.original, QtCore.QSizeF(thing.w, thing.h), thing.blob, thing.ext,
                          thing.pdf_page, thing.name)
-            copy.set_pixels(mask=thing.mask, matte=thing.matte, border=thing.border)
+            copy.set_pixels(mask=thing.mask, matte=thing.matte, border=thing.border,
+                            tear=dict(thing.tear) if thing.tear else None)
         self._adopt(copy, thing, z=thing.zValue() + 0.5)
         copy.setPos(thing.pos() + offset)
         return copy
@@ -4141,6 +4229,8 @@ class Ream(QtWidgets.QMainWindow):
                     media[entry[field]] = data
             if thing.border is not None:
                 entry["border"] = list(thing.border)
+            if thing.tear:
+                entry["tear"] = dict(thing.tear)
             if any(thing.flip):
                 entry["flip"] = list(thing.flip)
             things.append(entry)
@@ -4225,8 +4315,9 @@ class Ream(QtWidgets.QMainWindow):
                 planes = {f: project.png_plane(media.get(entry[f], b""))
                           for f in ("mask", "matte") if entry.get(f)}
                 border = tuple(entry["border"]) if entry.get("border") else None
-                if planes or border:
-                    thing.set_pixels(**planes, border=border)
+                tear = dict(entry["tear"]) if entry.get("tear") else None
+                if planes or border or tear:
+                    thing.set_pixels(**planes, border=border, tear=tear)
                 if entry.get("flip"):
                     thing.set_flip(*entry["flip"])
             self.page = max(0, min(int(state.get("page", 0)), self.sheet.pages()))
@@ -4317,6 +4408,7 @@ class Ream(QtWidgets.QMainWindow):
         self._write_prefs()
 
     def changed(self):
+        self.sheet.show_page(self.page)             # things that moved page show where they belong
         if self._loading:
             return
         self.save_timer.start()

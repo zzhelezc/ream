@@ -26,6 +26,7 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 PREVIEW_MAX = 2400          # px: the on-screen copy of a big image is no larger
+DRAFT_MAX = 900             # px: while a slider is dragged, an image is reworked this big
 _uids = itertools.count(1)
 
 
@@ -81,9 +82,11 @@ class Thing(QtWidgets.QGraphicsItem):
         self.mask: np.ndarray | None = None       # the cut shape, uint8 (h, w); None: all of it
         self.matte: np.ndarray | None = None      # what cleaning took away; None: nothing
         self.border: tuple | None = None          # (width px, "#rrggbb", smooth px) die-cut
+        self.tear: dict | None = None             # a torn edge (see ream.wear), or None
         self.flip = (False, False)
         self.pad_px = 0                           # how far the border reaches past the art
         self.version = 0                          # bumped whenever the pixels change
+        self.drafted = False                      # shown from a quick draft; recompose() pending
         self.setFlag(QtWidgets.QGraphicsItem.ItemIsSelectable)
 
     # -- pixels ----------------------------------------------------------------
@@ -105,22 +108,56 @@ class Thing(QtWidgets.QGraphicsItem):
             a = a * self.matte // 255
         return a.astype(np.uint8)
 
-    def set_pixels(self, **changes):
-        """Change any of original / mask / matte / border, then rebuild."""
+    def set_pixels(self, draft: bool = False, **changes):
+        """Change any of original / mask / matte / border / tear, then
+        rebuild.  `draft`: rebuild just what is shown, from a small copy -
+        quick enough to follow a slider; recompose() finishes it."""
         if "original" in changes:
             self.original = changes.pop("original").convertToFormat(QtGui.QImage.Format_ARGB32)
             self._bgra = None
         for key, value in changes.items():
             setattr(self, key, value)
-        self.recompose()
+        if draft and max(self.original.width(), self.original.height()) > DRAFT_MAX:
+            self._draft()
+        else:
+            self.recompose()
+
+    def _draft(self):
+        """What is shown, worked out at DRAFT_MAX px; `image` waits for recompose()."""
+        import cv2
+        from . import matting
+        k = DRAFT_MAX / max(self.original.width(), self.original.height())
+        pixels = self.bgra().copy()
+        pixels[..., 3] = self.alpha()
+        small = cv2.resize(pixels, (max(1, round(pixels.shape[1] * k)), max(1, round(pixels.shape[0] * k))),
+                           interpolation=cv2.INTER_AREA)
+        if self.tear:
+            from . import wear
+            small = wear.apply_tear(small, self.tear, self.px_per_pt() * k)
+        pad = 0
+        if self.border is not None:
+            width, colour, smooth = self.border
+            c = QtGui.QColor(colour)
+            grown = matting.add_outline(small, width * k, (c.red(), c.green(), c.blue()), smooth * k)
+            pad = (grown.shape[1] - small.shape[1]) // 2
+            small = grown
+        self.prepareGeometryChange()
+        self.pad_px = int(round(pad / k))
+        self.preview = QtGui.QPixmap.fromImage(bgra_to_qimage(small))
+        self.drafted = True
+        self.update()
 
     def recompose(self):
         from . import matting
-        if self.mask is None and self.matte is None and self.border is None:
+        self.drafted = False
+        if self.mask is None and self.matte is None and self.border is None and not self.tear:
             self.image, self.pad_px = self.original, 0
         else:
             pixels = self.bgra().copy()
             pixels[..., 3] = self.alpha()
+            if self.tear:
+                from . import wear
+                pixels = wear.apply_tear(pixels, self.tear, self.px_per_pt())
             pad = 0
             if self.border is not None:
                 width, colour, smooth = self.border
@@ -550,6 +587,28 @@ class PageText(QtWidgets.QGraphicsTextItem):
         event.ignore()
 
 
+class FacingLayer(QtWidgets.QGraphicsItem):
+    """On the live page, what hangs over from the page beside it in its
+    spread: a picture placed across the gutter belongs to one page but shows
+    on both.  Two of these sit in the strip - behind the words and in front
+    - and draw the facing page's things, shifted onto this page."""
+
+    def __init__(self, sheet, front: bool):
+        super().__init__(sheet.strip)
+        self.sheet = sheet
+        self.front = front
+        self.setZValue(1e6 if front else -1e6)
+        self.setAcceptedMouseButtons(QtCore.Qt.NoButton)
+
+    def boundingRect(self) -> QtCore.QRectF:
+        return QtCore.QRectF(-1e5, -1e5, 2e5, 1e8)      # the sheet clips it to the page
+
+    def paint(self, painter, option, widget=None):
+        paint = getattr(self.sheet.controller, "paint_facing", None)
+        if paint is not None:
+            paint(painter, self.front)
+
+
 class StockLayer(QtWidgets.QGraphicsItem):
     """A paper photograph blended over the whole page - words, images and
     all - with one of Qt's blend modes, as a paper texture on top in
@@ -617,6 +676,7 @@ class Sheet(QtWidgets.QGraphicsRectItem):
         self.W, self.H = 595.0, 842.0
         self.stock = StockLayer(self)
         self.stock.setVisible(False)
+        self.facing_layers = (FacingLayer(self, False), FacingLayer(self, True))
 
     # -- geometry ------------------------------------------------------------
     def set_geometry(self, w: float, h: float, side: float, head: float):
@@ -640,6 +700,14 @@ class Sheet(QtWidgets.QGraphicsRectItem):
     def set_offset(self, y: float):
         self.offset = y
         self.strip.setPos(0.0, -y)
+        self.show_page(int(round(y / self.H)) if self.H else 0)
+
+    def show_page(self, index: int):
+        """Only page `index`'s own things show on the live page: a thing that
+        hangs off another page's foot or head stays on its page (what hangs
+        over the gutter from the facing page is drawn by the facing layers)."""
+        for thing in self.pinned():
+            thing.setVisible(self.page_of(thing) == index)
 
     def set_paper(self, colour: QtGui.QColor, surface: QtGui.QImage | None = None):
         """Flat colour, or a paper stock image drawn over the whole page."""
@@ -662,14 +730,42 @@ class Sheet(QtWidgets.QGraphicsRectItem):
     def pinned(self) -> list[Thing]:
         return [c for c in self.strip.childItems() if isinstance(c, Thing)]
 
+    def page_of(self, thing) -> int:
+        """The page a pinned thing belongs to: the one its middle is on."""
+        return max(0, int(thing.parent_rect().center().y() // self.H))
+
+    def facing(self, index: int):
+        """(page beside `index` in its spread, dx, dy): things on that page
+        show on `index` moved by (dx, dy) in strip points; None for a page
+        that stands alone (a cover)."""
+        facing = getattr(self.controller, "facing", None)
+        return facing(index) if facing is not None else None
+
+    def page_things(self, index: int) -> list[tuple]:
+        """What shows on page `index`, bottom to top: (thing, dx, dy) - its
+        own things (cut at its edges), and the overhang of things on the
+        facing page of its spread."""
+        clip = QtCore.QRectF(0.0, index * self.H, self.W, self.H)
+        things = self.pinned()
+        # its own things only: what hangs off the page above or below stays there
+        shown = [(t, 0.0, 0.0) for t in things
+                 if self.page_of(t) == index and t.parent_rect().intersects(clip)]
+        face = self.facing(index)
+        if face is not None:
+            other, dx, dy = face
+            shown += [(t, dx, dy) for t in things
+                      if self.page_of(t) == other and t.parent_rect().translated(dx, dy).intersects(clip)]
+        shown.sort(key=lambda e: e[0].zValue())
+        return shown
+
     def pages(self) -> int:
-        """Pages with something on them: the text's, and any a pinned thing
-        reaches."""
+        """Pages with something on them: the text's, and each pinned thing's
+        own page (the one its middle is on) - not every page it reaches, so a
+        picture bleeding off a page's foot doesn't keep the next page alive."""
         count = self.text_pages()
         for thing in self.pinned():
-            bottom = thing.parent_rect().bottom()
-            if bottom > 0:
-                count = max(count, int((bottom - 0.5) // self.H) + 1)
+            if thing.parent_rect().bottom() > 0:
+                count = max(count, self.page_of(thing) + 1)
         return count
 
     def caret_span(self) -> tuple[float, float]:

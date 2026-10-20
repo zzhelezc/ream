@@ -279,6 +279,16 @@ itself when you switch, and `⌘0` re-frames it.
 
 - **Spread.** Pages pair the way a book's do. `⌘←` and `⌘→` turn a whole
   spread.
+- **Across the gutter.** Drop, paste or drag a picture (or a text block)
+  across the gutter and it spans the spread. It belongs to the page its
+  middle is on and hangs over onto the facing page, which shows the rest.
+  That holds on screen, in previews, distress, single-page and spread
+  exports, and imposition, where each half prints on its own page. Click
+  either half to pick it up; picked up by its overhang, its home moves to
+  the page you're on, without it moving. A cover or back cover standing
+  alone has no facing page, so anything hanging off it is cut at the
+  edge. So is anything hanging off a page's head or foot: bleed is cut
+  there and never makes or keeps an extra page.
 - **All pages.** Laid out like the pages panel: one spread a row, facing
   pages touching, every spine on one line down the middle. Each page is
   numbered underneath, or beside its spread when zoomed out too far for that.
@@ -382,6 +392,7 @@ the number.
 | --- | --- |
 | Panels | distress panel (`⌘D`), page panel (`⌘L`), text panel (`⌘T`) |
 | Modes | writer mode / design mode (`⌥⌘D`), new text box (`T` in design mode) |
+| Plugins | stik (`⌥⌘K`), impose (`⌥⌘I`), wear (`⌥⌘W`), instagram (`⌥⌘G`), scanner |
 | Export | export pdf (`⌘E`: the export panel, for PDF or PNG), export pdf · all pages now, export pdf · clean (`⇧⌘E`), export png pages |
 | Distress | distress view (`⇧⌘D`), distress on/off, distress images on/off, style · …, fade texture · …, reset distress |
 | Page and type | page size · a4 / letter / a5 / square, paper · white / cream / newsprint / bond, paper colour…, canvas colour…, font · … |
@@ -801,6 +812,97 @@ still pans. Right-click either frame for the settings.
 Also in the palette: **scanner: scan / stop**, **clear result**, **result to
 canvas** and **export png**. Positions, size and settings are remembered.
 
+### Instagram
+
+The book as Instagram posts. `⌥⌘G` (or **instagram** in the palette) opens
+a preview of the slides and the panel. The chosen pages, laid side by side,
+make one long picture, and the slides are cut from it edge to edge. So in
+a carousel each slide runs straight on into the next: a spread, or a
+picture across the gutter, swipes as one image.
+
+| as | Slides |
+| --- | --- |
+| **pages** | one slide per page, the page fitted to it |
+| **spreads** | each spread across **per spread** slides (2 by default, so a page a slide), a cover alone on its own |
+| **one long strip** | every page side by side, cut into as many slides as it takes |
+
+**Shape and size:**
+- **shape:** 4:5 (1080 × 1350, the most room on screen), 1:1, 3:4
+  (1080 × 1440) or 1.91:1 (1080 × 566).
+- **width:** 1080, 1440 or 2160.
+- **pages:** all, or a range like `2-9`.
+
+**Fitting the pages:**
+- **pictures:** **fit** keeps whole pages in the slides with the background
+  round them; **fill** fills the slides and crops.
+- **zoom, margin, gap** (between pages in the strip), and **nudge** ←→ ↑↓
+  to adjust.
+- **background:** the canvas colour, the paper, white or black.
+- **finish:** as distress is set, distressed, or clean.
+
+**export…** writes a folder with `01.jpg`, `02.jpg` and so on (post them in
+that order), and `full.jpg`, the whole uncut picture (turn **full picture**
+off to skip it). JPEG or PNG. Instagram takes up to 20 slides a post; past
+that, the preview says how many posts it takes.
+
+### Wear
+
+Distress for what's on the page: **torn edges** for images, and **stamps**
+(stains, ink splatter, tape, dust, folds, document marks) to put down. `⌥⌘W`
+(or **wear** in the palette) opens the panel.
+
+**Torn edges.** Select images and click **tear**. Their edges tear, and the
+paper's core shows along the tear.
+
+- **edge:** **drawn** (ream tears along a fractal edge, with fibres) or a
+  torn matte from your stamps folder, stretched over the image.
+- **sides:** all, one, or a pair.
+- **depth, rough:** how far and how raggedly it tears.
+- **rim, core:** how wide the band of paper core is, and its colour (paper,
+  cream, burnt, or none).
+
+The tear is a property of the image, like its border, so the original is
+never touched. With torn images selected, the sliders change the tear live,
+and a whole drag undoes as one step. **new tear** tears again differently,
+and **mend** takes it off. The **tear** tool (`R`) tears any image you click;
+`⌥`-click mends it. Tears are saved, exported and distressed.
+
+**Stamps.** Pick a **kind**, then a stamp in the grid, and the **stamp** tool
+(`S`) is on. Each click puts the stamp down centred on the pointer, as an
+image, so it moves, turns, stacks, pins to the page, undoes and is
+distressed like any image.
+
+| Row | Does |
+| --- | --- |
+| size | as a share of the page's width (the dashed box at the pointer shows it) |
+| jitter | varies the size, stamp to stamp |
+| turn | none, a little, or any way, at random |
+| tint | as is, ink, brown, rust, blue, red, paper |
+| strength | fades it |
+
+A sheet of pieces (tape strips, document marks) gives a different piece
+each click. `Esc` stops.
+
+**Where stamps come from.** ream draws four itself, so it works with nothing
+downloaded: **coffee ring**, **ink blot**, **specks** and **crease**. The
+rest are your own textures in the stamps folder,
+`~/Library/Application Support/ream/stamps/` (**stamps folder…** opens it).
+Each subfolder is a kind; **torn mattes** holds the mattes that tear images.
+
+- **Opaque images** (marks photographed on white, or on black) are keyed from
+  their lightness, so the marks become the stamp and the ground disappears.
+- **Images with transparency** are used as they are.
+- **index.json** names them and says which to split into pieces:
+  `{"tape/Texturelabs_Details_122M.png": {"label": "Masking tape", "split": 8}}`.
+
+Like the paper stock, ream ships no textures. Texturelabs' textures are free
+to use in your work but not to pass on, so they stay in your folder and are
+never bundled with ream.
+
+Stamps lie over the page with ordinary transparency, so they look the same
+in a clean PDF (which has no blend modes). A dark stamp over words lightens
+them a little, where a real stain would darken them.
+
 ## Paper stock
 
 A paper stock lays a photographed paper's surface under the page, on screen,
@@ -909,6 +1011,11 @@ palette changes like `edge 30` or `style · stamp` show in it straight away.
 default). A clean one is vector, so the text stays real text. The distress
 settings are saved with the document.
 
+Distressing is the slow part: about 0.3 s a page at 300 dpi, or 0.7 s with
+misfire. So exports distress several pages at once on separate threads,
+and work only on the ink and the margin round it that the effect can reach.
+`tests/bench.py` times it.
+
 ## Export
 
 `⌘E` opens the **export** panel: the page map, which pages to export, and
@@ -985,6 +1092,9 @@ Choosing a theme sets its canvas colour. Any colour from the page panel or
 | `src/ream/plugins/impose.py` | the impose plugin: panel, preview, guide drawings, bundle, print card |
 | `src/ream/printing.py` | sending PDFs to a printer (CUPS `lp` / `lpstat`) |
 | `src/ream/plugins/stik.py` | the stik plugin: cut tools, wand, eraser, background, islands, border, export |
+| `src/ream/wear.py` | torn edges (drawn or from a matte, with a paper rim), stamps from textures, ream's own drawn stamps |
+| `src/ream/plugins/wear.py` | the wear plugin: tear and stamp tools, the stamp grid |
+| `src/ream/plugins/instagram.py` | the instagram plugin: slides from pages, spreads or one long strip, the seamless carousel, the full picture |
 | `src/ream/matting.py` | stik's pixel maths: background removal, wand, islands, die-cut borders |
 | `src/ream/profiles.py` | profiles: the store of named settings |
 | `src/ream/papers.py` | paper stock: the papers folder, the tooth map, laying it on a page |

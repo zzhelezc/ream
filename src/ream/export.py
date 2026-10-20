@@ -8,10 +8,18 @@ no selection outline or canvas clutter can get in: things behind the text
 Clean PDFs are vector - the text stays text.  With distress on, each page is
 rendered as an ink layer on transparent at the export dpi, distressed (see
 distress.py), laid on paper and placed in the PDF as one image.
+
+Distressing is the slow part, so several pages go at once (distressed_pages):
+Qt draws each page's layers here, on the main thread - text layout is not
+safe anywhere else - and threads distress them (numpy and OpenCV let go of
+the interpreter while they work), a few pages ahead, handed back in order.
 """
 from __future__ import annotations
 
-from typing import Callable
+import os
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Iterator
 
 import numpy as np
 from PyQt5 import QtCore, QtGui
@@ -28,13 +36,15 @@ def draw_page(painter: QtGui.QPainter, sheet, index: int, ink: QtGui.QColor):
                            | QtGui.QPainter.TextAntialiasing)
     painter.translate(0.0, -index * h)
     painter.setClipRect(clip)
-    things = sorted(sheet.pinned(), key=lambda t: t.zValue())
+    # its own things, and what hangs over from the facing page of its spread
+    things = sheet.page_things(index)
 
     def things_where(test):
-        for thing in things:
-            if not (test(thing.zValue()) and thing.parent_rect().intersects(clip)):
+        for thing, dx, dy in things:
+            if not test(thing.zValue()):
                 continue
             painter.save()
+            painter.translate(dx, dy)
             placed, _ok = thing.itemTransform(thing.parentItem())
             painter.setTransform(placed, True)
             thing.render(painter, ink)
@@ -80,8 +90,10 @@ def ink_layer(sheet, index: int, dpi: float, ink: QtGui.QColor,
     return to_numpy(image)
 
 
-def _draw_thing(painter: QtGui.QPainter, thing, ink: QtGui.QColor):
+def _draw_thing(painter: QtGui.QPainter, thing, ink: QtGui.QColor, dx: float = 0.0,
+                dy: float = 0.0):
     painter.save()
+    painter.translate(dx, dy)
     placed, _ok = thing.itemTransform(thing.parentItem())
     painter.setTransform(placed, True)
     thing.render(painter, ink)
@@ -120,8 +132,8 @@ def ink_layers(sheet, index: int, dpi: float, ink: QtGui.QColor,
         context.palette.setColor(QtGui.QPalette.Text, ink)
         sheet.doc.documentLayout().draw(painter, context)
 
-    def thing_layer(thing):
-        area = thing.parent_rect().intersected(page)
+    def thing_layer(thing, dx=0.0, dy=0.0):
+        area = thing.parent_rect().translated(dx, dy).intersected(page)
         if area.isEmpty():
             return None
         left = int(area.left() * scale) - x0 - pad
@@ -133,13 +145,13 @@ def ink_layers(sheet, index: int, dpi: float, ink: QtGui.QColor,
         if right <= left or bottom <= top:
             return None
         rgba = render(left, top, right - left, bottom - top,
-                      lambda painter, t=thing: _draw_thing(painter, t, ink))
+                      lambda painter, t=thing: _draw_thing(painter, t, ink, dx, dy))
         kind = "image" if getattr(thing, "kind", "image") == "image" else "text"
         return distress.Layer(rgba, top, left, kind)
 
-    things = sorted(sheet.pinned(), key=lambda t: t.zValue())
-    below = [thing_layer(t) for t in things if t.zValue() < 0]
-    above = [thing_layer(t) for t in things if t.zValue() >= 0]
+    things = sheet.page_things(index)           # with the facing page's overhang
+    below = [thing_layer(t, dx, dy) for t, dx, dy in things if t.zValue() < 0]
+    above = [thing_layer(t, dx, dy) for t, dx, dy in things if t.zValue() >= 0]
     text = distress.Layer(render(0, 0, width, height, words), 0, 0, "text")
     # the words always come first in the list (they set the canvas size), so
     # anything behind them goes on in a separate pass below
@@ -203,6 +215,44 @@ def over(sheet, dpi: float, box, paper_stock: Stock | None):
     s = paper_stock
     layer = papers.surface(s.texture, sheet.W, sheet.H, dpi, box, s.scale, s.blend)
     return None if layer is None else (layer, s.blend, s.grain)
+
+
+WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))     # threads distressing pages at once
+
+
+def distressed_pages(sheet, pages, dpi: float, settings: distress.Settings,
+                     paper: QtGui.QColor, ink: QtGui.QColor, density: float = 1.0,
+                     paper_stock: Stock | None = None,
+                     progress: Callable[[int, int], None] | None = None,
+                     workers: int | None = None) -> Iterator[tuple[int, QtGui.QImage]]:
+    """(index, finished page) for each of `pages`, in order - the same
+    images raster_page makes, with several pages distressed at once.  At
+    most a few pages are in hand at a time, so memory stays in check."""
+    pages = list(pages)
+    workers = workers or WORKERS
+    base = stock(sheet, dpi, None, paper, paper_stock)
+    blend = over(sheet, dpi, None, paper_stock)
+    colour = rgb(paper)
+    pending: deque = deque()
+
+    def ready(future_index):
+        future, index = future_index
+        return index, from_rgb(future.result())
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for n, index in enumerate(pages):
+            if progress:
+                progress(n, len(pages))
+            below, text, above = ink_layers(sheet, index, dpi, ink)
+            shape = text.rgba.shape[:2]
+            layers = below + [text] + above
+            pending.append((pool.submit(distress.compose, layers, colour, settings, dpi,
+                                        density=density, base=base, over=blend, shape=shape),
+                            index))
+            while len(pending) > workers:
+                yield ready(pending.popleft())
+        while pending:
+            yield ready(pending.popleft())
 
 
 def raster_page(sheet, index: int, dpi: float, settings: distress.Settings,
@@ -295,6 +345,8 @@ def write_pdf(path: str, sheet, pages: list[int], *, dpi: float, settings: distr
     pw, ph = sheet.W * k, sheet.H * k
     base = None if raster else clean_base(sheet, min(dpi, 300.0), paper, paper_stock)
     total, done = sum(len(u) for u in units), 0
+    finished = distressed_pages(sheet, [i for u in units for i in u], dpi, settings, paper, ink,
+                                density, paper_stock) if raster else None
     for n, unit in enumerate(units):
         if n:
             writer.setPageSize(size(unit))           # takes effect on the new page
@@ -305,8 +357,8 @@ def write_pdf(path: str, sheet, pages: list[int], *, dpi: float, settings: distr
             done += 1
             target = QtCore.QRectF(i * pw, 0, pw, ph)
             if raster:
-                painter.drawImage(target, raster_page(sheet, index, dpi, settings, paper, ink,
-                                                      density, paper_stock))
+                _index, image = next(finished)
+                painter.drawImage(target, image)
             else:
                 # vector words stay words, on top of the paper
                 draw_clean_page(painter, target, sheet, index, paper, ink, base)
@@ -322,13 +374,16 @@ def write_pngs(stem: str, sheet, pages: list[int], *, dpi: float, settings: dist
     written = []
     units = _units(pages, units)
     total, done = sum(len(u) for u in units), 0
+    finished = distressed_pages(sheet, [i for u in units for i in u], dpi, settings, paper, ink,
+                                density, paper_stock) if settings.enabled else None
     for unit in units:
         images = []
         for index in unit:
             if progress:
                 progress(done, total)
             done += 1
-            images.append(final_page(sheet, index, dpi, settings, paper, ink, density, paper_stock))
+            images.append(next(finished)[1] if finished is not None else
+                          final_page(sheet, index, dpi, settings, paper, ink, density, paper_stock))
         if len(images) == 1:
             image = images[0]
         else:

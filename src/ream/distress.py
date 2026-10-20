@@ -175,6 +175,7 @@ def _extract(folder: Path, out: Path) -> dict:
 _index: dict | None = None
 _textures: dict[str, np.ndarray] = {}
 _lock = threading.Lock()        # the app warms the library up in a thread
+_tex_lock = threading.Lock()    # textures load once, even with pages distressed in parallel
 
 
 def library() -> dict:
@@ -237,6 +238,21 @@ def _texture(kind: str, style: str, part: str = "outer") -> np.ndarray:
     key = f"{kind}:{style}:{part}"
     if key in _textures:
         return _textures[key]
+    with _tex_lock:
+        if key in _textures:
+            return _textures[key]
+        return _load_texture(kind, style, part, key)
+
+
+def warm(s: "Settings"):
+    """Load the textures `s` uses, ahead of the first distress (a thread)."""
+    library()
+    _texture("edge", s.style, "outer")
+    _texture("edge", s.style, "inner")
+    _texture("fade", s.fade_style)
+
+
+def _load_texture(kind: str, style: str, part: str, key: str) -> np.ndarray:
     import cv2
     lib = library()
     file = None
@@ -286,7 +302,7 @@ def _field(tex: np.ndarray, shape: tuple[int, int], scale: float,
     th, tw = t.shape
     rows = (np.arange(origin[0], origin[0] + shape[0]) + int(fy * th)) % th
     cols = (np.arange(origin[1], origin[1] + shape[1]) + int(fx * tw)) % tw
-    return t[np.ix_(rows, cols)]
+    return np.take(np.take(t, rows, axis=0), cols, axis=1)
 
 
 EDGE_PX, EDGE_BIAS, EDGE_GAIN = 1.0, 0.2, 0.8      # tuned against 300 dpi type
@@ -300,13 +316,57 @@ def _smoothstep(lo, hi, x):
 
 # -- applying it -------------------------------------------------------------
 
+def _margin(s: Settings, r: float) -> int:
+    """How far from the ink anything apply() does can reach (pixels): the
+    spread, the melt, the colour carried out, and the misfire's wobble and
+    the blur it is drawn from.  Outside that, a layer is untouched."""
+    grow = s.bleed * 0.12 * r
+    spread = max(0.0, grow) + s.edge / 10.0 * EDGE_PX * r * max(0.0, 2.5 * EDGE_GAIN - EDGE_BIAS)
+    reach = int(2 * spread + (8 * r if s.misfire > 0 else 0)) * 2 + 3
+    margin = reach + int(np.ceil(4 * s.blur / 100.0 * MELT_PX * r)) + int(np.ceil(4 * (2.0 * r + 1.0)))
+    if s.misfire > 0:
+        margin += int(np.ceil(4 * (40 * r + 1) + s.misfire / 100.0 * 4.0 * r))
+    return margin + 8
+
+
 def apply(rgba: np.ndarray, s: Settings, dpi: float, origin: tuple[int, int] = (0, 0),
           density: float = 1.0) -> np.ndarray:
     """Distress a layer: (h, w, 4) uint8 straight RGBA in, the same out.  Only
     the alpha is reshaped; colour is carried out to wherever ink spreads.
 
     `origin` places a crop on the page (pixels, row then column).  `density`
-    above 1 packs the ink denser: worn and antialiased edges fill back in."""
+    above 1 packs the ink denser: worn and antialiased edges fill back in.
+
+    Only the ink's own box (and as far round it as the distress can reach)
+    is worked on - a page of type is mostly margin - with the textures
+    placed by `origin`, so the result is the same as distressing it all."""
+    crop, y0, x0 = _apply_box(rgba, s, dpi, origin, density)
+    if crop.shape == rgba.shape:
+        return crop
+    out = np.zeros_like(rgba)
+    out[..., :3] = rgba[..., :3]
+    out[y0:y0 + crop.shape[0], x0:x0 + crop.shape[1]] = crop
+    return out
+
+
+def _apply_box(rgba: np.ndarray, s: Settings, dpi: float, origin: tuple[int, int],
+               density: float) -> tuple[np.ndarray, int, int]:
+    """apply() on just the part that can change: (distressed crop, row, column)."""
+    import cv2
+    h, w = rgba.shape[:2]
+    x, y, bw, bh = cv2.boundingRect((rgba[..., 3] > 0).astype(np.uint8))
+    if bw == 0 or bh == 0:
+        return rgba.copy(), 0, 0
+    pad = _margin(s, dpi / 300.0)
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(w, x + bw + pad), min(h, y + bh + pad)
+    if (x1 - x0) * (y1 - y0) > 0.85 * w * h:
+        return _apply(rgba, s, dpi, origin, density), 0, 0
+    return _apply(rgba[y0:y1, x0:x1], s, dpi, (origin[0] + y0, origin[1] + x0), density), y0, x0
+
+
+def _apply(rgba: np.ndarray, s: Settings, dpi: float, origin: tuple[int, int],
+           density: float) -> np.ndarray:
     import cv2
     h, w = rgba.shape[:2]
     alpha = rgba[..., 3].astype(np.float32) / 255.0
@@ -364,18 +424,38 @@ def apply(rgba: np.ndarray, s: Settings, dpi: float, origin: tuple[int, int] = (
     kept = cv2.dilate(alpha, np.ones((reach, reach), np.uint8))
     cover = np.clip(cover * kept, 0.0, 1.0)
 
-    rgb = rgba[..., :3].astype(np.float32)
-    if spread > 0 or shift is not None:
-        # carry colour outward (normalised blur) so spread ink has a colour
-        sigma = 2.0 * r + 1.0
-        num = cv2.GaussianBlur(rgb * alpha[..., None], (0, 0), sigma)
-        den = cv2.GaussianBlur(alpha, (0, 0), sigma)[..., None]
-        carried = num / np.maximum(den, 1e-4)
-        rgb = np.where(alpha[..., None] > 0.5, rgb, carried)
     out = np.empty_like(rgba)
-    out[..., :3] = np.clip(rgb, 0, 255).astype(np.uint8)
+    if spread > 0 or shift is not None:
+        one = _one_colour(rgba, alpha)
+        if one is not None:
+            # ink of one colour (type always is) carries out as itself
+            out[..., :3] = one
+        else:
+            # carry colour outward (normalised blur) so spread ink has a colour
+            rgb = rgba[..., :3].astype(np.float32)
+            sigma = 2.0 * r + 1.0
+            num = cv2.GaussianBlur(rgb * alpha[..., None], (0, 0), sigma)
+            den = cv2.GaussianBlur(alpha, (0, 0), sigma)[..., None]
+            carried = num / np.maximum(den, 1e-4)
+            rgb = np.where(alpha[..., None] > 0.5, rgb, carried)
+            out[..., :3] = np.clip(rgb, 0, 255).astype(np.uint8)
+    else:
+        out[..., :3] = rgba[..., :3]
     out[..., 3] = np.clip(cover * 255.0 + 0.5, 0, 255).astype(np.uint8)
     return out
+
+
+def _one_colour(rgba: np.ndarray, alpha: np.ndarray) -> np.ndarray | None:
+    """The ink's colour if every inked pixel has the same one, else None."""
+    import cv2
+    mask = (rgba[..., 3] > 0).astype(np.uint8)
+    colour = []
+    for c in range(3):
+        lo, hi, _p, _q = cv2.minMaxLoc(np.ascontiguousarray(rgba[..., c]), mask)
+        if lo != hi:
+            return None
+        colour.append(int(lo))
+    return np.array(colour, np.uint8)
 
 
 def paper(shape: tuple[int, int], colour: tuple[int, int, int], s: Settings,
@@ -384,6 +464,11 @@ def paper(shape: tuple[int, int], colour: tuple[int, int, int], s: Settings,
     """The sheet: (h, w, 3) uint8 - flat `colour`, or `base` (a paper stock,
     see papers.py) - aged by the fade texture when `paper` > 0."""
     h, w = shape
+    if not (s.enabled and s.paper > 0):
+        # nothing to age: the paper as it is, with no trip through floats
+        if base is not None:
+            return base.copy()
+        return np.full((h, w, 3), np.clip(np.asarray(colour), 0, 255), np.uint8)
     if base is not None:
         sheet = base.astype(np.float32)
     else:
@@ -401,7 +486,8 @@ def paper(shape: tuple[int, int], colour: tuple[int, int, int], s: Settings,
 
 def compose(layers, colour: tuple[int, int, int], s: Settings,
             dpi: float, origin: tuple[int, int] = (0, 0), density: float = 1.0,
-            base: np.ndarray | None = None, over: tuple | None = None) -> np.ndarray:
+            base: np.ndarray | None = None, over: tuple | None = None,
+            shape: tuple[int, int] | None = None) -> np.ndarray:
     """Lay a page's ink on paper: (h, w, 3) uint8 RGB.
 
     `layers` is one straight-RGBA array (everything at once), or a list of
@@ -413,28 +499,44 @@ def compose(layers, colour: tuple[int, int, int], s: Settings,
     (photo, mode, amount), a paper blended over the finished page."""
     if isinstance(layers, np.ndarray):
         layers = [Layer(layers, 0, 0, "text")]
-    h, w = layers[0].rgba.shape[:2]
-    sheet = paper((h, w), colour, s, dpi, origin, base).astype(np.float32)
-    tone = None
-    if base is not None:
-        # ink sits in the paper's tooth: the stock's light and shade carry
-        # through it (multiply), most visibly in faded or coloured ink
-        tone = np.clip(base.astype(np.float32) / np.maximum(np.array(colour, np.float32), 1.0),
-                       0.0, 1.3)
+    import cv2
+    h, w = shape if shape is not None else layers[0].rgba.shape[:2]
+    page = paper((h, w), colour, s, dpi, origin, base)
+    # distress each layer on its own, kept as just the part with ink in it
+    # (a layer of type is mostly margin)
+    inks = []
     for layer in layers:
         rgba = layer.rgba
-        lh, lw = rgba.shape[:2]
-        if lh == 0 or lw == 0 or rgba[..., 3].max() == 0:
+        if rgba.shape[0] == 0 or rgba.shape[1] == 0 or rgba[..., 3].max() == 0:
             continue
+        y, x = layer.y, layer.x
         if s.enabled and (layer.kind == "text" or s.images):
-            rgba = apply(rgba, s, dpi, (origin[0] + layer.y, origin[1] + layer.x), density)
-        a = rgba[..., 3:4].astype(np.float32) / 255.0
-        pigment = rgba[..., :3].astype(np.float32)
-        region = (slice(layer.y, layer.y + lh), slice(layer.x, layer.x + lw))
-        if tone is not None:
-            pigment = pigment * tone[region]
-        sheet[region] = sheet[region] * (1.0 - a) + pigment * a
-    page = np.clip(sheet + 0.5, 0, 255).astype(np.uint8)
+            rgba, dy, dx = _apply_box(rgba, s, dpi, (origin[0] + y, origin[1] + x), density)
+            y, x = y + dy, x + dx
+        bx, by, bw, bh = cv2.boundingRect((rgba[..., 3] > 0).astype(np.uint8))
+        if bw and bh:
+            inks.append((rgba[by:by + bh, bx:bx + bw], y + by, x + bx))
+    if inks:
+        # lay them on in order, in floats over just the inked area, rounding once
+        y0 = max(0, min(y for _r, y, _x in inks))
+        x0 = max(0, min(x for _r, _y, x in inks))
+        y1 = min(h, max(y + r.shape[0] for r, y, _x in inks))
+        x1 = min(w, max(x + r.shape[1] for r, _y, x in inks))
+        sheet = page[y0:y1, x0:x1].astype(np.float32)
+        tone = None
+        if base is not None:
+            # ink sits in the paper's tooth: the stock's light and shade carry
+            # through it (multiply), most visibly in faded or coloured ink
+            tone = np.clip(base[y0:y1, x0:x1].astype(np.float32)
+                           / np.maximum(np.array(colour, np.float32), 1.0), 0.0, 1.3)
+        for rgba, y, x in inks:
+            region = (slice(y - y0, y - y0 + rgba.shape[0]), slice(x - x0, x - x0 + rgba.shape[1]))
+            a = rgba[..., 3:4].astype(np.float32) / 255.0
+            pigment = rgba[..., :3].astype(np.float32)
+            if tone is not None:
+                pigment = pigment * tone[region]
+            sheet[region] = sheet[region] * (1.0 - a) + pigment * a
+        page[y0:y1, x0:x1] = np.clip(sheet + 0.5, 0, 255).astype(np.uint8)
     if over is not None:
         from . import papers
         layer_photo, mode, amount = over

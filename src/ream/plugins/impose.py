@@ -1093,6 +1093,10 @@ class Plugin(Base):
             cache: dict[int, QtGui.QImage] = {}
 
             def draw(painter, rect, page):
+                if not cache:
+                    # every page at once, several distressed in parallel
+                    cache.update(export.distressed_pages(c.sheet, range(c.sheet.pages()), c.fmt.dpi,
+                                                         c.distress, paper, ink, c.density(), stock))
                 if page not in cache:
                     cache[page] = export.final_page(c.sheet, page, c.fmt.dpi, c.distress, paper, ink,
                                                     c.density(), stock)

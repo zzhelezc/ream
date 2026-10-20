@@ -7,6 +7,8 @@ They use a throwaway home folder (REAM_HOME), never yours.
 """
 from __future__ import annotations
 
+import json
+import math
 import os
 import sys
 import tempfile
@@ -15,6 +17,7 @@ import traceback
 
 TMP = tempfile.mkdtemp(prefix="ream-test-")
 os.environ["REAM_HOME"] = os.path.join(TMP, "home")
+os.environ["REAM_CACHE"] = os.path.join(TMP, "cache")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np  # noqa: E402
@@ -2335,6 +2338,386 @@ def test_space_plays_and_stops_the_scanner():
     w.focus_text()
     QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Space)
     assert not scanner.running and w.doc.toPlainText().endswith(" ")
+    w.close()
+
+
+def make_stamp_textures():
+    """A stamps folder like a downloaded one, made here: a tape sheet (three
+    pieces on clear), a stain photographed on white, dust on black, a torn matte."""
+    import cv2
+    from ream import wear
+    root = wear.folder()
+    for sub in ("tape", "stains", "dust", "torn mattes"):
+        os.makedirs(root / sub, exist_ok=True)
+    sheet = np.zeros((300, 600, 4), np.uint8)
+    for n in range(3):
+        sheet[60:120, 40 + n * 190:200 + n * 190] = (120, 190, 220, 255)
+    cv2.imwrite(str(root / "tape" / "tape_sheet.png"), sheet)
+    stain = np.full((400, 400, 3), 245, np.uint8)
+    cv2.circle(stain, (200, 200), 120, (60, 90, 120), 18)
+    cv2.imwrite(str(root / "stains" / "stain.jpg"), stain)
+    dust = np.zeros((300, 300, 3), np.uint8)
+    for x, y in ((40, 50), (200, 90), (120, 240)):
+        cv2.circle(dust, (x, y), 6, (230, 230, 230), -1)
+    cv2.imwrite(str(root / "dust" / "dust.jpg"), dust)
+    matte = np.zeros((300, 400), np.uint8)
+    cv2.rectangle(matte, (30, 25), (370, 275), 255, -1)
+    cv2.imwrite(str(root / "torn mattes" / "torn_rect.jpg"), matte)
+    (root / "index.json").write_text(json.dumps({
+        "tape/tape_sheet.png": {"label": "Masking tape", "split": 6},
+        "stains/stain.jpg": {"label": "Ring stain", "tint": "brown"},
+        "torn mattes/torn_rect.jpg": {"label": "Torn rectangle"}}))
+    return root
+
+
+def test_wear_tears_edges_and_places_stamps():
+    import json as _json  # noqa: F401
+    from ream import wear
+    make_stamp_textures()
+    # the library: categories from the folders, mattes kept apart, sheets split
+    entries = wear.library()
+    assert {e["category"] for e in entries} == {"tape", "stains", "dust", "torn mattes"}
+    assert wear.categories(entries) == ["drawn", "dust", "stains", "tape"]
+    tape = [e for e in entries if e["label"] == "Masking tape"][0]
+    assert len(wear.stamp_variants(tape)) == 3
+    stain = wear.as_rgba([e for e in entries if e["label"] == "Ring stain"][0]["path"])
+    assert stain[200, 200, 3] < 30 and stain[200, 80, 3] > 200, "dark marks on white become the ink"
+    dust = wear.as_rgba([e for e in entries if e["category"] == "dust"][0]["path"])
+    assert dust[50, 40, 3] > 200 and dust[5, 5, 3] < 30, "light marks on black too"
+    for kind in wear.DRAWN:
+        art = wear.drawn(kind, seed=2, px=300)
+        assert art.shape[2] == 4 and art[..., 3].max() > 100
+    w = fresh()
+    w.show()
+    plugin = [p for p, _h in w.plugins if p.name == "wear"][0]
+    page = w.sheet.scene_page_rect()
+    qimage = QtGui.QImage(400, 300, QtGui.QImage.Format_ARGB32)
+    qimage.fill(QtGui.QColor("#3355aa"))
+    image = w.place_qimage(qimage, QtCore.QRectF(page.left() + 60, page.top() + 80, 200, 150), "photo")
+    w.select([image])
+    # ⌥⌘W: the panel
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_W, QtCore.Qt.ControlModifier | QtCore.Qt.AltModifier)
+    assert plugin.panel.isVisible()
+    # tear: the edges go, the middle stays, a paper rim along the cut
+    steps = len(w.history)
+    plugin.tear()
+    assert image.tear and image.tear["sides"] == "all" and len(w.history) == steps + 1
+    alpha = image.image.convertToFormat(QtGui.QImage.Format_ARGB32)
+    corner, middle = QtGui.QColor(alpha.pixelColor(1, 1)), QtGui.QColor(alpha.pixelColor(200, 150))
+    assert corner.alpha() < 40 and middle.alpha() == 255 and middle.blue() > 150
+    # somewhere along the top edge the paper's white core shows (the tear is random)
+    rim = [QtGui.QColor(alpha.pixelColor(x, y)) for x in range(20, 380, 6) for y in range(0, 40)]
+    assert any(c.alpha() > 200 and c.red() > 200 and c.green() > 200 for c in rim), "the paper core"
+    assert image.original.pixelColor(1, 1).alpha() == 255, "the original is untouched"
+    # the sliders follow live, one undo step a drag
+    plugin.panel.refresh()
+    plugin.s["depth"] = 20.0
+    plugin.retear()
+    plugin.s["depth"] = 25.0
+    plugin.retear()
+    plugin._released()
+    assert image.tear["depth"] == 25.0 and len(w.history) == steps + 2
+    w.undo()
+    assert image.tear["depth"] == wear.DEFAULT_TEAR["depth"]
+    # one side only, a torn matte, mend, undo
+    plugin.s["sides"] = "bottom"
+    plugin.tear(fresh=True)
+    edge = image.image.convertToFormat(QtGui.QImage.Format_ARGB32)
+    assert edge.pixelColor(200, 1).alpha() == 255 and edge.pixelColor(200, 298).alpha() < 40
+    plugin.set_edge("Torn rectangle")
+    plugin.tear()
+    assert image.tear["matte"].endswith("torn_rect.jpg")
+    plugin.mend()
+    assert image.tear is None and image.image.pixelColor(1, 1).alpha() == 255
+    w.undo()
+    assert image.tear and image.tear["matte"]
+    # saved and loaded with it
+    state, media = w.state()
+    entry = [t for t in state["things"] if t.get("name") == "photo"][0]
+    assert entry["tear"]["matte"].endswith("torn_rect.jpg")
+    # stamps: a drawn coffee ring, sized as a share of the page
+    plugin.choose_stamp("drawn:coffee ring")
+    assert w.active_tool is plugin.stamp_tool
+    plugin.s.update({"size": 30.0, "jitter": 0.0, "turn": "none", "tint": "as is", "strength": 100.0})
+    plugin._next = None
+    spot = QtCore.QPointF(page.left() + 300, page.top() + 500)
+    QtTest.QTest.mouseClick(w.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+                            view_point(w, spot))
+    stamps = [t for t in w.things.values() if t.alive and t.name.startswith("stamp")]
+    assert len(stamps) == 1 and stamps[0].pinned and stamps[0].name == "stamp · coffee ring"
+    assert abs(stamps[0].w - w.sheet.W * 0.30) < 1.0
+    assert stamps[0].sceneBoundingRect().contains(spot)
+    # the tape sheet: a piece a click, tinted, faded
+    plugin.set_category("tape")
+    assert len(plugin.grid.entries) == 1 and plugin.grid.entries[0]["label"] == "Masking tape"
+    plugin.choose_stamp(tape["key"])
+    plugin.s.update({"tint": "red", "strength": 50.0, "turn": "any"})
+    for n in range(4):
+        plugin.stamp_at(QtCore.QPointF(page.left() + 100 + n * 60, page.top() + 650))
+    taped = [t for t in w.things.values() if t.alive and t.name == "stamp · Masking tape"]
+    assert len(taped) == 4
+    pixel = taped[0].image.convertToFormat(QtGui.QImage.Format_ARGB32)
+    solid = [QtGui.QColor(pixel.pixelColor(x, pixel.height() // 2)) for x in range(pixel.width())]
+    strong = max(solid, key=lambda c: c.alpha())
+    assert 100 < strong.alpha() < 150 and strong.red() > strong.blue(), (strong.getRgb(),)
+    # undo takes a stamp back
+    w.undo()
+    assert len([t for t in w.things.values() if t.alive and t.name == "stamp · Masking tape"]) == 3
+    # the tools panel lists the tools; in design mode their letters pick them
+    labels = [e["label"] for e in w.tool_entries()]
+    assert "stamp" in labels and "tear" in labels
+    w.use_tool(None)
+    w.set_mode("design", quiet=True)
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_R)
+    assert w.active_tool is plugin.tear_tool
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_S)
+    assert w.active_tool is plugin.stamp_tool
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Escape)
+    # stamps and tears go out with the PDF
+    pdf = w.export_pdf(clean=True, path=os.path.join(TMP, "wear.pdf"))
+    import pypdfium2
+    rendered = pypdfium2.PdfDocument(pdf)[0].render(scale=0.5).to_numpy()
+    assert rendered.std() > 5
+    plugin.panel.close_panel()
+    w.close()
+
+
+def test_faster_distress_is_the_same():
+    from dataclasses import replace
+    from ream import distress
+    w = fresh()
+    type_paragraphs(w, 6)
+    w.distress.enabled = True
+    below, text, above = export.ink_layers(w.sheet, 0, 150, w.ink())
+    # the cropped kernel gives exactly what working on the whole layer gives
+    for change in ({}, {"misfire": 70, "bleed": 50, "blur": 90}, {"edge": 40, "inner": 90}):
+        s = replace(w.distress, **change)
+        whole = distress._apply(text.rgba, s, 150, (0, 0), 1.0)
+        cropped = distress.apply(text.rgba, s, 150)
+        assert (whole[..., 3] == cropped[..., 3]).all(), change
+        inked = whole[..., 3] > 0
+        assert (whole[..., :3][inked] == cropped[..., :3][inked]).all(), change
+    # pages distressed in parallel are the pages raster_page makes
+    pages = list(range(min(3, w.sheet.pages())))
+    got = dict(export.distressed_pages(w.sheet, pages, 150, w.distress, w.paper(), w.ink(),
+                                       w.density(), w.paper_stock(), workers=3))
+    for index in pages:
+        assert got[index] == export.raster_page(w.sheet, index, 150, w.distress, w.paper(), w.ink(),
+                                                w.density(), w.paper_stock()), index
+    # a distressed PDF still has every page, in order
+    import pypdfium2
+    pdf = w.export_pdf(path=os.path.join(TMP, "parallel.pdf"))
+    assert len(pypdfium2.PdfDocument(pdf)) == w.sheet.pages()
+    # a big image follows a tear slider from a small draft, then is finished
+    plugin = [p for p, _h in w.plugins if p.name == "wear"][0]
+    page = w.sheet.scene_page_rect()
+    big = QtGui.QImage(3000, 2200, QtGui.QImage.Format_ARGB32)
+    big.fill(QtGui.QColor("#336699"))
+    thing = w.place_qimage(big, QtCore.QRectF(page.left() + 40, page.top() + 60, 300, 220), "big")
+    w.select([thing])
+    plugin.tear()
+    before = thing.image
+    steps = len(w.history)
+    plugin.s["depth"] = 24.0
+    plugin.retear(draft=True)
+    plugin.s["depth"] = 28.0
+    plugin.retear(draft=True)
+    assert thing.drafted and thing.image is before and thing.preview.width() <= 1000
+    assert thing.tear["depth"] == 28.0 and len(w.history) == steps + 1
+    plugin._released()
+    assert not thing.drafted and thing.image is not before
+    assert thing.image.width() == 3000
+    # the finished tear is the one a direct tear makes
+    direct = thing.image
+    thing.set_pixels(tear=dict(thing.tear))
+    assert thing.image == direct
+    # or a moment after the slider stops, without letting go
+    plugin.s["depth"] = 12.0
+    plugin.retear(draft=True)
+    assert thing.drafted
+    pump(0.5)
+    assert not thing.drafted
+    w.close()
+
+
+def test_a_picture_across_a_spread():
+    import pypdfium2
+    w = fresh()
+    w.show()
+    w.distress.enabled = False
+    type_paragraphs(w, 30)
+    w.set_covers(cover=True, back=False)              # spreads: 1 | 2-3 | 4-5 ...
+    w.set_layout("spread")
+    w.go_to_page(1)                                   # page 2, the left of a spread
+    pump(0.1)
+    assert w.facing(1) == (2, w.sheet.W, -w.sheet.H) and w.facing(2) == (1, -w.sheet.W, w.sheet.H)
+    assert w.facing(0) is None, "the cover stands alone"
+    page = w.sheet.scene_page_rect()
+    red = QtGui.QImage(300, 200, QtGui.QImage.Format_ARGB32)
+    red.fill(QtGui.QColor("#dd2211"))
+    # across the gutter, its middle a little on the left page
+    thing = w.place_qimage(red, QtCore.QRectF(page.right() - 180, page.top() + 300, 300, 200), "wide")
+    assert thing.pinned and w.sheet.page_of(thing) == 1
+    # page 2 shows its left part, page 3 its right part (the overhang)
+    def strip(index, dpi=36):
+        image = export.final_page(w.sheet, index, dpi, w.distress, w.paper(), w.ink())
+        return image.convertToFormat(QtGui.QImage.Format_RGB32)
+    left, right = strip(1), strip(2)
+    k = 36 / 72.0
+    y = int((300 + 100) * k)
+    assert QtGui.QColor(left.pixel(left.width() - 3, y)).red() > 200 > QtGui.QColor(left.pixel(left.width() - 3, y)).green()
+    reach = int((300 - 180) * k)                       # how far it reaches onto page 3
+    assert QtGui.QColor(right.pixel(2, y)).red() > 200 > QtGui.QColor(right.pixel(2, y)).green()
+    assert QtGui.QColor(right.pixel(reach - 3, y)).green() < 100
+    assert QtGui.QColor(right.pixel(reach + 6, y)).green() > 200, "and no further"
+    # the page beside it on screen shows the overhang too (drawn from the document)
+    ghost = w.ghosts[2]
+    shot = w.view.grab().toImage()
+    over = w.view.mapFromScene(ghost.sceneBoundingRect().left() + 20, page.top() + 400)
+    assert QtGui.QColor(shot.pixel(over)).red() > 200 > QtGui.QColor(shot.pixel(over)).green()
+    # it can be picked up by its overhang, on the facing page
+    w.clear_selection()
+    QtTest.QTest.mouseClick(w.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, over)
+    assert w.selection() == [thing]
+    # ...and a thing on page 3 hanging back over page 2 shows and picks up there
+    w.clear_selection()
+    blue = QtGui.QImage(200, 100, QtGui.QImage.Format_ARGB32)
+    blue.fill(QtGui.QColor("#1133dd"))
+    w.make_live(2)
+    pump(0.05)
+    right_page = w.sheet.scene_page_rect()
+    other = w.place_qimage(blue, QtCore.QRectF(right_page.left() - 60, right_page.top() + 600, 200, 100),
+                           "blue")
+    assert w.sheet.page_of(other) == 2
+    w.make_live(1)
+    pump(0.05)
+    live = w.sheet.scene_page_rect()
+    spot = QtCore.QPointF(live.right() - 30, live.top() + 650)
+    shot = w.view.grab().toImage()
+    pixel = QtGui.QColor(shot.pixel(w.view.mapFromScene(spot)))
+    assert pixel.blue() > 200 > pixel.red(), pixel.getRgb()       # drawn on the live page
+    QtTest.QTest.mouseClick(w.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+                            view_point(w, spot))
+    assert w.selection() == [other] and w.sheet.page_of(other) == 1, "its home is the live page now"
+    seen = other.sceneBoundingRect()                  # ...but it is where it was seen
+    assert seen.contains(spot) and seen.right() > live.right() + 100
+    assert abs(seen.left() - (live.right() - 60)) < 1.0
+    # exported as spreads: one picture, unbroken across the gutter
+    w.set_export_option("spreads", True)
+    pdf = w.export_pdf(clean=True, path=os.path.join(TMP, "across.pdf"), pages=[1, 2], spreads=True)
+    sheet_image = pypdfium2.PdfDocument(pdf)[0].render(scale=0.5).to_numpy()
+    row = sheet_image[int(400 * 0.5)]
+    middle = sheet_image.shape[1] // 2
+    reds = [(c[2] > 200 and c[1] < 100) for c in row[middle - 40: middle + 40]]      # (BGR)
+    assert all(reds), "across the spine without a break"
+    w.close()
+
+
+def test_instagram_slides_and_seamless_carousel():
+    from ream.plugins import instagram as ig
+    w = fresh()
+    w.show()
+    w.distress.enabled = False
+    type_paragraphs(w, 30)
+    w.set_covers(cover=True, back=False)
+    n = w.sheet.pages()
+    plugin = [p for p, _h in w.plugins if p.name == "instagram"][0]
+    # ⌥⌘G: the slides and the panel
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_G, QtCore.Qt.ControlModifier | QtCore.Qt.AltModifier)
+    assert plugin.view.isVisible() and plugin.panel.isVisible()
+    assert ig.slide_size("4:5", 1080) == (1080, 1350) and ig.slide_size("1.91:1", 1080) == (1080, 566)
+    # how many slides each way
+    plugin.s.update({"mode": "pages"})
+    assert plugin.plan().slides == n
+    plugin.s.update({"mode": "spreads", "per_spread": 2})
+    spreads = w.spreads(n)
+    expected = sum(max(1, round(2 * len([p for p in pair if p is not None]) / 2)) for pair in spreads)
+    assert plugin.plan().slides == expected
+    plugin.s.update({"mode": "one long strip", "fit": "fit", "margin": 0.0, "zoom": 100.0, "gap": 0.0})
+    p = plugin.plan()
+    page_px = w.sheet.W * (1350 / w.sheet.H)
+    assert p.slides == math.ceil(n * page_px / 1080 - 1e-6)
+    # the pages run on without a gap in the strip, centred in the slides
+    xs = sorted(pl.rect.left() for pl in p.placed)
+    assert all(abs((b - a) - page_px) < 0.01 for a, b in zip(xs, xs[1:]))
+    # the slides are the full picture cut edge to edge: nothing lost, nothing doubled
+    full = plugin.picture()
+    assert full.width() == p.slides * 1080 and full.height() == 1350
+    cut = plugin.slides(full)
+    assert len(cut) == p.slides and all(c.width() == 1080 and c.height() == 1350 for c in cut)
+    for k in range(len(cut) - 1):
+        a = cut[k].pixel(1079, 700)
+        b = cut[k + 1].pixel(0, 700)
+        assert a == full.pixel(k * 1080 + 1079, 700) and b == full.pixel((k + 1) * 1080, 700)
+    # fit leaves the background round the pages; fill covers the slides
+    plugin.s.update({"mode": "pages", "fit": "fit", "margin": 10.0, "background": "black"})
+    one = plugin.slides()[1]
+    assert QtGui.QColor(one.pixel(5, 5)) == QtGui.QColor("#000000")
+    plugin.s.update({"fit": "fill"})
+    one = plugin.slides()[1]
+    assert QtGui.QColor(one.pixel(5, 5)) != QtGui.QColor("#000000"), "filled to the edge"
+    # zoom and nudge move the pages
+    plugin.s.update({"fit": "fit", "margin": 0.0, "zoom": 80.0, "nudge_x": 10.0})
+    pl = plugin.plan().placed[0].rect
+    assert abs(pl.height() - 1350 * 0.8) < 0.5 and pl.center().x() > 540 + 100
+    plugin.s.update({"zoom": 100.0, "nudge_x": 0.0, "margin": 4.0})
+    # a page range
+    plugin.set_pages("2-3")
+    plugin.s.update({"mode": "spreads"})
+    assert sorted(pl.page for pl in plugin.plan().placed) == [1, 2] and plugin.plan().slides == 2
+    plugin.set_pages("all")
+    # export: numbered slides and the full picture
+    plugin.s.update({"mode": "spreads", "format": "jpg", "full": True})
+    folder = plugin.export(TMP)
+    names = sorted(os.listdir(folder))
+    count = plugin.plan().slides
+    assert names == [f"{k:02d}.jpg" for k in range(1, count + 1)] + ["full.jpg"], names
+    assert QtGui.QImage(os.path.join(folder, "01.jpg")).size() == QtCore.QSize(1080, 1350)
+    assert QtGui.QImage(os.path.join(folder, "full.jpg")).size() == QtCore.QSize(count * 1080, 1350)
+    # more than Instagram takes in one post: said in the preview
+    plugin.s.update({"mode": "pages", "shape": "1.91:1"})
+    w.view.grab()
+    plugin.view.grab()
+    plugin.s.update({"shape": "4:5"})
+    QtTest.QTest.keyClick(plugin.view, QtCore.Qt.Key_Escape)
+    assert not plugin.view.isVisible()
+    w.close()
+
+
+def test_a_bleeding_spread_picture_keeps_no_extra_page():
+    w = fresh()
+    w.show()
+    w.distress.enabled = False
+    w.set_mode("design", quiet=True)
+    w.set_covers(cover=False, back=False)
+    w.add_page()                                      # a spread: pages 1-2
+    w.set_layout("spread")
+    w.go_to_page(0)
+    pump(0.05)
+    page = w.sheet.scene_page_rect()
+    red = QtGui.QImage(600, 300, QtGui.QImage.Format_ARGB32)
+    red.fill(QtGui.QColor("#dd2211"))
+    # over the whole spread, bleeding off every edge
+    pic = w.place_qimage(red, QtCore.QRectF(page.left() - 9, page.top() - 9, 2 * w.sheet.W + 18,
+                                            w.sheet.H + 18), "spread")
+    assert w.sheet.pages() == 2, "the bleed doesn't make a third page"
+    # a real third page, then deleted: gone, and the picture stays
+    w.add_page(1)
+    assert w.sheet.pages() == 3
+    w.delete_page(2)
+    assert w.sheet.pages() == 2 and pic.alive
+    # what hangs off a page's foot shows on no other page
+    w.add_page(1)
+    third = export.final_page(w.sheet, 2, 36, w.distress, w.paper(), w.ink())
+    top = QtGui.QColor(third.pixel(third.width() // 2, 1))
+    assert top.green() > 200, "no red at the head of page 3"
+    w.delete_page(2)
+    assert w.sheet.pages() == 2
+    # both pages of the spread show their half
+    for index in (0, 1):
+        image = export.final_page(w.sheet, index, 36, w.distress, w.paper(), w.ink())
+        middle = QtGui.QColor(image.pixel(image.width() // 2, image.height() // 2))
+        assert middle.red() > 200 > middle.green(), index
     w.close()
 
 
