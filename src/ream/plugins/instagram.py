@@ -392,6 +392,11 @@ class Plugin(Base):
 
     def open(self):
         window = self.host.window
+        if window.instagram():
+            # in instagram mode the carousel board is what is posted, not the book
+            window.open_carousel_panel()
+            window.toast("instagram mode: the carousel is what is posted · swipe through or export… in its panel")
+            return
         if window.editing is not None:
             window.finish_editing()
         self.view.open()
@@ -737,6 +742,8 @@ class Plugin(Base):
 
     # -- exporting --------------------------------------------------------------------
     def export(self, parent: str | None = None) -> str | None:
+        if self.host.window.instagram():
+            return self.host.window.export_carousel(parent)    # the board, not the book
         if parent is None:
             start = self.s.get("folder") or os.path.expanduser("~/Desktop")
             parent = QtWidgets.QFileDialog.getExistingDirectory(self.host.window,

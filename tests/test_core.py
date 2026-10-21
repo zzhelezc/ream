@@ -3026,6 +3026,154 @@ def test_instagram_drops_slides():
     w.close()
 
 
+def test_instagram_mode_carousel():
+    import pypdfium2  # noqa: F401
+    w = fresh()
+    w.show()
+    w.distress.enabled = False
+    type_paragraphs(w, 3)
+    book_things = len(w.sheet.pinned())
+    # ⌥⌘C: instagram mode - the book is put away, the carousel board is out
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_C, QtCore.Qt.ControlModifier | QtCore.Qt.AltModifier)
+    assert w.mode == "instagram" and w.design() and w.instagram()
+    assert not w.sheet.isVisible() and w.carousel.isVisible()
+    board = w.carousel
+    assert board.slides == 3 and board.s["shape"] == "4:5"
+    assert abs(board.slide_h / board.slide_w - 1350 / 1080) < 1e-6
+    # a picture across the cut between slides 1 and 2: on the board, not the book
+    first, second = board.slide_rect(0), board.slide_rect(1)
+    red = QtGui.QImage(300, 200, QtGui.QImage.Format_ARGB32)
+    red.fill(QtGui.QColor("#dd2211"))
+    pic = w.place_qimage(red, QtCore.QRectF(first.right() - 120, first.top() + 200, 240, 160), "across")
+    assert pic.parentItem() is board and len(w.sheet.pinned()) == book_things
+    # a text box drawn with T goes on the board too
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_T)
+    a = QtCore.QPointF(second.left() + 60, second.top() + 400)
+    drag(w, view_point(w, a), view_point(w, a + QtCore.QPointF(200, 30)))
+    note = w.editing
+    assert note is not None and note.parentItem() is board
+    QtTest.QTest.keyClicks(w.view, "on the carousel")
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_Escape)
+    # a slide added after the first: what is right of it moves along; undo puts it back
+    board.current = 0
+    note_x = note.pos().x()
+    w.add_slide()
+    assert board.slides == 4 and abs(note.pos().x() - (note_x + board.slide_w)) < 0.01
+    w.undo()
+    assert board.slides == 3 and abs(note.pos().x() - note_x) < 0.01
+    # removing a slide: what is right of it moves back
+    w.remove_slide(0)
+    assert board.slides == 2 and abs(note.pos().x() - (note_x - board.slide_w)) < 0.01
+    w.undo()
+    assert board.slides == 3
+    # the shape changes the slides' height
+    w.set_carousel(shape="1:1")
+    assert abs(board.slide_h - board.slide_w) < 1e-6
+    w.undo()
+    assert board.s["shape"] == "4:5"
+    # rendered seamless: the slides are the board cut in equal widths
+    from ream import carousel as carousels
+    k = 1080 / board.slide_w
+    picture = carousels.render(board, k, w.distress, w.ink())
+    assert picture.width() == 3 * 1080 and picture.height() == 1350
+    cut = carousels.slides(picture, board.slides)
+    assert [c.width() for c in cut] == [1080] * 3
+    y = int((200 + 80) * k)
+    assert cut[0].pixel(1079, y) == picture.pixel(1079, y) and cut[1].pixel(0, y) == picture.pixel(1080, y)
+    assert QtGui.QColor(cut[0].pixel(1079, y)).red() > 200 and QtGui.QColor(cut[1].pixel(0, y)).red() > 200
+    # distressed too
+    from dataclasses import replace
+    rough = carousels.render(board, 0.5, replace(w.distress, enabled=True), w.ink())
+    assert rough.width() == int(round(3 * board.slide_w * 0.5))
+    # export: the slides and the fitted whole picture
+    board.s.update({"full": "last slide + file", "format": "png"})
+    folder = w.export_carousel(TMP)
+    names = sorted(os.listdir(folder))
+    assert names == ["01.png", "02.png", "03.png", "04.png", "full.png"], names
+    assert QtGui.QImage(os.path.join(folder, "04.png")).size() == QtCore.QSize(1080, 1350)
+    assert QtGui.QImage(os.path.join(folder, "full.png")).size() == QtCore.QSize(3240, 1350)
+    # swiping through, as on Instagram
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_P, QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier)
+    preview = w.carousel_preview
+    assert preview is not None and preview.isVisible()
+    preview.grab()
+    QtTest.QTest.keyClick(preview, QtCore.Qt.Key_Right)
+    pump(0.4)
+    assert abs(preview.at - 1.0) < 1e-6
+    preview.at = 1.4                                   # half a swipe: two slides showing, seamless
+    preview.grab()
+    preview.snap()
+    pump(0.4)
+    assert abs(preview.at - 1.0) < 1e-6
+    QtTest.QTest.keyClick(preview, QtCore.Qt.Key_Escape)
+    assert not preview.isVisible() and board.current == 1
+    # right-click on the board: its panel
+    right_click(w, board.slide_rect(2).center() + QtCore.QPointF(0, 150))
+    assert w.carousel_panel is not None and w.carousel_panel.isVisible() and board.current == 2
+    # saved and loaded with it
+    state, media = w.state()
+    assert state["carousel"]["slides"] == 3
+    on = [t for t in state["things"] if t.get("board") == "carousel"]
+    assert sorted(t.get("kind", "image") for t in on) == ["image", "text"]
+    assert [t for t in on if t.get("kind") == "text"][0]["text"] == "on the carousel"
+    w.load_state(state, media)
+    on_board = w.carousel.things()
+    assert len(on_board) == 2 and w.carousel.isVisible()
+    # back to the book
+    w.set_mode("design", quiet=True)
+    assert w.sheet.isVisible() and not w.carousel.isVisible()
+    w.close()
+
+
+def test_instagram_mode_exports_the_board_whatever_the_route():
+    w = fresh()
+    w.show()
+    w.distress.enabled = False
+    w.set_mode("instagram", quiet=True)
+    red = QtGui.QImage(600, 400, QtGui.QImage.Format_ARGB32)
+    red.fill(QtGui.QColor("#dd2211"))
+    png = os.path.join(TMP, "board-red.png")
+    red.save(png)
+    mime = QtCore.QMimeData()
+    mime.setUrls([QtCore.QUrl.fromLocalFile(png)])
+    w.drop(mime, w.carousel.slide_rect(0).center())
+    assert [t for t in w.things.values() if t.alive][-1].parentItem() is w.carousel
+    w.carousel.s.update({"full": "no", "format": "png"})
+
+    def reds(folder):
+        image = QtGui.QImage(os.path.join(folder, "01.png"))
+        return sum(1 for x in range(0, image.width(), 20) for y in range(0, image.height(), 20)
+                   if QtGui.QColor(image.pixel(x, y)).red() > 200 and QtGui.QColor(image.pixel(x, y)).green() < 90)
+
+    # the instagram plugin's export (⌥⌘G's) posts the board, not the book
+    plugin = [p for p, _h in w.plugins if p.name == "instagram"][0]
+    folder = plugin.export(TMP)
+    assert sorted(os.listdir(folder)) == ["01.png", "02.png", "03.png"] and reds(folder) > 100
+    # ⌥⌘G opens the carousel's panel, not the book's slides
+    QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_G, QtCore.Qt.ControlModifier | QtCore.Qt.AltModifier)
+    assert not plugin.view.isVisible() and w.carousel_panel.isVisible()
+    # ⌘E: (with the panel open) exports the carousel
+    target = os.path.join(TMP, "cmd-e")
+    os.makedirs(target, exist_ok=True)
+    real = QtWidgets.QFileDialog.getExistingDirectory
+    QtWidgets.QFileDialog.getExistingDirectory = lambda *a, **k: target
+    try:
+        QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_E, QtCore.Qt.ControlModifier)
+        made = [os.path.join(target, d) for d in os.listdir(target)]
+        assert len(made) == 1 and reds(made[0]) > 100, "⌘E posts the board"
+        # ⇧⌘E: clean, now
+        QtTest.QTest.keyClick(w.view, QtCore.Qt.Key_E, QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier)
+        assert len(os.listdir(target)) == 2
+    finally:
+        QtWidgets.QFileDialog.getExistingDirectory = real
+    # back in design mode, the plugin is the book's again
+    w.set_mode("design", quiet=True)
+    plugin.open()
+    assert plugin.view.isVisible()
+    plugin.close()
+    w.close()
+
+
 def imposition_styles():
     from ream import imposition
     return list(imposition.STYLES)

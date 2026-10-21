@@ -36,7 +36,7 @@ from pathlib import Path
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from . import __version__, distress, export, papers, plugin, profiles, project, spelling, style
+from . import __version__, carousel as carousels, distress, export, papers, plugin, profiles, project, spelling, style
 from .canvas import CanvasView
 from .page import (ALIGN, LOOK, WORDS, GhostPage, Note, NoteText, Sheet, Thing, apply_runs,
                    char_props, doc_runs, draw_stock, restyle_range)
@@ -93,7 +93,7 @@ class Format:
         return cls(**{k: v for k, v in (data or {}).items() if k in known})
 
 
-MODES = ("writer", "design")
+MODES = ("writer", "design", "instagram")
 
 FORMAT_PARAMS = {"size": (5, 72), "line": (80, 300), "para": (0, 72), "margin": (0, 200),
                  "head": (0, 200), "dpi": (72, 1200), "ink": (5, 150),
@@ -127,6 +127,12 @@ class Ream(QtWidgets.QMainWindow):
         self.setCentralWidget(self.view)
         self.sheet = Sheet(self)
         self.scene.addItem(self.sheet)
+        # instagram mode's board: Instagram-shaped slides edge to edge
+        self.carousel = carousels.Carousel(self)
+        self.scene.addItem(self.carousel)
+        self.carousel.setVisible(False)
+        self.carousel_panel = None
+        self.carousel_preview = None
         self.doc = self.sheet.doc
 
         self.fmt = Format()
@@ -549,6 +555,10 @@ class Ream(QtWidgets.QMainWindow):
         return max(self.sheet.pages(), self.page + 1)
 
     def paint_overlay(self, painter: QtGui.QPainter):
+        if self.instagram():
+            self._paint_carousel(painter)
+            self._paint_marks(painter)
+            return
         th = self.th()
         rect = self.page_rect_view()
         transform = self.view.viewportTransform()
@@ -612,7 +622,11 @@ class Ream(QtWidgets.QMainWindow):
             tag = f"distress · {self.distress.style}"
             width = QtGui.QFontMetrics(painter.font()).horizontalAdvance(tag)
             painter.drawText(QtCore.QPointF(rect.right() - width, rect.bottom() + 20), tag)
+        self._paint_marks(painter)
 
+    def _paint_marks(self, painter: QtGui.QPainter):
+        """Selection handles, tools, plugin frames - over the book or the board."""
+        transform = self.view.viewportTransform()
         mark = style.qc(style.INK if self.canvas_is_light() else "#ffffff")
         line = QtGui.QPen(mark, 1.0, QtCore.Qt.CustomDashLine)
         line.setDashPattern([3.0, 3.0])
@@ -628,8 +642,9 @@ class Ream(QtWidgets.QMainWindow):
             painter.setBrush(style.qc("#ffffff"))
             painter.drawEllipse(knob, 4.0, 4.0)
             painter.drawRect(self._handle_rect(corners[2]))
-        self._paint_live_caret(painter)
-        self._paint_spelling(painter)
+        if not self.instagram():
+            self._paint_live_caret(painter)
+            self._paint_spelling(painter)
         if self.active_tool is not None:
             painter.save()
             self.active_tool.paint(painter, transform)
@@ -784,12 +799,16 @@ class Ream(QtWidgets.QMainWindow):
                 item = item.note
             if not isinstance(item, Thing) or not item.alive:
                 continue
+            if item.parentItem() is self.carousel:
+                return item                 # (the board clips its things: hits are on it)
             if item.pinned:
                 if not page.contains(scene_pos):
                     continue
                 if item.zValue() < 0 and not behind:
                     continue                # behind the words: Alt+click reaches it
             return item
+        if self.instagram():
+            return None
         hit = self.spread_hit(scene_pos, behind)  # a picture across the gutter, by its overhang
         return hit[0] if hit is not None else None
 
@@ -858,6 +877,13 @@ class Ream(QtWidgets.QMainWindow):
         if thing.pinned:
             return
         at = thing.scenePos()
+        if self.instagram():                        # onto the carousel board
+            thing.setParentItem(self.carousel)
+            thing.setPos(self.carousel.mapFromScene(at))
+            thing.home = None
+            front = [t.zValue() for t in self.carousel.things() if t is not thing]
+            thing.setZValue(max(front, default=0.0) + 1.0)
+            return
         thing.setParentItem(self.sheet.strip)
         thing.setPos(self.sheet.strip.mapFromScene(at))
         thing.home = self.page                      # it belongs to the live page, bleed and all
@@ -944,7 +970,12 @@ class Ream(QtWidgets.QMainWindow):
             behind = True                   # no words here: what lies under them is reachable
         thing = self.thing_at(at, behind=behind)
         if thing is not None:
-            self.adopt_facing(thing)        # picked up by its overhang: home is the live page now
+            if self.instagram():
+                slide = self.carousel.slide_at(at)
+                if slide is not None:
+                    self.carousel.current = slide
+            else:
+                self.adopt_facing(thing)    # picked up by its overhang: home is the live page now
             self.story_selected = False
             if mods & QtCore.Qt.ShiftModifier:
                 thing.setSelected(not thing.isSelected())
@@ -959,6 +990,10 @@ class Ream(QtWidgets.QMainWindow):
         self.clear_selection()
         if self.design():
             self.live_on(at)
+            if self.instagram():
+                slide = self.carousel.slide_at(at)
+                if slide is not None:
+                    self.carousel.current = slide
             self.story_selected = self.story_hit(at)
             if not self.story_selected:
                 # an empty spot: drag a marquee round what to select
@@ -1419,6 +1454,7 @@ class Ream(QtWidgets.QMainWindow):
                 self.scene.addItem(ghost)
             ghost.prepareGeometryChange()
             ghost.setPos(self.slot(index))
+            ghost.setVisible(not self.instagram())
             ghost.update()
         self.view.viewport().update()
 
@@ -1435,6 +1471,9 @@ class Ream(QtWidgets.QMainWindow):
     def set_layout(self, layout: str):
         """⌘1 one page, ⌘2 a spread, ⌘3 all pages; asking for the layout
         you are in goes back to one page."""
+        if self.instagram():
+            self.toast("instagram mode: the book is put away · ⌥⌘D for it")
+            return
         if layout == self.layout and layout != "single":
             layout = "single"
         self.layout = layout
@@ -1534,7 +1573,7 @@ class Ream(QtWidgets.QMainWindow):
         """A thing picked up by its overhang on the live page moves its
         home to the live page - where it is seen does not change."""
         face = self.facing(self.page)
-        if face is not None and thing.pinned and self.sheet.page_of(thing) == face[0]:
+        if face is not None and thing.parentItem() is self.sheet.strip and self.sheet.page_of(thing) == face[0]:
             thing.setPos(thing.pos() + QtCore.QPointF(face[1], face[2]))
             thing.home = self.page
             thing.setVisible(True)                  # one of the live page's own now
@@ -1569,9 +1608,13 @@ class Ream(QtWidgets.QMainWindow):
         """The shown page something over `rect` goes to: the one under its
         middle, else the one it covers most - if that is at least a quarter
         of it (a picture bleeding off a page's edge belongs to that page).
-        (index, scene rect) or None."""
-        shown = [(self.page, self.sheet.scene_page_rect())] + \
-            [(i, g.sceneBoundingRect()) for i, g in sorted(self.ghosts.items())]
+        In instagram mode, the carousel board the same way.
+        (index, scene rect) or None - index "carousel" for the board."""
+        if self.instagram():
+            shown = [("carousel", self.carousel.sceneBoundingRect())]
+        else:
+            shown = [(self.page, self.sheet.scene_page_rect())] + \
+                [(i, g.sceneBoundingRect()) for i, g in sorted(self.ghosts.items())]
         middle = rect.center()
         for index, box in shown:
             if box.contains(middle):
@@ -1592,12 +1635,15 @@ class Ream(QtWidgets.QMainWindow):
         choice = self.page_choice(rect)
         if choice is None:
             return False
-        if choice[0] != self.page:
+        if isinstance(choice[0], int) and choice[0] != self.page:
             self.make_live(choice[0])
         return True
 
     def live_on(self, at: QtCore.QPointF) -> bool:
-        """If `at` is over a shown page, make that page live; True if so."""
+        """If `at` is over a shown page, make that page live; True if so.
+        In instagram mode: is `at` on the carousel board?"""
+        if self.instagram():
+            return self.carousel.sceneBoundingRect().contains(at)
         ghost = self.ghost_at(at)
         if ghost is not None:
             self.make_live(ghost.index)
@@ -1666,6 +1712,8 @@ class Ream(QtWidgets.QMainWindow):
         """Cmd+Left / Cmd+Right: the previous or next page, with the caret
         moved to its first line so writing carries on there.  Past the last
         page waits a blank one; click it to start writing on it."""
+        if self.instagram():
+            return
         if self.layout == "spread":
             spreads = self.spreads(max(self.sheet.pages(), self.page + 1))
             k = self.spread_index(self.page, spreads) + (1 if delta > 0 else -1)
@@ -1776,7 +1824,11 @@ class Ream(QtWidgets.QMainWindow):
         return self.previewing is not None and self.previewing.isVisible()
 
     def toggle_preview_mode(self):
-        if self.in_preview():
+        if self.carousel_preview is not None and self.carousel_preview.isVisible():
+            self.leave_carousel_preview()
+        elif self.instagram():
+            self.enter_carousel_preview()
+        elif self.in_preview():
             self.leave_preview()
         else:
             self.enter_preview()
@@ -2122,6 +2174,13 @@ class Ream(QtWidgets.QMainWindow):
                     open_panel()
                     return True
             return False                         # the palette, with it selected
+        if self.instagram():
+            slide = self.carousel.slide_at(at)
+            if slide is None:
+                return False
+            self.carousel.current = slide
+            self.open_carousel_panel()
+            return True
         page = self.sheet.scene_page_rect()
         ghost = next((g for g in self.ghosts.values() if g.sceneBoundingRect().contains(at)), None)
         if not page.contains(at) and ghost is None:
@@ -2292,17 +2351,24 @@ class Ream(QtWidgets.QMainWindow):
 
     # -- history -------------------------------------------------------------
     def snapshot(self) -> dict:
-        return {uid: (t.alive, t.pinned, t.pos().x(), t.pos().y(), t.w, t.h, t.zValue(),
+        snap = {uid: (t.alive, "carousel" if t.parentItem() is self.carousel else t.pinned,
+                      t.pos().x(), t.pos().y(), t.w, t.h, t.zValue(),
                       t.rotation(), dict(t.look) if isinstance(t, Note) else
                       (None, t.mask, t.matte, t.border, t.flip, t.tear), t.home)
                 for uid, t in self.things.items()}
+        snap["carousel"] = self.carousel.state()
+        return snap
 
     def things_key(self) -> tuple:
         """Where and what every thing is, for caches (snapshot() holds arrays)."""
-        return tuple(sorted(t.key() for t in self.things.values()))
+        return tuple(sorted(t.key() for t in self.things.values())) + \
+            (tuple(sorted(self.carousel.state().items())),
+             tuple((t.uid, t.parentItem() is self.carousel) for t in self.carousel.things()))
 
     def restore(self, snap: dict):
         for uid, thing in self.things.items():
+            if uid not in snap and not isinstance(uid, int):
+                continue
             alive, pinned, x, y, w, h, z, turn, pixels, home = snap.get(
                 uid, (False, False, 0, 0, thing.w, thing.h, 0, 0, None, None))
             thing.home = home if pinned else None
@@ -2313,7 +2379,12 @@ class Ream(QtWidgets.QMainWindow):
                 thing.alive = False
                 continue
             thing.alive = True
-            if pinned:
+            if pinned == "carousel":
+                if thing.parentItem() is not self.carousel:
+                    if thing.scene() is None:
+                        self.scene.addItem(thing)
+                    thing.setParentItem(self.carousel)
+            elif pinned:
                 if thing.parentItem() is not self.sheet.strip:
                     thing.setParentItem(self.sheet.strip)
             else:
@@ -2337,6 +2408,9 @@ class Ream(QtWidgets.QMainWindow):
             elif isinstance(pixels, dict) and isinstance(thing, Note) and pixels != thing.look:
                 thing.look = dict(pixels)
                 self.style_note(thing)
+        if "carousel" in snap and snap["carousel"] != self.carousel.state():
+            self.carousel.set_state(snap["carousel"])
+            self._refresh_carousel_panel()
         if self.editing is not None and not self.editing.alive:
             self.editing = None
             self.focus_text()
@@ -2487,7 +2561,7 @@ class Ream(QtWidgets.QMainWindow):
         before = self.snapshot()
         on_page = self.live_on(at)
         page = self.sheet.scene_page_rect()
-        text_width = self.sheet.W - 2 * self.fmt.margin
+        text_width = self.carousel.slide_w * 0.8 if self.instagram() else self.sheet.W - 2 * self.fmt.margin
         x, y, row_h = at.x(), at.y(), 0.0
         z = self.top_z()
         for n, thing in enumerate(things):
@@ -2890,7 +2964,8 @@ class Ream(QtWidgets.QMainWindow):
             def choose():
                 if self.active_tool is not None:
                     self.use_tool(None)
-                self.set_mode("design", quiet=True)
+                if not self.design():
+                    self.set_mode("design", quiet=True)
                 self.set_text_tool(text_tool, quiet=True)
             return choose
         entries = [
@@ -2986,7 +3061,22 @@ class Ream(QtWidgets.QMainWindow):
 
     # -- writer and design modes ---------------------------------------------------
     def design(self) -> bool:
-        return self.mode == "design"
+        """Design and instagram mode: objects are selected and placed, nothing types until chosen."""
+        return self.mode in ("design", "instagram")
+
+    def instagram(self) -> bool:
+        return self.mode == "instagram"
+
+    def show_book(self):
+        """The book (page, the pages beside it) shows except in instagram
+        mode, where the carousel board does."""
+        board = self.instagram()
+        self.sheet.setVisible(not board)
+        for ghost in self.ghosts.values():
+            ghost.setVisible(not board)
+        self.carousel.setVisible(board)
+        if board:
+            self.hide_preview()
 
     def set_mode(self, mode: str, quiet: bool = False):
         """Writer: the page's words are always live, a click puts the caret
@@ -2999,10 +3089,24 @@ class Ream(QtWidgets.QMainWindow):
             self.finish_editing()
         self.story_editing = self.story_selected = False
         self.text_tool = False
+        was_board = self.carousel.isVisible()
         self.mode = mode
         self.prefs["mode"] = mode
         self._write_prefs()
-        if mode == "design":
+        self.show_book()
+        if mode == "instagram":
+            if self.write_mode:
+                self.leave_write_mode()
+            self.clear_selection()
+            self.sheet.text.clearFocus()
+            self.view.setFocus(QtCore.Qt.OtherFocusReason)
+            if not was_board:
+                self.fit_layout()
+            if not quiet:
+                self.toast("instagram · slides side by side, seamless · ⌥⌘C carousel panel · ⇧⌘P swipe through")
+        elif mode == "design":
+            if was_board:
+                self.fit_layout()
             if self.write_mode:
                 self.leave_write_mode()
             cursor = self.sheet.text.textCursor()
@@ -3013,6 +3117,8 @@ class Ream(QtWidgets.QMainWindow):
             if not quiet:
                 self.toast("design · click selects · double-click writes · T text box · ⌥⌘D writer")
         else:
+            if was_board:
+                self.fit_layout()
             self.focus_text()
             if not quiet:
                 self.toast("writer · ⌥⌘D design")
@@ -3024,6 +3130,185 @@ class Ream(QtWidgets.QMainWindow):
     def toggle_mode(self):
         self.set_mode("writer" if self.design() else "design")
 
+    # -- instagram mode: the carousel board ------------------------------------------------
+    def _paint_carousel(self, painter: QtGui.QPainter):
+        """The board's edge, the slide edges (dotted guides), the slide numbers
+        under them, text box outlines, the marquee - in screen pixels."""
+        th = self.th()
+        transform = self.view.viewportTransform()
+        board = self.carousel
+        light = self.canvas_is_light()
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        edge = QtGui.QPen(style.qc(style.INK if light else "#ffffff"), 1.0)
+        painter.setPen(edge)
+        painter.setBrush(QtCore.Qt.NoBrush)
+        whole = transform.mapRect(board.sceneBoundingRect())
+        painter.drawRect(whole.adjusted(-1, -1, 0, 0))
+        guide = QtGui.QPen(style.qc("#9a9893" if light else "#77766f"), 1.0, QtCore.Qt.CustomDashLine)
+        guide.setDashPattern([3.0, 4.0])
+        painter.setPen(guide)
+        for n in range(1, board.slides):
+            x = transform.map(board.slide_rect(n).topLeft()).x()
+            painter.drawLine(QtCore.QPointF(x, whole.top()), QtCore.QPointF(x, whole.bottom()))
+        over = self.drag.get("over") if self.drag and self.drag.get("mode") == "move" else None
+        if over:
+            painter.setPen(QtGui.QPen(style.qc(style.INK if light else "#ffffff"), 2.0))
+            painter.drawRect(transform.mapRect(over).adjusted(-3, -3, 2, 2))
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.setFont(style.ui_font(11))
+        painter.setPen(style.qc(th["meta"]))
+        for n in range(board.slides):
+            box = transform.mapRect(board.slide_rect(n))
+            label = f"{n + 1:02d}" + (" ·" if n == board.current else "")
+            painter.drawText(QtCore.QPointF(box.left(), box.bottom() + 18), label)
+        quiet = QtGui.QPen(style.qc("#b9b8b2" if light else "#6b6a66"), 1.0, QtCore.Qt.CustomDashLine)
+        quiet.setDashPattern([2.0, 3.0])
+        painter.setPen(quiet)
+        for thing in board.things():
+            if isinstance(thing, Note) and not thing.isSelected() and thing is not self.editing:
+                painter.drawPolygon(transform.map(thing.mapToScene(thing.boundingRect())))
+        if self.drag and self.drag.get("mode") in ("marquee", "textbox") and self.drag.get("rect"):
+            pen = QtGui.QPen(style.qc(style.INK if light else "#ffffff"), 1.0)
+            if self.drag["mode"] == "marquee":
+                pen.setStyle(QtCore.Qt.CustomDashLine)
+                pen.setDashPattern([3.0, 3.0])
+            painter.setPen(pen)
+            painter.drawRect(transform.mapRect(self.drag["rect"]))
+        s = board.s
+        tag = f"instagram · {s['shape']} · {board.slides} slide{'s' if board.slides != 1 else ''}" + \
+            (" · text box" if self.text_tool else " · writing" if self.editing is not None else "")
+        area = QtCore.QRectF(self.view.viewport().rect()).adjusted(18, 0, -18, -16)
+        painter.setPen(style.qc(th["meta"]))
+        painter.drawText(area, QtCore.Qt.AlignRight | QtCore.Qt.AlignBottom, tag)
+
+    def export_clean(self):
+        """⇧⌘E: everything clean, now - the book's PDF, or in instagram mode the carousel."""
+        if self.instagram():
+            finish = self.carousel.s["finish"]
+            self.carousel.s["finish"] = "clean"
+            try:
+                return self.export_carousel()
+            finally:
+                self.carousel.s["finish"] = finish
+        return self.export_pdf(True)
+
+    def toggle_carousel_panel_or_mode(self):
+        """⌥⌘C: into instagram mode; once there, the carousel panel."""
+        if not self.instagram():
+            self.set_mode("instagram")
+        else:
+            self.toggle_carousel_panel()
+
+    def toggle_instagram(self):
+        """⌥⌘C: instagram mode (the carousel), or back to design."""
+        self.set_mode("design" if self.instagram() else "instagram")
+
+    def add_slide(self):
+        """A new slide after the current one (the one last clicked); what is
+        to the right of it moves along.  One undo step."""
+        before = self.snapshot()
+        self.carousel.insert_after(self.carousel.current)
+        self.push("things", before)
+        self.changed()
+        self._refresh_carousel_panel()
+        self.toast(f"slide {self.carousel.current + 1} added · {self.carousel.slides} slides")
+
+    def remove_slide(self, n: int | None = None):
+        """Take out slide `n` (the current one); what is to the right of it
+        moves back.  What was on it stays, over its neighbours.  One undo step."""
+        board = self.carousel
+        if board.slides <= 1:
+            self.toast("a carousel has at least one slide")
+            return
+        n = board.current if n is None else n
+        before = self.snapshot()
+        board.remove(n)
+        self.push("things", before)
+        self.changed()
+        self._refresh_carousel_panel()
+        self.toast(f"slide {n + 1} removed · {board.slides} slides")
+
+    def set_carousel(self, **values):
+        before = self.snapshot()
+        self.carousel.s.update(values)
+        self.carousel.apply()
+        if any(k in values for k in ("shape", "slides", "background")):
+            self.push("things", before)
+        self.changed()
+        self._refresh_carousel_panel()
+
+    def build_carousel_panel(self) -> Panel:
+        panel = Panel(self, "carousel", on_tab=self.open_palette)
+        board = self.carousel
+        s = lambda: board.s                                             # noqa: E731
+        panel.choice("shape", lambda: list(carousels.SHAPES), lambda: s()["shape"],
+                     lambda v: self.set_carousel(shape=v))
+        panel.links("slides", [(lambda: f"{board.slides} · + slide", self.add_slide),
+                               (lambda: f"remove {board.current + 1:02d}", self.remove_slide)])
+        panel.swatches("background", carousels.BACKGROUNDS, lambda: s()["background"],
+                       lambda v: self.set_carousel(background=v))
+        panel.section("export")
+        panel.choice("width", lambda: [str(w) for w in carousels.WIDTHS], lambda: str(s()["width"]),
+                     lambda v: self.set_carousel(width=int(v)))
+        panel.choice("finish", lambda: ["as set", "distressed", "clean"], lambda: s()["finish"],
+                     lambda v: self.set_carousel(finish=v))
+        panel.choice("full picture", lambda: list(carousels.FULL), lambda: s()["full"],
+                     lambda v: self.set_carousel(full=v))
+        panel.toggle("format", lambda: s()["format"] == "jpg",
+                     lambda v: self.set_carousel(format="jpg" if v else "png"), on="jpg", off="png")
+        panel.buttons([("swipe through", self.enter_carousel_preview),
+                       ("export…", self.export_carousel), ("close", panel.close_panel)])
+        return panel
+
+    def open_carousel_panel(self):
+        if self.carousel_panel is None:
+            self.carousel_panel = self.build_carousel_panel()
+        self._open_beside(self.carousel_panel, self.text_panel)
+        self.carousel_panel.raise_()
+        self.carousel_panel.refresh()
+
+    def toggle_carousel_panel(self):
+        if self.carousel_panel is not None and self.carousel_panel.isVisible():
+            self.carousel_panel.close_panel()
+        else:
+            if not self.instagram():
+                self.set_mode("instagram", quiet=True)
+            self.open_carousel_panel()
+
+    def _refresh_carousel_panel(self):
+        if self.carousel_panel is not None and self.carousel_panel.isVisible():
+            self.carousel_panel.refresh()
+
+    def enter_carousel_preview(self):
+        """Swipe through the slides as on Instagram."""
+        if self.editing is not None:
+            self.finish_editing()
+        if self.carousel_preview is None:
+            self.carousel_preview = carousels.CarouselPreview(self)
+        self.carousel_preview.start(self.carousel.current)
+
+    def leave_carousel_preview(self):
+        if self.carousel_preview is not None:
+            self.carousel.current = int(round(self.carousel_preview.at))
+            self.carousel_preview.hide()
+        self.view.setFocus(QtCore.Qt.OtherFocusReason)
+        self.view.viewport().update()
+
+    def export_carousel(self, parent: str | None = None) -> str | None:
+        if parent is None:
+            start = self.prefs.get("export_dir", os.path.expanduser("~/Desktop"))
+            parent = QtWidgets.QFileDialog.getExistingDirectory(self, "Export the carousel into", start)
+            if not parent:
+                return None
+            self.prefs["export_dir"] = parent
+            self._write_prefs()
+        with busy():
+            folder = carousels.export_folder(self, parent)
+        count = self.carousel.slides + (1 if self.carousel.s["full"] in ("last slide", "last slide + file") else 0)
+        posts = math.ceil(count / carousels.MAX_SLIDES)
+        self.toast(f"carousel · {count} slides{f' ({posts} posts)' if posts > 1 else ''} → {folder}")
+        return folder
+
     def margin_box(self) -> QtCore.QRectF:
         """The main text's frame on a page, in page coordinates."""
         m, h = self.fmt.margin, self.fmt.head
@@ -3032,6 +3317,8 @@ class Ream(QtWidgets.QMainWindow):
     def story_hit(self, at: QtCore.QPointF, slack: bool = False) -> bool:
         """Is `at` on the main text's frame on the live page (one with
         words)?  `slack`: a little round it too, for placing the caret."""
+        if self.instagram():
+            return False                    # the book is put away
         page = self.sheet.scene_page_rect()
         if not page.contains(at):
             return False
@@ -3046,10 +3333,10 @@ class Ream(QtWidgets.QMainWindow):
         page = self.sheet.scene_page_rect()
         hits = []
         for thing in self.things.values():
-            if not thing.alive or thing.scene() is None:
+            if not thing.alive or thing.scene() is None or not thing.isVisible():
                 continue
             box = thing.sceneBoundingRect()
-            if thing.pinned and not box.intersects(page):
+            if thing.parentItem() is self.sheet.strip and not box.intersects(page):
                 continue                     # on another page of the strip, out of sight
             if box.intersects(rect):
                 hits.append(thing)
@@ -3223,7 +3510,11 @@ class Ream(QtWidgets.QMainWindow):
         page = self.sheet.scene_page_rect()
         if wrap is None:
             wrap = -1.0
-            if on_page:
+            if on_page and self.instagram():
+                slide = self.carousel.slide_at(at) or 0
+                right = self.carousel.slide_rect(slide).right() - 24.0
+                wrap = (right - at.x()) if right - at.x() >= 60 else 160.0
+            elif on_page:
                 x = at.x() - page.left()
                 right = self.sheet.W - self.fmt.margin
                 wrap = (right - x) if right - x >= 60 else max(40.0, self.sheet.W - x - 8)
@@ -3305,7 +3596,7 @@ class Ream(QtWidgets.QMainWindow):
         """Register a new thing beside `like`: same parent, rotation, flip."""
         self.things[thing.uid] = thing
         if like.pinned:
-            thing.setParentItem(self.sheet.strip)
+            thing.setParentItem(like.parentItem())  # the same page strip, or the carousel
             thing.home = like.home
         else:
             self.scene.addItem(thing)
@@ -3496,6 +3787,9 @@ class Ream(QtWidgets.QMainWindow):
 
     # -- view ----------------------------------------------------------------
     def fit_layout(self):
+        if self.instagram():
+            self.view.frame(self.carousel.sceneBoundingRect(), margin=64)
+            return
         self.view.frame(self.layout_rect(), margin=48)
 
     def fit_page(self):
@@ -3629,7 +3923,7 @@ class Ream(QtWidgets.QMainWindow):
             self.view.viewport().update()
 
     def live(self) -> bool:
-        return self.distress_view
+        return self.distress_view and not self.instagram()
 
     def _refresh_live_preview(self, fast: bool = False):
         if self.live():
@@ -4221,7 +4515,15 @@ class Ream(QtWidgets.QMainWindow):
         return panel
 
     def toggle_export_panel(self):
-        """⌘E: the export panel - and, when it is open, export."""
+        """⌘E: the export panel - and, when it is open, export.  In instagram
+        mode, the carousel's: its panel, then (⌘E again) its export."""
+        if self.instagram():
+            if self.carousel_panel is not None and self.carousel_panel.isVisible():
+                self.export_carousel()
+            else:
+                self.open_carousel_panel()
+                self.toast("⌘E again exports the carousel")
+            return
         if self.export_panel is None:
             self.export_panel = self.build_export_panel()
         if self.export_panel.isVisible():
@@ -4253,6 +4555,7 @@ class Ream(QtWidgets.QMainWindow):
                 if thing is self.editing or thing.text().strip():
                     things.append({"uid": thing.uid, "kind": "text", "text": thing.text(),
                                    "wrap": thing.wrap, "pinned": thing.pinned,
+                                   **({"board": "carousel"} if thing.parentItem() is self.carousel else {}),
                                    **({"home": thing.home} if thing.pinned and thing.home is not None
                                       else {}),
                                    "x": thing.pos().x(), "y": thing.pos().y(),
@@ -4265,6 +4568,7 @@ class Ream(QtWidgets.QMainWindow):
             media[name] = thing.blob
             entry = {"uid": thing.uid, "media": name, "pdf_page": thing.pdf_page,
                      "name": thing.name, "pinned": thing.pinned,
+                     **({"board": "carousel"} if thing.parentItem() is self.carousel else {}),
                      **({"home": thing.home} if thing.pinned and thing.home is not None else {}),
                      "x": thing.pos().x(), "y": thing.pos().y(),
                      "w": thing.w, "h": thing.h, "z": thing.zValue(),
@@ -4293,6 +4597,7 @@ class Ream(QtWidgets.QMainWindow):
             "page": self.page,
             "view": {"zoom": self.view.zoom(), "x": centre.x(), "y": centre.y()},
             "things": things,
+            "carousel": self.carousel.state(),      # instagram mode's board (older files: none)
         }, media
 
     def _clear(self):
@@ -4316,6 +4621,7 @@ class Ream(QtWidgets.QMainWindow):
             self.doc.setUndoRedoEnabled(False)
             apply_runs(self.doc, state.get("runs"))
             self.apply_format()
+            self.carousel.set_state(state.get("carousel"))
             pdf_cache: dict[tuple[str, int], tuple] = {}
             for entry in state.get("things", []):
                 if entry.get("kind") == "text":
@@ -4325,7 +4631,9 @@ class Ream(QtWidgets.QMainWindow):
                     apply_runs(note.editor.document(), entry.get("runs"))
                     self.style_note(note)
                     self.things[note.uid] = note
-                    if entry.get("pinned"):
+                    if entry.get("board") == "carousel":
+                        note.setParentItem(self.carousel)
+                    elif entry.get("pinned"):
                         note.setParentItem(self.sheet.strip)
                         note.home = entry.get("home")
                     else:
@@ -4354,7 +4662,9 @@ class Ream(QtWidgets.QMainWindow):
                 thing = Thing(image, QtCore.QSizeF(entry["w"], entry["h"]), blob, ext, index,
                               entry.get("name", ""), uid=entry.get("uid"))
                 self.things[thing.uid] = thing
-                if entry.get("pinned"):
+                if entry.get("board") == "carousel":
+                    thing.setParentItem(self.carousel)
+                elif entry.get("pinned"):
                     thing.setParentItem(self.sheet.strip)
                     thing.home = entry.get("home")
                 else:
@@ -4371,6 +4681,7 @@ class Ream(QtWidgets.QMainWindow):
                 if entry.get("flip"):
                     thing.set_flip(*entry["flip"])
             self.page = max(0, min(int(state.get("page", 0)), self.sheet.pages()))
+            self.show_book()                        # the book, or the carousel in instagram mode
             self.sheet.set_offset(self.page * self.sheet.H)
             self._update_grid()
             self._place_sheet()
@@ -4577,6 +4888,15 @@ class Ream(QtWidgets.QMainWindow):
             C(f"about ream {__version__}", lambda: self.toast(
                 f"ream {__version__} · semver · CHANGELOG.md has what changed"), "",
               "version release changelog"),
+            C("instagram mode", partial(self.set_mode, "instagram"), "⌥⌘C",
+              "carousel slides post board social seamless"),
+            C("carousel panel", self.toggle_carousel_panel, "⌥⌘C in instagram mode",
+              "slides add remove shape background export"),
+            C("carousel: + slide", self.add_slide, "", "instagram add slide"),
+            C("carousel: remove slide", self.remove_slide, "", "instagram delete slide"),
+            C("carousel: swipe through", self.enter_carousel_preview, "⇧⌘P in instagram mode",
+              "preview instagram scroll"),
+            C("carousel: export…", self.export_carousel, "", "instagram jpg slides folder"),
             C("tools panel", self.toggle_tools_panel, "⌥⌘T",
               "tools select text box lasso wand eraser toolbar"),
             C("text panel", self.toggle_text_panel, "⌘T",
@@ -4827,7 +5147,7 @@ class Ream(QtWidgets.QMainWindow):
 
     def _shortcuts(self):
         bindings = [
-            ("Ctrl+E", self.toggle_export_panel), ("Ctrl+Shift+E", partial(self.export_pdf, True)),
+            ("Ctrl+E", self.toggle_export_panel), ("Ctrl+Shift+E", self.export_clean),
             ("Ctrl+D", self.toggle_distress_panel), ("Ctrl+L", self.toggle_page_panel),
             ("Ctrl+Shift+D", self.toggle_distress_view),
             ("Ctrl+Alt+S", self.save_profile),
@@ -4848,6 +5168,7 @@ class Ream(QtWidgets.QMainWindow):
             ("Ctrl+;", self.toggle_spelling),
             ("Ctrl+Alt+D", self.toggle_mode), ("Ctrl+T", self.toggle_text_panel),
             ("Ctrl+Alt+T", self.toggle_tools_panel),
+            ("Ctrl+Alt+C", self.toggle_carousel_panel_or_mode),
         ]
         for keys, slot in bindings:
             action = QtWidgets.QAction(self)

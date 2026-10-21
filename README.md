@@ -135,6 +135,50 @@ marks the main text's frame on each page with words, and every text box.
 The selected frame is solid, and the one you are writing in is dashed. The
 mode shows at the bottom right.
 
+### Instagram mode
+
+A third mode, for making a carousel post. `⌥⌘C` (or **instagram mode** in the
+palette) puts the book away and lays out a **carousel**: Instagram-shaped
+slides side by side, touching, as one wide board. `⌥⌘D` takes you back to
+the book; both are kept in the same document.
+
+**The board.** It edits like design mode: drop, paste or drag pictures onto
+it, draw text boxes with `T`, stamp, cut with stik, and style text with the
+text panel. Anything can sit across slides: the slide edges are dotted guides
+only, so the carousel is seamless by construction. Each slide is the board
+cut at an equal width. What hangs off the board's edge is cut, as on a page.
+
+**The carousel panel.** `⌥⌘C` again, or a right-click on the board, opens it.
+
+| Row | Does |
+| --- | --- |
+| shape | 4:5 (1080 × 1350), 1:1, 3:4 (1080 × 1440) or 1.91:1 (1080 × 566) |
+| slides | **+ slide** adds one after the current slide (the one last clicked); **remove** takes the current one out. What is to the right moves along either way. Both undo |
+| background | the board's colour |
+| width, finish, full picture, format | the export: 1080, 1440 or 2160 wide, distressed or clean, the whole picture as a fitted last slide and/or `full.jpg`, JPEG or PNG |
+
+**Swiping through.** `⇧⌘P` in instagram mode (or **swipe through**) shows
+the carousel as Instagram does: one slide at a time in a phone-wide column,
+the count in the corner and dots underneath.
+
+- **Moving:** swipe with two fingers on a trackpad, drag, or use `←` `→`.
+  Letting go snaps to a slide; a flick goes on to the next.
+- **Seamless:** between slides you see both halves, running on into each
+  other.
+- `Esc` goes back to the slide you were looking at.
+
+**export…** writes a folder with `01.jpg` and onward, plus the fitted whole
+picture and `full.jpg` as you chose.
+
+In instagram mode every export is the carousel's:
+
+- `⌘E` opens its panel, and `⌘E` again exports;
+- `⇧⌘E` exports it clean;
+- the instagram plugin's `⌥⌘G` and **instagram: export…** post the board,
+  not the book.
+
+Back in writer or design mode, they are the book's again.
+
 ### Text panel
 
 `⌘T` (or **text panel**) styles text: **font**, **size**, **line** spacing,
@@ -401,7 +445,8 @@ the number.
 | Group | Commands |
 | --- | --- |
 | Panels | distress panel (`⌘D`), page panel (`⌘L`), text panel (`⌘T`) |
-| Modes | writer mode / design mode (`⌥⌘D`), new text box (`T` in design mode) |
+| Modes | writer mode / design mode (`⌥⌘D`), instagram mode (`⌥⌘C`), new text box (`T` in design and instagram mode) |
+| Carousel | carousel panel (`⌥⌘C` in instagram mode), carousel: + slide, remove slide, swipe through (`⇧⌘P`), export… |
 | Plugins | stik (`⌥⌘K`), impose (`⌥⌘I`), wear (`⌥⌘W`), instagram (`⌥⌘G`), scanner |
 | Export | export pdf (`⌘E`: the export panel, for PDF or PNG), export pdf · all pages now, export pdf · clean (`⇧⌘E`), export png pages |
 | Distress | distress view (`⇧⌘D`), distress on/off, distress images on/off, style · …, fade texture · …, reset distress |
@@ -1136,6 +1181,7 @@ Choosing a theme sets its canvas colour. Any colour from the page panel or
 | `src/ream/plugins/stik.py` | the stik plugin: cut tools, wand, eraser, background, islands, border, export |
 | `src/ream/wear.py` | torn edges (drawn or from a matte, with a paper rim), stamps from textures, ream's own drawn stamps |
 | `src/ream/plugins/wear.py` | the wear plugin: tear and stamp tools, the stamp grid |
+| `src/ream/carousel.py` | instagram mode's carousel board, rendering it seamless, its export and the swipe-through preview |
 | `src/ream/plugins/instagram.py` | the instagram plugin: slides from pages, spreads or one long strip, the seamless carousel, the full picture |
 | `src/ream/matting.py` | stik's pixel maths: background removal, wand, islands, die-cut borders |
 | `src/ream/profiles.py` | profiles: the store of named settings |

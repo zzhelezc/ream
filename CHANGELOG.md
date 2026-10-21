@@ -19,6 +19,38 @@ version that wrote it. The format follows
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-21
+
+### Fixed
+
+- **In instagram mode every export posts the carousel board.** The
+  instagram plugin's export (`⌥⌘G`, **instagram: export…**) and `⌘E` still
+  worked from the book, so after arranging a carousel they came out empty.
+  In instagram mode now:
+  - `⌥⌘G` opens the carousel panel, and the plugin's export writes the
+    carousel;
+  - `⌘E` opens the carousel panel, and `⌘E` again exports it;
+  - `⇧⌘E` exports it clean.
+
+  In writer and design mode they work on the book as before.
+
+## [0.8.0] - 2026-10-21
+
+### Added
+
+- **Instagram mode** (`⌥⌘C`): a carousel board in place of the book.
+  - **The board:** Instagram-shaped slides (4:5, 1:1, 3:4, 1.91:1) side
+    by side, edited like design mode (pictures, text boxes, stamps, stik)
+    and seamless across slides by construction.
+  - **The carousel panel:** add or remove slides (things to the right move
+    along, and it undoes), shape, background, and export (width, finish,
+    fitted whole picture, `full.jpg`).
+  - **Swipe-through preview** (`⇧⌘P`), as on Instagram: one slide at a
+    time, trackpad, drag and arrows, snapping, dots and count, the picture
+    running on between slides.
+  - **Files:** `.ream` files keep the carousel and what is on it (older
+    files open with an empty three-slide board).
+
 ## [0.7.0] - 2026-10-20
 
 ### Added
@@ -297,6 +329,8 @@ Everything before versioning started.
     including draft and test prints.
 
 [Unreleased]: #unreleased
+[0.8.1]: #081---2026-10-21
+[0.8.0]: #080---2026-10-21
 [0.7.0]: #070---2026-10-20
 [0.6.0]: #060---2026-10-20
 [0.5.5]: #055---2026-10-20
