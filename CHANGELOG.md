@@ -19,6 +19,29 @@ version that wrote it. The format follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-22
+
+### Added
+
+- **Shift keeps proportions when resizing.** An image's corner now
+  stretches it freely about its middle (it used to always keep its
+  proportions); hold `Shift` to keep them. Plugin frames (the scanner's)
+  work the same way.
+- **Scanner shapes:** a **shape** menu sets the bed and result to free, 1:1,
+  4:5, 3:4, 2:3, 3:2, 4:3, 16:9, 9:16, A4 portrait or landscape, the book's
+  page, or a carousel slide. A chosen shape holds while resizing.
+- **impose: single pages.** Two new styles, **pages · one-sided** and
+  **pages · two-sided** (pages back to back), on portrait or landscape
+  sheets. The turn for the backs and the print jobs follow the sheet's
+  orientation.
+
+### Changed
+
+- **The scanner opens where your pointer is** (or where the palette was
+  opened), not where it was last time.
+- **Image resizing:** stretching freely is the default; `Shift` keeps the
+  proportions.
+
 ## [0.8.1] - 2026-10-21
 
 ### Fixed
@@ -329,6 +352,7 @@ Everything before versioning started.
     including draft and test prints.
 
 [Unreleased]: #unreleased
+[0.9.0]: #090---2026-10-22
 [0.8.1]: #081---2026-10-21
 [0.8.0]: #080---2026-10-21
 [0.7.0]: #070---2026-10-20

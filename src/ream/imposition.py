@@ -23,6 +23,12 @@ it stays on the outside (`keep_back`), or at the end.
 | signatures  | 2 up, both sides | sheets nested in groups (signatures), each folded, groups stacked and sewn |
 | cutstack    | 2 up, both sides | printed, cut in half, the right pile put under the left: the leaves come out in order |
 | zine8       | 4 x 2, one side  | one sheet, one cut, folded into an eight-page mini zine |
+| pages1      | 1 up, one side   | a page a sheet, printed on one side - portrait or landscape |
+| pages2      | 1 up, both sides | a page a side: pages back to back, two a sheet |
+
+The page styles (PAGE_STYLES) print each page whole on its own side of the
+sheet, which can stand portrait or landscape; the booklet styles always use
+the sheet landscape, two pages (or eight) to a side.
 """
 from __future__ import annotations
 
@@ -34,7 +40,10 @@ STYLES = {
     "signatures": ("sewn signatures", "sheets nested in groups, each group folded, groups sewn"),
     "cutstack": ("cut & stack", "printed 2 up, cut in half, right pile under left: leaves in order"),
     "zine8": ("mini zine · 8 pages", "one sheet, one side, one cut, folded"),
+    "pages1": ("pages · one-sided", "a page a sheet, printed on one side"),
+    "pages2": ("pages · two-sided", "a page a side: pages back to back, two a sheet"),
 }
+PAGE_STYLES = ("pages1", "pages2")          # a whole page to a side, portrait or landscape
 SHEETS = {"a4": (841.890, 595.276), "letter": (792.0, 612.0), "a3": (1190.551, 841.890),
           "tabloid": (1224.0, 792.0)}          # landscape, points
 PRINTING = {
@@ -113,6 +122,15 @@ def _folio(sheet_no: int, left_front: int, right_front: int, left_back: int, rig
 
 def impose(pages: int, style: str, per_signature: int = 4, keep_back: bool = True) -> Layout:
     pages = max(1, pages)
+    if style == "pages1":
+        sheets = [Sheet(k + 1, front=[Cell(k, 0, 0)], back=None) for k in range(pages)]
+        return Layout(style, 1, 1, pages, pages, sheets, folds=[], cuts=[], keep_back=keep_back)
+    if style == "pages2":
+        padded = _round_up(pages, 2)
+        page = _Slots(pages, padded, keep_back)
+        sheets = [Sheet(k + 1, front=[Cell(page(2 * k), 0, 0)], back=[Cell(page(2 * k + 1), 0, 0)])
+                  for k in range(padded // 2)]
+        return Layout(style, 1, 1, pages, padded, sheets, folds=[], cuts=[], keep_back=keep_back)
     if style == "zine8":
         padded = _round_up(pages, 8)
         page = _Slots(pages, padded, keep_back)
@@ -166,7 +184,7 @@ def impose(pages: int, style: str, per_signature: int = 4, keep_back: bool = Tru
                   per_signature=per_signature, keep_back=keep_back)
 
 
-def back_turn(printing: str) -> int:
+def back_turn(printing: str, portrait: bool = False) -> int:
     """How far the backs must be turned for the way the paper is turned over.
 
     Printers feed paper short edge first, so these landscape sheets go
@@ -174,15 +192,26 @@ def back_turn(printing: str) -> int:
     Turning the paper over its long edge (like a book's page, as it lies in
     front of you) - or a duplex printer flipping on the long edge - turns the
     sheet top to bottom, so the backs are printed turned 180°.  Over the
-    short edge (like a calendar), or a short-edge flip, they need nothing."""
+    short edge (like a calendar), or a short-edge flip, they need nothing.
+
+    A `portrait` sheet (the page styles) goes through upright, so it is the
+    other way round: over the long edge, like a book's page, the back comes
+    out upright; over the short edge it needs turning."""
     printing = OLD_PRINTING.get(printing, printing)
-    return 180 if printing in ("single-long", "duplex-long") else 0
+    long_edge = printing in ("single-long", "duplex-long")
+    if portrait:
+        return 0 if long_edge else 180
+    return 180 if long_edge else 0
 
 
 def reading_order(layout: Layout) -> list[int]:
     """The pages in the order they come out once the sheets are printed,
     folded (or cut) and bound - for checking an imposition."""
     style = layout.style
+    if style == "pages1":
+        return [s.front[0].page for s in layout.sheets]
+    if style == "pages2":
+        return [p for s in layout.sheets for p in (s.front[0].page, s.back[0].page)]
     if style == "zine8":
         slots = _Slots(layout.pages, layout.padded, layout.keep_back)
         return [slots(p) for p in range(layout.padded)]

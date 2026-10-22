@@ -43,7 +43,11 @@ BAYER = (np.array([[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]
                   np.float32) + 0.5) / 16.0
 DEFAULTS = {"direction": "down", "speed": 1.0, "loop": False, "ink": "colour", "tone": 0.0,
             "grain": 2.0, "layering": "replace", "blend": "darken", "noise": 25.0,
-            "paper": "white", "dpi": 150.0, "bed": [360.0, 260.0]}
+            "paper": "white", "dpi": 150.0, "bed": [360.0, 260.0], "aspect": "free"}
+# shapes for the bed (and so the result): width / height; None: free
+ASPECTS = {"free": None, "1:1": 1.0, "4:5": 4 / 5, "3:4": 3 / 4, "2:3": 2 / 3, "3:2": 3 / 2,
+           "4:3": 4 / 3, "16:9": 16 / 9, "9:16": 9 / 16, "A4 portrait": 1 / 2 ** 0.5,
+           "A4 landscape": 2 ** 0.5, "the page": "page", "a carousel slide": "slide"}
 LINE = QtGui.QColor("#2f4bd8")
 
 
@@ -97,17 +101,18 @@ class Plugin(Base):
             self.open()
 
     def open(self):
+        """The bed opens where the pointer is (or where the palette was
+        opened), the result beside it."""
+        window = self.host.window
         seen = self.host.visible_rect()
-        saved = self.s.get("at")
-        if saved:
-            self.bed.setPos(*saved[0])
-            self.result.setPos(*saved[1])
-        else:
-            gap = 40.0
-            left = seen.center().x() - self.bed.w - gap / 2
-            top = seen.center().y() - self.bed.h / 2
-            self.bed.setPos(left, top)
-            self.result.setPos(left + self.bed.w + gap, top)
+        at = window.palette_at or window.pointer_scene()
+        if at is None or not seen.contains(at):
+            at = seen.center()
+        gap = 40.0
+        left, top = at.x() - self.bed.w / 2, at.y() - self.bed.h / 2
+        self.bed.setPos(left, top)
+        self.result.setPos(left + self.bed.w + gap, top)
+        self.lock_aspect()
         self.bed.show()
         self.result.show()
         if self.buffer is None:
@@ -160,6 +165,7 @@ class Plugin(Base):
         panel.choice("paper", lambda: list(PAPERS), lambda: s["paper"], put("paper", refresh=True))
         panel.slider("dpi", 72, 300, lambda: s["dpi"], put("dpi", refresh=True), step=6,
                      default=150)
+        panel.choice("shape", lambda: list(ASPECTS), lambda: s.get("aspect", "free"), self.set_aspect)
         panel.buttons([("to canvas", self.to_canvas), ("export png", self.export_png)])
         return panel
 
@@ -339,6 +345,34 @@ class Plugin(Base):
     def take(self, at: QtCore.QPointF) -> QtGui.QImage | None:
         """Dragging out of the result picks up a copy of the scan."""
         return self.qimage().copy() if self.qimage() is not None else None
+
+    # -- the bed's shape -------------------------------------------------------------
+    def ratio(self) -> float | None:
+        value = ASPECTS.get(self.s.get("aspect", "free"))
+        window = self.host.window
+        if value == "page":
+            return window.sheet.W / window.sheet.H
+        if value == "slide":
+            return window.carousel.slide_w / window.carousel.slide_h
+        return value
+
+    def lock_aspect(self):
+        """Resizing keeps the chosen shape (free: any)."""
+        self.bed.aspect = self.result.aspect = self.ratio()
+
+    def set_aspect(self, name: str):
+        """The bed (and the result) to a shape, keeping about the same area."""
+        self.s["aspect"] = name
+        ratio = self.ratio()
+        self.lock_aspect()
+        if ratio:
+            area = self.bed.w * self.bed.h
+            w, h = (area * ratio) ** 0.5, (area / ratio) ** 0.5
+            self.bed.set_size(w, h)
+            self.bed_changed()
+            self.s["bed"] = [self.bed.w, self.bed.h]
+            self.save()
+            self.host.toast(f"scanner · {name} · {self.bed.w:.0f} × {self.bed.h:.0f} pt")
 
     def bed_changed(self):
         if (self.result.w, self.result.h) != (self.bed.w, self.bed.h):

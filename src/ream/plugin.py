@@ -130,6 +130,7 @@ class Frame(QtWidgets.QGraphicsItem):
         super().__init__()
         self.host = host
         self.on_context = on_context            # right-click: open its panel
+        self.aspect: float | None = None        # w / h it keeps when resized (None: free)
         self.label = label
         self.w, self.h = float(size.width()), float(size.height())
         self.paint_content = paint_content

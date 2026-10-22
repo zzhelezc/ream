@@ -40,7 +40,8 @@ from .. import export, imposition, printing, style
 from ..panel import _Link
 from ..plugin import Plugin as Base
 
-DEFAULTS = {"style": "saddle", "sheet": "a4", "fit": True, "printing": "single-long",
+DEFAULTS = {"style": "saddle", "sheet": "a4", "orientation": "portrait", "fit": True,
+            "printing": "single-long",
             "reverse": False, "marks": True, "per_signature": 4, "keep_back": True}
 INK = QtGui.QColor(style.INK)
 GREY = QtGui.QColor("#8c8b86")
@@ -414,6 +415,15 @@ def draw_binding(painter: QtGui.QPainter, rect: QtCore.QRectF, style_key: str):
                                  w * 0.2, h * 0.34)
             painter.drawRect(pile)
             painter.drawText(pile, QtCore.Qt.AlignCenter, label)
+    elif style_key in ("pages1", "pages2"):
+        # a stack of sheets, a page each, bound at the left edge
+        for i in range(4):
+            sheet = QtCore.QRectF(c.x() - w * 0.16 + i * w * 0.025, c.y() - h * 0.3 + i * h * 0.03,
+                                  w * 0.3, h * 0.5)
+            painter.drawRect(sheet)
+        _pen(painter, 2.4, LINE)
+        painter.drawLine(QtCore.QPointF(sheet.left() + w * 0.02, sheet.top() + h * 0.05),
+                         QtCore.QPointF(sheet.left() + w * 0.02, sheet.bottom() - h * 0.05))
     else:                                       # zine8
         sheet = QtCore.QRectF(c.x() - w * 0.36, c.y() - h * 0.24, w * 0.72, h * 0.48)
         painter.drawRect(sheet)
@@ -477,6 +487,10 @@ BIND_STEPS = {
               "cut along the dashed line - the middle two panels only",
               "fold the long way again, push the ends in so the cut opens into a diamond",
               "fold it flat into a booklet, page 1 on the outside"],
+    "pages1": ["the sheets come out in page order, page 1 first",
+               "trim, then bind the edge however you like: staples, stab-sewing, a clip, a ring"],
+    "pages2": ["the sheets come out in page order, two pages back to back on each",
+               "trim, then bind the spine edge: staples, stab-sewing, glue or rings"],
 }
 
 
@@ -551,7 +565,7 @@ class ImposeView(QtWidgets.QWidget):
         sheets = layout.sheets
         self.sheet_index = max(0, min(self.sheet_index, len(sheets) - 1))
         sheet = sheets[self.sheet_index]
-        sw, sh = imposition.SHEETS[p.s["sheet"]]
+        sw, sh = p.sheet_size()
         sides = [("front · side A", sheet.front, 0)]
         if sheet.back is not None:
             sides.append(("back · side B · as it is after turning the sheet over",
@@ -948,6 +962,9 @@ class Plugin(Base):
             return setter
 
         panel.choice("style", lambda: list(imposition.STYLES), lambda: s["style"], put("style"))
+        panel.toggle("orientation", lambda: s.get("orientation", "portrait") == "portrait",
+                     lambda v: put("orientation")("portrait" if v else "landscape"),
+                     on="portrait", off="landscape")
         panel.choice("sheet", lambda: list(imposition.SHEETS), lambda: s["sheet"], put("sheet"))
         panel.toggle("pages", lambda: s["fit"], put("fit"), on="fit", off="100%")
         panel.slider("signature", 1, 8, lambda: s["per_signature"], put("per_signature"),
@@ -979,6 +996,18 @@ class Plugin(Base):
         self.view.update()
 
     # -- the layout -------------------------------------------------------------------
+    def sheet_size(self) -> tuple[float, float]:
+        """The sheet in points: landscape for the booklet styles; for the page
+        styles, portrait or landscape as chosen."""
+        sw, sh = imposition.SHEETS[self.s["sheet"]]
+        if self.s["style"] in imposition.PAGE_STYLES and self.s.get("orientation") == "portrait":
+            return sh, sw
+        return sw, sh
+
+    def portrait_sheet(self) -> bool:
+        sw, sh = self.sheet_size()
+        return sh > sw
+
     def layout(self) -> imposition.Layout:
         return imposition.impose(self.host.window.sheet.pages(), self.s["style"],
                                  int(self.s["per_signature"]), bool(self.s["keep_back"]))
@@ -1060,8 +1089,8 @@ class Plugin(Base):
 
     # -- printing it ----------------------------------------------------------------------
     def _writer(self, path: str, pages_are_images: bool) -> QtGui.QPdfWriter:
-        sw, sh = imposition.SHEETS[self.s["sheet"]]
-        if self.portrait:
+        sw, sh = self.sheet_size()
+        if self.portrait and sw > sh:                # printing: landscape sheets go in turned
             sw, sh = sh, sw
         writer = QtGui.QPdfWriter(path)
         writer.setCreator("ream")
@@ -1076,8 +1105,8 @@ class Plugin(Base):
         page is the paper as it goes through the printer - upright, short
         edge first - so the sheet is turned a quarter onto it (top edge to
         the paper's right; fronts and backs alike, so they still back up)."""
-        if not self.portrait:
-            return QtCore.QRectF(0, 0, writer.width(), writer.height())
+        if not self.portrait or self.portrait_sheet():
+            return QtCore.QRectF(0, 0, writer.width(), writer.height())   # (portrait goes in as it is)
         painter.translate(writer.width(), 0)
         painter.rotate(90)
         return QtCore.QRectF(0, 0, writer.height(), writer.width())
@@ -1109,7 +1138,7 @@ class Plugin(Base):
         return draw
 
     def write_sides(self, path: str, sides: list[tuple[list, int]], layout, draw):
-        sw, sh = imposition.SHEETS[self.s["sheet"]]
+        sw, sh = self.sheet_size()
         c = self.host.window
         writer = self._writer(path, c.distress.enabled and not self.drafting)
         painter = QtGui.QPainter(writer)
@@ -1141,7 +1170,7 @@ class Plugin(Base):
         painter.setPen(INK)
         painter.drawText(QtCore.QRectF(48, 40, sw - 96, 24), QtCore.Qt.AlignLeft,
                          f"page map  ·  {imposition.STYLES[layout.style][0]}")
-        ssw, ssh = imposition.SHEETS[self.s["sheet"]]
+        ssw, ssh = self.sheet_size()
         cols = 2 if layout.two_sided else 3
         cell_w = (sw - 96 - 20 * (cols - 1)) / cols
         scale = cell_w / ssw
@@ -1204,7 +1233,7 @@ class Plugin(Base):
         if not layout.two_sided:
             return files
         if "backs" in which:
-            turn = imposition.back_turn(self.s["printing"]) \
+            turn = imposition.back_turn(self.s["printing"], self.portrait_sheet()) \
                 if self.s["printing"].startswith("single") else 0
             backs = [(s.back, turn) for s in layout.sheets]
             if self.s["reverse"]:
@@ -1212,7 +1241,7 @@ class Plugin(Base):
             files["backs"] = os.path.join(folder, "2-backs.pdf")
             self.write_sides(files["backs"], backs, layout, draw)
         if "duplex" in which:
-            duplex_turn = 180 if self.s["printing"] == "duplex-long" else 0
+            duplex_turn = imposition.back_turn(self.s["printing"], self.portrait_sheet())
             interleaved = []
             for s in layout.sheets:
                 interleaved += [(s.front, 0), (s.back, duplex_turn)]
@@ -1237,8 +1266,9 @@ class Plugin(Base):
     def test_sheet(self, folder: str) -> list[str]:
         """Two one-page PDFs: print the front, turn the sheet as the guide
         says, print the back; they should read upright, back to back."""
-        sw, sh = imposition.SHEETS[self.s["sheet"]]
-        turn = imposition.back_turn(self.s["printing"]) if self.s["printing"].startswith("single") else 0
+        sw, sh = self.sheet_size()
+        turn = imposition.back_turn(self.s["printing"], self.portrait_sheet()) \
+            if self.s["printing"].startswith("single") else 0
         paths = []
         for side, label in (("front", "A · FRONT"), ("back", "B · BACK")):
             path = os.path.join(folder, f"test-{side}.pdf")

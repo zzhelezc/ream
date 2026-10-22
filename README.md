@@ -397,7 +397,9 @@ text width if it is wider.
 - **Selecting and moving:** click to select, `Shift`+click adds, drag moves,
   `Alt`+drag carries a copy,
   and the arrows nudge (`Shift` for 10 pt). The corner square resizes about
-  the middle, keeping the proportions.
+  the middle, freely: drag sideways and only the width changes. Hold `Shift`
+  to keep the current proportions. Frames on the canvas (the scanner's) work
+  the same way.
 - **Rotating:** drag the round knob above a selected image (`Shift` snaps to
   15°). `[` and `]` turn it 15° (`Shift` for 1°). In the palette,
   `rotate 30` sets an angle, and **straighten** puts it level. Images export
@@ -651,6 +653,19 @@ panel and the imposition preview.
 | **sewn signatures** | thicker books: sheets nested in groups (1–8 sheets each), folded, sewn |
 | **cut & stack** | printed 2-up, cut in half, right pile under left: the leaves come out in order |
 | **mini zine · 8 pages** | the classic one-sheet zine: one side, one cut, folded |
+| **pages · one-sided** | no imposing: a page to a sheet, printed on one side |
+| **pages · two-sided** | a page to a side: pages back to back, two to a sheet |
+
+**orientation** (portrait or landscape) sets which way the sheet stands for
+the two page styles; each page is fitted to it whole. The booklet styles
+always use the sheet landscape, two pages to a side.
+
+- **Turning for the back:** on a portrait sheet, turning the stack over its
+  long edge (like a book's page) brings the backs out upright; over the
+  short edge they are turned to suit.
+- **Printing:** portrait sheets go to the printer as they are. One-sided
+  prints just the fronts; two-sided runs the fronts, the turn, then the
+  backs, or one duplex job.
 
 **How the pages are placed:**
 
@@ -864,8 +879,22 @@ Wherever you are writing, Space stays a space: in writer mode's page, in a
 text box, or in the main text in design mode. Holding Space and dragging
 still pans. Right-click either frame for the settings.
 
+**Shape.** The **shape** menu sets the bed (and so the result) to a fixed
+shape, keeping about the same area:
+
+- free, 1:1, 4:5, 3:4, 2:3, 3:2, 4:3, 16:9, 9:16;
+- A4 portrait or landscape;
+- **the page** (the book's);
+- **a carousel slide** (instagram mode's).
+
+A chosen shape holds while you drag a frame's corner; **free** lets go of it
+(`Shift` then keeps whatever shape it has).
+
+**Where it opens.** The scanner opens where your pointer is (or where you
+opened the palette), the bed under it and the result beside it.
+
 Also in the palette: **scanner: scan / stop**, **clear result**, **result to
-canvas** and **export png**. Positions, size and settings are remembered.
+canvas** and **export png**. Size and settings are remembered.
 
 ### Instagram
 

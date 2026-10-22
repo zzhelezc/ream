@@ -3174,6 +3174,138 @@ def test_instagram_mode_exports_the_board_whatever_the_route():
     w.close()
 
 
+def test_shift_keeps_aspect_and_scanner_shapes():
+    w = fresh()
+    w.show()
+    page = w.sheet.scene_page_rect()
+    blue = QtGui.QImage(400, 200, QtGui.QImage.Format_ARGB32)
+    blue.fill(QtGui.QColor("#3355aa"))
+    pic = w.place_qimage(blue, QtCore.QRectF(page.right() + 100, page.top() + 100, 200, 100), "p")
+    w.view.frame(pic.sceneBoundingRect().adjusted(-300, -300, 300, 300))
+    pump(0.05)
+    viewport = w.view.viewport()
+
+    def stretch(thing, dx, dy, mods=QtCore.Qt.NoModifier):
+        w.select([thing])
+        corners = w._handles(thing)[0]                 # (kept: a point of a dropped polygon dangles)
+        handle = w._handle_rect(QtCore.QPointF(corners[2])).center()
+        start = QtCore.QPoint(int(handle.x()), int(handle.y()))
+        end = start + QtCore.QPoint(dx, dy)
+        QtTest.QTest.mousePress(viewport, QtCore.Qt.LeftButton, mods, start)
+        app.sendEvent(viewport, QtGui.QMouseEvent(QtCore.QEvent.MouseMove, QtCore.QPointF(end),
+                                                  QtCore.Qt.LeftButton, QtCore.Qt.LeftButton, mods))
+        QtTest.QTest.mouseRelease(viewport, QtCore.Qt.LeftButton, mods, end)
+        pump(0.02)
+
+    # the corner stretches freely: only the width changes when dragged sideways
+    stretch(pic, 60, 0)
+    assert pic.w > 200 + 20 and abs(pic.h - 100) < 3, (pic.w, pic.h)
+    # with Shift the shape is kept
+    ratio = pic.w / pic.h
+    stretch(pic, 80, 0, QtCore.Qt.ShiftModifier)
+    assert abs(pic.w / pic.h - ratio) < 0.02, (pic.w / pic.h, ratio)
+    w.undo()
+    # the scanner: shapes from its menu; it opens where the pointer is
+    scanner = scanner_of(w)
+    w.fit_layout()
+    pump(0.05)
+    spot = page.center() + QtCore.QPointF(-100, 50)
+    assert w.view.visible_scene_rect().contains(spot)
+    w.palette_at = spot
+    scanner.open()
+    assert abs(scanner.bed.scene_rect().center().x() - spot.x()) < 1 and \
+        abs(scanner.bed.scene_rect().center().y() - spot.y()) < 1
+    area = scanner.bed.w * scanner.bed.h
+    scanner.set_aspect("4:5")
+    assert abs(scanner.bed.w / scanner.bed.h - 0.8) < 1e-6 and abs(scanner.bed.w * scanner.bed.h - area) < 2
+    assert (scanner.result.w, scanner.result.h) == (scanner.bed.w, scanner.bed.h)
+    scanner.set_aspect("a carousel slide")
+    assert abs(scanner.bed.w / scanner.bed.h - w.carousel.slide_w / w.carousel.slide_h) < 1e-6
+    # a set shape holds while the frame's corner is dragged
+    scanner.set_aspect("16:9")
+    transform = w.view.viewportTransform()
+    corner = transform.map(scanner.bed.scene_rect().bottomRight())
+    start = QtCore.QPoint(int(corner.x()) - 2, int(corner.y()) - 2)
+    drag(w, start, start + QtCore.QPoint(80, 5))
+    assert abs(scanner.bed.w / scanner.bed.h - 16 / 9) < 1e-3, scanner.bed.w / scanner.bed.h
+    # free: any shape - and Shift keeps the one it has
+    scanner.set_aspect("free")
+    assert scanner.bed.aspect is None
+    ratio = scanner.bed.w / scanner.bed.h
+    corner = w.view.viewportTransform().map(scanner.bed.scene_rect().bottomRight())
+    start = QtCore.QPoint(int(corner.x()) - 2, int(corner.y()) - 2)
+    QtTest.QTest.mousePress(viewport, QtCore.Qt.LeftButton, QtCore.Qt.ShiftModifier, start)
+    app.sendEvent(viewport, QtGui.QMouseEvent(QtCore.QEvent.MouseMove, QtCore.QPointF(start + QtCore.QPoint(90, 0)),
+                                              QtCore.Qt.LeftButton, QtCore.Qt.LeftButton, QtCore.Qt.ShiftModifier))
+    QtTest.QTest.mouseRelease(viewport, QtCore.Qt.LeftButton, QtCore.Qt.ShiftModifier, start + QtCore.QPoint(90, 0))
+    assert abs(scanner.bed.w / scanner.bed.h - ratio) < 1e-3
+    scanner.close()
+    w.close()
+
+
+def test_impose_single_pages_portrait_or_landscape():
+    import pypdfium2
+    from ream import imposition, printing
+    assert imposition.back_turn("single-long", True) == 0 and imposition.back_turn("single-short", True) == 180
+    assert imposition.back_turn("duplex-long", True) == 0 and imposition.back_turn("duplex-short", True) == 180
+    w = fresh()
+    w.distress.enabled = False
+    type_paragraphs(w, 14)
+    n = w.sheet.pages()
+    imp = impose_of(w)
+    # one-sided: a page a sheet, fronts only
+    imp.s.update({"style": "pages1", "orientation": "portrait", "sheet": "a4", "printing": "single-long",
+                  "reverse": False, "marks": False})
+    layout = imp.layout()
+    assert len(layout.sheets) == n and not layout.two_sided and imp.mode() == "one"
+    assert imposition.reading_order(layout) == list(range(n))
+    folder = imp.export_bundle(TMP)
+    assert sorted(os.listdir(folder)) == ["1-fronts.pdf", "README.txt", "guide.pdf"]
+    fronts = pypdfium2.PdfDocument(os.path.join(folder, "1-fronts.pdf"))
+    width, height = fronts[0].get_size()
+    assert len(fronts) == n and height > width, "portrait sheets"
+    imp.s["orientation"] = "landscape"
+    folder = imp.export_bundle(TMP)
+    width, height = pypdfium2.PdfDocument(os.path.join(folder, "1-fronts.pdf"))[0].get_size()
+    assert width > height, "landscape sheets"
+    # two-sided: pages back to back
+    imp.s.update({"style": "pages2", "orientation": "portrait"})
+    layout = imp.layout()
+    assert len(layout.sheets) == -(-n // 2) and layout.two_sided
+    assert [[c.page for c in s.front] + [c.page for c in s.back] for s in layout.sheets][0] == [0, 1]
+    folder = imp.export_bundle(TMP)
+    assert {"1-fronts.pdf", "2-backs.pdf", "duplex.pdf"} <= set(os.listdir(folder))
+    # portrait, turned over the long edge (like a book): the backs come out upright, not turned
+    long_backs = pypdfium2.PdfDocument(os.path.join(folder, "2-backs.pdf"))[0].render(scale=0.4).to_numpy()
+    imp.s["printing"] = "single-short"
+    short = imp.export_bundle(TMP)
+    short_backs = pypdfium2.PdfDocument(os.path.join(short, "2-backs.pdf"))[0].render(scale=0.4).to_numpy()
+    turned = np.abs(long_backs.astype(int) - np.rot90(short_backs, 2).astype(int)).mean()
+    plain = np.abs(long_backs.astype(int) - short_backs.astype(int)).mean()
+    assert turned < 6 and plain > 3 * turned, (turned, plain)
+    page2 = export.final_page(w.sheet, 1, 0.4 * 72, w.distress, w.paper(), w.ink())
+    assert long_backs.shape[0] > long_backs.shape[1], "portrait"
+    # printing portrait sheets: sent as they are (no quarter turn)
+    fake = FakePrinter()
+    real_run, real_available = printing.RUN, printing.available
+    printing.RUN, printing.available = fake, (lambda: True)
+    try:
+        imp.s.update({"printing": "single-long", "printer": ""})
+        w.show()
+        imp.print_now()
+        sent = pypdfium2.PdfDocument(fake.jobs[0][-1])
+        width, height = sent[0].get_size()
+        assert height > width
+        made = pypdfium2.PdfDocument(os.path.join(folder, "1-fronts.pdf"))
+        a = sent[0].render(scale=0.4).to_numpy().astype(int)
+        b = made[0].render(scale=0.4).to_numpy().astype(int)
+        assert a.shape == b.shape and np.abs(a - b).mean() < 3, "the same page, not turned"
+        imp.flow.close_card()
+    finally:
+        printing.RUN, printing.available = real_run, real_available
+    w.close()
+
+
 def imposition_styles():
     from ream import imposition
     return list(imposition.STYLES)

@@ -1034,7 +1034,16 @@ class Ream(QtWidgets.QMainWindow):
             if drag["mode"] == "frame-move":
                 frame.setPos(drag["from"] + delta)
             else:
-                frame.set_size(drag["w"] + delta.x(), drag["h"] + delta.y())
+                w, h = drag["w"] + delta.x(), drag["h"] + delta.y()
+                # a set aspect (the scanner's menu), or Shift: keep the shape
+                aspect = frame.aspect or (drag["w"] / max(1e-6, drag["h"])
+                                          if event.modifiers() & QtCore.Qt.ShiftModifier else None)
+                if aspect:
+                    if abs(delta.x()) * drag["h"] >= abs(delta.y()) * drag["w"]:
+                        h = w / aspect
+                    else:
+                        w = h * aspect
+                frame.set_size(w, h)
             frame.changed()
             self.view.viewport().update()
             return True
@@ -1064,9 +1073,17 @@ class Ream(QtWidgets.QMainWindow):
             note = drag["thing"]
             note.set_width(note.mapFromScene(at).x())
         elif drag["mode"] == "scale":
+            # the corner stretches it freely, about its middle; Shift keeps its shape
             thing, centre = drag["thing"], drag["centre"]
-            factor = max(0.02, math.hypot(at.x() - centre.x(), at.y() - centre.y()) / drag["reach"])
-            thing.resize(drag["w"] * factor, drag["h"] * factor)
+            turn = math.radians(-thing.rotation())
+            vx, vy = at.x() - centre.x(), at.y() - centre.y()
+            local_x = abs(vx * math.cos(turn) - vy * math.sin(turn))
+            local_y = abs(vx * math.sin(turn) + vy * math.cos(turn))
+            if event.modifiers() & QtCore.Qt.ShiftModifier:
+                factor = max(0.02, math.hypot(at.x() - centre.x(), at.y() - centre.y()) / drag["reach"])
+                thing.resize(drag["w"] * factor, drag["h"] * factor)
+            else:
+                thing.resize(max(4.0, 2 * local_x), max(4.0, 2 * local_y))
         elif drag["mode"] == "rotate":
             thing, centre = drag["thing"], drag["centre"]
             angle = math.degrees(math.atan2(at.y() - centre.y(), at.x() - centre.x()))
